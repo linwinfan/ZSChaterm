@@ -503,9 +503,9 @@ const liteLlmBaseUrl = ref('')
 const liteLlmApiKey = ref('')
 const liteLlmModelId = ref('')
 const deepSeekApiKey = ref('')
-const openAiBaseUrl = ref('https://api.openai.com/v1')
+const openAiBaseUrl = ref('http://172.21.16.16:3001/v1') //ref('https://api.openai.com/v1')
 const openAiApiKey = ref('')
-const openAiModelId = ref('')
+const openAiModelId = ref('Qwen3.5-122B-A10B-FP8')
 const ollamaBaseUrl = ref('http://localhost:11434')
 const ollamaModelId = ref('')
 const checkLoadingLiteLLM = ref(false)
@@ -534,6 +534,7 @@ const loadSavedConfig = async () => {
     deepSeekApiKey.value = (await getSecret('deepSeekApiKey')) || ''
     openAiBaseUrl.value = ((await getGlobalState('openAiBaseUrl')) as string) || 'https://api.openai.com/v1'
     openAiApiKey.value = (await getSecret('openAiApiKey')) || ''
+    openAiModelId.value = ((await getGlobalState('openAiModelId')) as string) || 'gpt-4o'
     awsEndpointSelected.value = ((await getGlobalState('awsEndpointSelected')) as boolean) || false
     // Ollama information
     ollamaBaseUrl.value = ((await getGlobalState('ollamaBaseUrl')) as string) || 'http://localhost:11434'
@@ -594,6 +595,7 @@ const saveDeepSeekConfig = async () => {
 const saveOpenAiConfig = async () => {
   try {
     await updateGlobalState('openAiBaseUrl', openAiBaseUrl.value)
+    await updateGlobalState('openAiModelId', openAiModelId.value)
     await storeSecret('openAiApiKey', openAiApiKey.value)
   } catch (error) {
     console.error('Failed to save OpenAI config:', error)
@@ -621,10 +623,21 @@ const saveOllamaConfig = async () => {
 onMounted(async () => {
   await loadSavedConfig()
   await loadModelOptions()
+
+  // Listen for auto enable add model switch
+  eventBus.on('autoEnableAddModelSwitch', () => {
+    console.log('Auto enabling Add Model switch')
+    addModelSwitch.value = true
+  })
+
+  console.log('Model settings component mounted, auto enable listener added')
 })
 
 // Save configuration before component unmounts
-onBeforeUnmount(async () => {})
+onBeforeUnmount(async () => {
+  // Remove event listeners
+  eventBus.off('autoEnableAddModelSwitch')
+})
 
 const isEmptyValue = (value: unknown) => value === undefined || value === ''
 

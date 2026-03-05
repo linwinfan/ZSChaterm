@@ -24,6 +24,8 @@ notification.config({
 import * as storageState from './agent/storage/state'
 // Import IndexedDB migration listener
 import { setupIndexDBMigrationListener } from './services/indexdb-migration-listener'
+// Import LLM startup check
+import { initializeStartupModelCheck } from './services/llmStartupCheck'
 
 // Initialize IndexedDB migration listener
 setupIndexDBMigrationListener()
@@ -50,6 +52,9 @@ declare global {
 window.storageAPI = storageState
 
 app.mount('#app')
+
+// Initialize startup LLM model check after app is mounted
+initializeStartupModelCheck()
 
 if (import.meta.hot) {
   import.meta.hot.on('vite:afterUpdate', () => {
