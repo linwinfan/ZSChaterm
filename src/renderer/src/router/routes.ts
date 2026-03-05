@@ -1,21 +1,16 @@
 import Home from '@/views/index.vue'
-import Login from '@/views/auth/login.vue'
 
 export const AppRoutes = [
   {
     path: '/',
     name: 'Home',
     meta: {
-      requiresAuth: true
+      requiresAuth: false  // Change to not require auth since we're always guest
     },
     component: Home
   },
   {
-    path: '/login',
-    name: 'Login',
-    meta: {
-      requiresAuth: false
-    },
-    component: Login
+    path: '/:pathMatch(.*)*',  // Catch-all for invalid paths
+    redirect: '/'
   }
 ]

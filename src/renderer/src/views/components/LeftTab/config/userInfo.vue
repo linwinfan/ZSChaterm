@@ -453,16 +453,6 @@
 import { ref, onMounted, onBeforeUnmount, reactive, computed } from 'vue'
 import 'xterm/css/xterm.css'
 import i18n from '@/locales'
-import {
-  getUser,
-  updateUser,
-  changePassword,
-  sendEmailBindCode,
-  verifyAndBindEmail,
-  sendMobileBindCode,
-  verifyAndBindMobile,
-  updateAvatar
-} from '@api/user/user'
 import { EditOutlined, CheckOutlined, CloseOutlined, FormOutlined, CameraOutlined } from '@ant-design/icons-vue'
 import { useDeviceStore } from '@/store/useDeviceStore'
 import { message } from 'ant-design-vue'
@@ -553,15 +543,19 @@ const previewImageStyle = computed(() => {
 })
 
 const getUserInfo = () => {
-  getUser({}).then((res: any) => {
-    userInfo.value = res.data as UserInfo
-    userInfo.value.localIp = deviceStore.getDeviceIp
-    userInfo.value.macAddress = deviceStore.getMacAddress
-    if (userInfo.value.uid !== 2000001) unChange.value = false
-    formState.username = userInfo.value.username || ''
-    formState.name = userInfo.value.name || ''
-    formState.mobile = userInfo.value.mobile || ''
-  })
+  // For guest users, provide default information
+  userInfo.value = {
+    uid: 999999999,
+    username: 'guest',
+    name: 'Guest',
+    email: 'guest@chaterm.ai',
+    localIp: deviceStore.getDeviceIp,
+    macAddress: deviceStore.getMacAddress
+  }
+  unChange.value = false  // Always read-only for guest users
+  formState.username = userInfo.value.username || ''
+  formState.name = userInfo.value.name || ''
+  formState.mobile = userInfo.value.mobile || ''
 }
 const strength = computed(() => {
   if (formState.newPassword === '') return null
@@ -587,7 +581,8 @@ const canEditEmail = computed(() => {
 })
 
 const startEditing = () => {
-  isEditing.value = true
+  // Disable editing for guest users
+  message.info(t('userInfo.guestReadOnly'))
 }
 
 const cancelEditing = () => {
@@ -740,25 +735,8 @@ const cancelResetPassword = () => {
 }
 
 const handleResetPassword = async () => {
-  if (!validatePassword()) {
-    return
-  }
-  try {
-    const response = (await changePassword({
-      password: formState.newPassword
-    })) as unknown as ApiResponse
-    if (response.code == 200) {
-      message.success(t('userInfo.passwordResetSuccess'))
-      showPasswordModal.value = false
-      formState.newPassword = ''
-      formState.confirmPassword = ''
-    } else {
-      message.error(response.message || t('userInfo.passwordResetFailed'))
-    }
-  } catch (error: any) {
-    const errorMessage = error?.response?.data?.message || t('userInfo.passwordResetFailed')
-    message.error(errorMessage)
-  }
+  // Disable password reset for guest users
+  message.info(t('userInfo.guestReadOnly'))
 }
 
 const validatePassword = () => {
@@ -797,24 +775,8 @@ const validateSave = () => {
   return true
 }
 const handleSave = async () => {
-  try {
-    if (!validateSave()) return
-    const response = (await updateUser({
-      username: formState.username,
-      name: formState.name
-    })) as unknown as ApiResponse
-    console.log(response)
-    if (response.code == 200) {
-      message.success(t('userInfo.updateSuccess'))
-      cancelEditing()
-      getUserInfo()
-    } else {
-      message.error(response.message || t('userInfo.updateFailed'))
-    }
-  } catch (error: any) {
-    const errorMessage = error?.response?.data?.message || t('userInfo.updateFailed')
-    message.error(errorMessage)
-  }
+  // Disable save for guest users
+  message.info(t('userInfo.guestReadOnly'))
 }
 
 const handleAvatarClick = () => {

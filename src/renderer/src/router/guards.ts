@@ -1,86 +1,46 @@
-import { getUserInfo } from '@/utils/permission'
 import { dataSyncService } from '@/services/dataSyncService'
 
 export const beforeEach = async (to, _from, next) => {
-  const token = localStorage.getItem('ctm-token')
-  const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
-  const isDev = import.meta.env.MODE === 'development'
-  if (to.path === '/login') {
-    if (isSkippedLogin) {
-      localStorage.removeItem('login-skipped')
-      localStorage.removeItem('ctm-token')
-      localStorage.removeItem('jms-token')
-      localStorage.removeItem('userInfo')
-    }
-    next()
-    return
+  // Set up guest user automatically
+  localStorage.removeItem('login-skipped')
+  localStorage.removeItem('ctm-token')
+  localStorage.removeItem('jms-token')
+  localStorage.removeItem('userInfo')
+
+  localStorage.setItem('login-skipped', 'true')
+  localStorage.setItem('ctm-token', 'guest_token')
+
+  const guestUserInfo = {
+    uid: 999999999,
+    username: 'guest',
+    name: 'Guest',
+    email: 'guest@chaterm.ai',
+    token: 'guest_token'
   }
 
-  if (isSkippedLogin && token === 'guest_token') {
-    try {
-      const api = window.api as any
-      const dbResult = await api.initUserDatabase({ uid: 999999999 })
-      console.log('Database initialization result:', dbResult)
+  // Set user info
+  const userInfoStr = JSON.stringify(guestUserInfo)
+  localStorage.setItem('userInfo', userInfoStr)
+  localStorage.setItem('user-info', userInfoStr) // For compatibility in permission utils
 
-      if (dbResult.success) {
-        if (to.path === '/') {
-          next()
-        } else {
-          next('/')
-        }
-      } else {
-        console.error('Database initialization failed, redirecting to login page')
-        localStorage.removeItem('login-skipped')
-        localStorage.removeItem('ctm-token')
-        localStorage.removeItem('jms-token')
-        localStorage.removeItem('userInfo')
-        next('/login')
-      }
-    } catch (error) {
-      console.error('Database initialization failed:', error)
-      localStorage.removeItem('login-skipped')
-      localStorage.removeItem('ctm-token')
-      localStorage.removeItem('jms-token')
-      localStorage.removeItem('userInfo')
-      next('/login')
+  try {
+    // Initialize database with guest UID
+    const api = (window as any).api
+    const dbResult = await api.initUserDatabase({ uid: 999999999 })
+
+    if (dbResult.success) {
+      // After database initialization succeeds, asynchronously initialize data sync service
+      dataSyncService.initialize().catch((error) => {
+        console.error('Data sync service initialization failed:', error)
+      })
+      next()
+    } else {
+      console.error('Database initialization failed')
+      next('/')
     }
-    return
-  }
-
-  if (token && !isSkippedLogin) {
-    try {
-      const userInfo = getUserInfo()
-      if (userInfo && userInfo.uid) {
-        const api = window.api as any
-        const dbResult = await api.initUserDatabase({ uid: userInfo.uid })
-
-        if (dbResult.success) {
-          // After database initialization succeeds, asynchronously initialize data sync service (non-blocking UI display)
-          dataSyncService.initialize().catch((error) => {
-            console.error('Data sync service initialization failed:', error)
-          })
-          next()
-        } else {
-          console.error('Database initialization failed, redirecting to login page')
-          next('/login')
-        }
-      } else {
-        next('/login')
-      }
-    } catch (error) {
-      console.error('Processing failed:', error)
-
-      const message = error instanceof Error ? error.message : String(error)
-
-      // In the development environment, bypass the relevant errors (usually caused by hot updates)
-      if (isDev && (message.includes('nextSibling') || message.includes('getUserInfo'))) {
-        next()
-        return
-      }
-      next('/login')
-    }
-  } else {
-    next('/login')
+  } catch (error) {
+    console.error('Initialization failed:', error)
+    next('/')
   }
 }
 

@@ -20,7 +20,7 @@ interface ModelOption {
 const hasAvailableModels = async (): Promise<boolean> => {
   try {
     const modelOptions = (await getGlobalState('modelOptions')) as ModelOption[]
-    const availableModels = modelOptions.filter(model => model.checked)
+    const availableModels = modelOptions.filter((model) => model.checked)
     return availableModels.length > 0
   } catch (error) {
     console.error('Failed to check available models:', error)

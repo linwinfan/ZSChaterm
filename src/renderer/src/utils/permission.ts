@@ -20,5 +20,18 @@ export const setUserInfo = (info) => {
 }
 export const getUserInfo = () => {
   const userStore = userInfoStore(pinia)
-  return userStore.userInfo
+  let userInfo = userStore.userInfo
+
+  // If no user info from store, default to guest
+  if (!userInfo || !userInfo.uid) {
+    userInfo = {
+      uid: 999999999,
+      username: 'guest',
+      name: 'Guest',
+      email: 'guest@chaterm.ai',
+      token: 'guest_token'
+    }
+  }
+
+  return userInfo
 }
