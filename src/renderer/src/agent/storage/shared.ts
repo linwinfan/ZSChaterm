@@ -288,8 +288,6 @@ export type HistoryItem = {
   isFavorited?: boolean
 }
 
-export type TelemetrySetting = 'unset' | 'enabled' | 'disabled'
-
 export interface UserInfo {
   displayName: string | null
   email: string | null

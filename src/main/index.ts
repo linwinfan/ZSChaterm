@@ -30,7 +30,7 @@ import { autoCompleteDatabaseService, ChatermDatabaseService, setCurrentUserId }
 import { getGuestUserId } from './storage/db/connection'
 import { Controller } from './agent/core/controller'
 import { executeRemoteCommand } from './agent/integrations/remote-terminal/example'
-import { initializeStorageMain, testStorageFromMain as testRendererStorageFromMain, getGlobalState } from './agent/core/storage/state'
+import { initializeStorageMain, testStorageFromMain as testRendererStorageFromMain } from './agent/core/storage/state'
 import { getTaskMetadata } from './agent/core/storage/disk'
 import { createMainWindow } from './windowManager'
 import { registerUpdater } from './updater'
@@ -55,7 +55,6 @@ import { getPluginDetailsByName, getLocalizedStrings, getUserLanguage } from './
 import { capabilityRegistry } from './ssh/capabilityRegistry'
 import { getActualTheme, loadUserTheme } from './themeManager'
 import { getLoginBaseUrl, getEdition, getProtocolPrefix, getProtocolName } from './config/edition'
-import { TelemetrySetting } from '@shared/TelemetrySetting'
 import { registerKnowledgeBaseHandlers } from './services/knowledgebase'
 import { setupInteractionIpcHandlers } from './agent/services/interaction-detector/ipc-handlers'
 import type { WebviewMessage } from '@shared/WebviewMessage'
@@ -330,19 +329,8 @@ app.whenReady().then(async () => {
     console.error('Failed to initialize security configuration:', error)
   }
 
-  // Function to initialize telemetry setting
-  const initializeTelemetrySetting = async () => {
-    let telemetrySetting: TelemetrySetting
-    try {
-      telemetrySetting = (await getGlobalState('telemetrySetting')) || 'enabled'
-    } catch (error) {
-      telemetrySetting = 'enabled'
-    }
-
-    if (controller) {
-      await controller.updateTelemetrySetting(telemetrySetting)
-    }
-
+  // Function to initialize telemetry (without user settings)
+  const initializeTelemetry = async () => {
     const isFirstLaunch = checkIsFirstLaunch()
 
     if (isFirstLaunch) {
@@ -377,7 +365,7 @@ app.whenReady().then(async () => {
     }
   })
 
-  setTimeout(initializeTelemetrySetting, 1000)
+  setTimeout(initializeTelemetry, 1000)
 })
 
 // Quit when all windows are closed, except on macOS. There, it's common

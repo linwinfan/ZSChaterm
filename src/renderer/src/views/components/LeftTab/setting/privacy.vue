@@ -18,36 +18,6 @@
           </template>
         </a-form-item>
         <a-form-item
-          :label="$t('user.telemetry')"
-          class="user_my-ant-form-item"
-        >
-          <a-radio-group
-            v-model:value="userConfig.telemetry"
-            class="custom-radio-group"
-            @change="updateTelemetry"
-          >
-            <a-radio value="enabled">{{ $t('user.telemetryEnabled') }}</a-radio>
-            <a-radio value="disabled">{{ $t('user.telemetryDisabled') }}</a-radio>
-          </a-radio-group>
-        </a-form-item>
-        <a-form-item
-          class="description-item"
-          :label-col="{ span: 0 }"
-          :wrapper-col="{ span: 24 }"
-        >
-          <div class="description">
-            {{ $t('user.telemetryDescriptionText') }}
-            <a
-              :href="privacyUrl"
-              target="_blank"
-              rel="noopener noreferrer"
-              class="privacy-link"
-            >
-              {{ $t('user.privacyPolicy') }}.
-            </a>
-          </div>
-        </a-form-item>
-        <a-form-item
           :label="$t('user.secretRedaction')"
           class="user_my-ant-form-item"
         >
@@ -128,18 +98,13 @@ import { notification } from 'ant-design-vue'
 import { userConfigStore } from '@/services/userConfigStoreService'
 import { dataSyncService } from '@/services/dataSyncService'
 import { useI18n } from 'vue-i18n'
-import { getPrivacyPolicyUrl } from '@/utils/edition'
 import { getUserInfo } from '@/utils/permission'
-import type { TelemetrySetting } from '@shared/TelemetrySetting'
 
 const { t } = useI18n()
 
-const privacyUrl = getPrivacyPolicyUrl()
-
 const userConfig = ref({
   secretRedaction: 'disabled',
-  dataSync: 'enabled',
-  telemetry: 'enabled'
+  dataSync: 'enabled'
 })
 
 const isUserLoggedIn = computed(() => {
@@ -263,8 +228,7 @@ const loadSavedConfig = async () => {
         ...userConfig.value,
         ...savedConfig,
         secretRedaction: (savedConfig.secretRedaction || 'enabled') as 'enabled' | 'disabled',
-        dataSync: defaultDataSync,
-        telemetry: ((savedConfig as any).telemetry || 'unset') as 'unset' | 'enabled' | 'disabled'
+        dataSync: defaultDataSync
       } as any
     }
   } catch (error) {
@@ -280,8 +244,7 @@ const saveConfig = async () => {
   try {
     const configToStore = {
       secretRedaction: (userConfig.value.secretRedaction || 'enabled') as 'enabled' | 'disabled',
-      dataSync: (userConfig.value.dataSync || 'enabled') as 'enabled' | 'disabled',
-      telemetry: ((userConfig.value as any).telemetry || 'unset') as 'unset' | 'enabled' | 'disabled'
+      dataSync: (userConfig.value.dataSync || 'enabled') as 'enabled' | 'disabled'
     }
     await userConfigStore.saveConfig(configToStore as any)
   } catch (error) {
@@ -304,23 +267,6 @@ watch(
 onMounted(async () => {
   await loadSavedConfig()
 })
-
-const updateTelemetry = async () => {
-  try {
-    await window.api.sendToMain({
-      type: 'telemetrySetting',
-      telemetrySetting: userConfig.value.telemetry as TelemetrySetting
-    })
-
-    await saveConfig()
-  } catch (error) {
-    console.error('Failed to change telemetry setting:', error)
-    notification.error({
-      message: t('user.telemetryUpdateFailed'),
-      description: t('user.telemetryUpdateFailedDescription')
-    })
-  }
-}
 
 const changeSecretRedaction = async () => {
   await saveConfig()

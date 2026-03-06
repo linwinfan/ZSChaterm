@@ -779,7 +779,7 @@ onMounted(async () => {
     configLoaded.value = true
     currentTheme.value = getActualTheme(config.theme || 'auto')
 
-    // Delay of 2 seconds to wait for the main thread to complete initializeTelemetrySetting
+    // Delay of 2 seconds to wait for the main thread to complete telemetry initialization
     setTimeout(async () => {
       const extensionStates = [
         { name: ExtensionNames.AUTO_COMPLETE, enabled: config.autoCompleteStatus === 1 },

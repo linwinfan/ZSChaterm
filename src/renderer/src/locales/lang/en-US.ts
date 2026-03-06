@@ -241,13 +241,6 @@ export default {
     defaultLayout: 'Default Layout',
     defaultLayoutTerminal: 'Terminal',
     defaultLayoutAgents: 'Agents',
-    telemetry: 'Telemetry',
-    telemetryEnabled: 'Enabled',
-    telemetryDisabled: 'Disabled',
-    telemetryDescription:
-      'Help improve Chaterm by sending anonymous usage data and error reports. We never send any code, prompt content, or personal information. For more information, please see our privacy policy.',
-    telemetryDescriptionText:
-      'Help improve Chaterm by sending anonymous usage data and error reports. We never send any code, prompt content, or personal information. For more information, please see our',
     privacyPolicy: 'privacy policy',
     enterprise: 'Enterprise',
     personal: 'Personal',
@@ -414,8 +407,6 @@ export default {
     type: 'Type',
     loadConfigFailed: 'Failed to load configuration',
     loadConfigFailedDescription: 'Default configuration will be used',
-    telemetryUpdateFailed: 'Failed to update telemetry settings',
-    telemetryUpdateFailedDescription: 'Please try again later',
     error: 'Error',
     saveConfigFailedDescription: 'Failed to save configuration',
     themeSwitchFailed: 'Failed to switch theme',

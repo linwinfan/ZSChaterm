@@ -299,72 +299,6 @@ describe('Privacy Component', () => {
     })
   })
 
-  describe('Telemetry Settings', () => {
-    beforeEach(async () => {
-      wrapper = createWrapper()
-      await waitForUpdates()
-    })
-
-    it('should render telemetry radio group', () => {
-      const radioGroups = wrapper.findAll('.a-radio-group')
-      expect(radioGroups.length).toBeGreaterThan(0)
-    })
-
-    it('should update telemetry to enabled and notify main process', async () => {
-      const vm = wrapper.vm as any
-      vm.userConfig.telemetry = 'enabled'
-      await nextTick()
-
-      await vm.updateTelemetry()
-
-      expect(mockWindowApi.sendToMain).toHaveBeenCalledWith({
-        type: 'telemetrySetting',
-        telemetrySetting: 'enabled'
-      })
-      expect(userConfigStore.saveConfig).toHaveBeenCalled()
-    })
-
-    it('should update telemetry to disabled and notify main process', async () => {
-      const vm = wrapper.vm as any
-      vm.userConfig.telemetry = 'disabled'
-      await nextTick()
-
-      await vm.updateTelemetry()
-
-      expect(mockWindowApi.sendToMain).toHaveBeenCalledWith({
-        type: 'telemetrySetting',
-        telemetrySetting: 'disabled'
-      })
-      expect(userConfigStore.saveConfig).toHaveBeenCalled()
-    })
-
-    it('should handle telemetry update errors and show notification', async () => {
-      const error = new Error('Update failed')
-      mockWindowApi.sendToMain.mockRejectedValue(error)
-
-      const vm = wrapper.vm as any
-      vm.userConfig.telemetry = 'enabled'
-      await nextTick()
-
-      await vm.updateTelemetry()
-
-      expect(notification.error).toHaveBeenCalledWith({
-        message: mockTranslations['user.telemetryUpdateFailed'],
-        description: mockTranslations['user.telemetryUpdateFailedDescription']
-      })
-    })
-
-    it('should save config when telemetry changes', async () => {
-      const vm = wrapper.vm as any
-      vm.userConfig.telemetry = 'disabled'
-      await nextTick()
-
-      await vm.updateTelemetry()
-
-      expect(userConfigStore.saveConfig).toHaveBeenCalled()
-    })
-  })
-
   describe('Secret Redaction Settings', () => {
     beforeEach(async () => {
       wrapper = createWrapper()
@@ -810,19 +744,13 @@ describe('Privacy Component', () => {
 
       await vm.updateTelemetry()
 
-      expect(userConfigStore.getConfig).toHaveBeenCalled()
-      expect(mockWindowApi.sendToMain).toHaveBeenCalledWith({
-        type: 'telemetrySetting',
-        telemetrySetting: 'disabled'
-      })
       expect(userConfigStore.saveConfig).toHaveBeenCalled()
     })
 
     it('should complete full flow: load config -> enable data sync -> save', async () => {
       const initialConfig = {
         secretRedaction: 'enabled',
-        dataSync: 'disabled',
-        telemetry: 'enabled'
+        dataSync: 'disabled'
       }
       ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue(initialConfig)
 

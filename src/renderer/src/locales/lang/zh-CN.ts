@@ -241,13 +241,6 @@ export default {
     defaultLayout: '默认布局',
     defaultLayoutTerminal: 'Terminal',
     defaultLayoutAgents: 'Agents',
-    telemetry: '遥测',
-    telemetryEnabled: '开启',
-    telemetryDisabled: '关闭',
-    telemetryDescription:
-      '通过发送匿名使用数据和错误报告帮助改进 Chaterm。我们绝不会发送任何代码、提示内容或个人信息。如需了解详细信息，请查看我们的隐私政策。',
-    telemetryDescriptionText:
-      '通过发送匿名使用数据和错误报告帮助改进 Chaterm。我们绝不会发送任何代码、提示内容或个人信息。如需了解详细信息，请查看我们的',
     privacyPolicy: '隐私政策',
     enterprise: '企业用户',
     personal: '个人用户',
@@ -413,8 +406,6 @@ export default {
     type: '类型',
     loadConfigFailed: '加载配置失败',
     loadConfigFailedDescription: '将使用默认配置',
-    telemetryUpdateFailed: '遥测设置更新失败',
-    telemetryUpdateFailedDescription: '请稍后重试',
     error: '错误',
     saveConfigFailedDescription: '保存配置失败',
     themeSwitchFailed: '主题切换失败',

@@ -11,8 +11,6 @@ import { buildApiHandler, ApiHandler } from '@api/index'
 import { McpHub } from '@services/mcp/McpHub'
 import { SkillsManager } from '@services/skills'
 import { version as extensionVersion } from '../../../../../package.json'
-import { TelemetrySetting } from '@shared/TelemetrySetting'
-import { telemetryService } from '@services/telemetry/TelemetryService'
 import { ExtensionMessage, Platform } from '@shared/ExtensionMessage'
 import { HistoryItem } from '@shared/HistoryItem'
 import { WebviewMessage } from '@shared/WebviewMessage'
@@ -236,9 +234,7 @@ export class Controller {
         this.deleteTaskWithId(message.text!)
         break
       case 'taskFeedback':
-        if (message.feedbackType && targetTaskId) {
-          telemetryService.captureTaskFeedback(targetTaskId, message.feedbackType)
-        }
+        // Telemetry service has been removed
         break
       case 'commandGeneration':
         if (message.instruction) {
@@ -250,22 +246,7 @@ export class Controller {
           await this.handleExplainCommand(message.command, message.tabId, message.commandMessageId)
         }
         break
-      case 'telemetrySetting': {
-        if (message.telemetrySetting) {
-          await this.updateTelemetrySetting(message.telemetrySetting)
-        }
-        await this.postStateToWebview(targetTaskId)
-        break
-      }
     }
-  }
-
-  async updateTelemetrySetting(telemetrySetting: TelemetrySetting) {
-    try {
-      await updateGlobalState('telemetrySetting', telemetrySetting)
-    } catch (error) {}
-    const isOptedIn = telemetrySetting === 'enabled'
-    telemetryService.updateTelemetryState(isOptedIn)
   }
 
   async cancelTask(tabId?: string) {

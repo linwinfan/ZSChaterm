@@ -80,7 +80,6 @@ export type GlobalStateKey =
   | 'requestyModelInfo'
   | 'togetherModelId'
   | 'mcpMarketplaceCatalog'
-  | 'telemetrySetting'
   | 'asksageApiUrl'
   | 'thinkingBudgetTokens'
   | 'reasoningEffort'
