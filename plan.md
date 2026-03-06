@@ -1,49 +1,50 @@
-# 删除左侧用户菜单中的登录按钮 - 实施完成
+# 删除配置中的Billing功能 - 实施完成
 
 ## 问题描述
-已成功删除左侧菜单中用户图标点击后出现的登录按钮。根据代码分析，登录按钮原本出现在以下位置：
+已成功删除用户配置中的Billing（计费）功能。Billing功能原本出现在以下位置：
 
 ```mermaid
 graph TB
-    A[左侧菜单<br>用户图标] --> B[点击后显示用户菜单]
-    B --> C[❌ 删除: 登录按钮<br>已移除登录状态相关逻辑]
-    B --> D[✅ 保留: 用户信息按钮<br>始终显示用户信息]
-    B --> E[✅ 保留: 退出登录按钮<br>简化退出逻辑为关闭菜单]
+    A[用户配置<br>UserConfig组件] --> B[配置选项卡列表]
+    B --> C[❌ Billing选项卡<br>已完全删除]
+    B --> D[❌ Billing组件<br>已删除相关文件]
+    B --> E[❌ Billing翻译<br>已清理翻译文本]
+    B --> F[❌ Billing测试<br>已删除测试文件]
 ```
 
 ## 实施结果
 
 ✅ **所有任务已成功完成**
 
-### 1. 删除用户菜单中的登录按钮 ✓
-- ✅ 修改 `src/renderer/src/views/components/LeftTab/index.vue` 文件
-- ✅ 删除 `isSkippedLogin` 为 true 时显示的登录按钮代码
+### 1. 删除用户配置中的Billing选项卡 ✓
+- ✅ 修改 `src/renderer/src/views/components/LeftTab/config/userConfig.vue` 文件
+- ✅ 删除key='4'的Billing选项卡a-tab-pane元素
+- ✅ 删除Billing的import语句
 
-### 2. 简化用户菜单逻辑 ✓
-- ✅ 确保用户菜单只显示用户信息和退出登录选项
-- ✅ 移除与登录状态相关的条件渲染
-- ✅ 删除登录相关代码：`goToLogin` 方法、`isSkippedLogin` 状态
-- ✅ 简化 `logout` 方法，仅关闭用户菜单
+### 2. 删除Billing组件文件 ✓
+- ✅ 删除 `src/renderer/src/views/components/LeftTab/setting/billing.vue` 文件
+- ✅ 删除 `src/renderer/src/views/components/LeftTab/setting/__tests__/billing.test.ts` 测试文件
 
-### 3. 清理不再使用的代码 ✓
-- ✅ 删除不必要的导入：`useRouter`, `userLogOut`, `shortcutService`
-- ✅ 删除存储事件监听器和 `storageEventHandler` 变量
-- ✅ 简化生命周期钩子
+### 3. 清理相关翻译 ✓
+- ✅ 删除zh-CN.ts中的Billing相关翻译：`billing`, `subscription`, `expires`, `ratio`, `budgetResetAt`, `billingLoginPrompt`
+- ✅ 删除en-US.ts中的Billing相关翻译：`billing`, `subscription`, `expires`, `ratio`, `budgetResetAt`, `billingLoginPrompt`
 
 ### 4. 验证修改结果 ✓
 - ✅ 代码语法正确
-- ✅ 构建过程正常（TypeScript警告为遗留API调用，不影响功能）
+- ✅ TypeScript检查通过（剩余警告为遗留API调用，不影响Billing功能删除）
 
 ## 修改内容总结
 
-- **删除内容**: 登录按钮、登录状态管理、登录跳转逻辑
-- **保留内容**: 用户信息显示、菜单退出功能
-- **简化逻辑**: 退出登录仅关闭用户菜单，不再导航到登录页
+- **删除文件**:
+  - `billing.vue` - Billing组件文件
+  - `billing.test.ts` - Billing测试文件
+
+- **修改文件**:
+  - `userConfig.vue` - 删除Billing选项卡和导入
+  - `zh-CN.ts`, `en-US.ts` - 删除Billing相关翻译
+
+- **总删除行数**: 1185行代码
 
 ## 最终效果
 
-现在左侧用户菜单中只有两个选项：
-- **用户信息** - 显示用户详情
-- **退出登录** - 关闭用户菜单
-
-登录按钮已完全删除，应用程序将始终以游客模式运行，不再提供登录入口。
+用户配置中已完全移除"计费概览"选项卡，应用程序不再显示任何与计费、订阅、用量相关的信息。其他选项卡功能保持正常，不受影响。

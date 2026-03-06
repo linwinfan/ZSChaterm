@@ -39,13 +39,6 @@
           <Model />
         </a-tab-pane>
         <a-tab-pane
-          key="4"
-          :tab="$t('user.billing')"
-          type="card"
-        >
-          <Billing />
-        </a-tab-pane>
-        <a-tab-pane
           key="5"
           :tab="$t('user.aiPreferences')"
           type="card"
@@ -124,7 +117,6 @@ import General from '@/views/components/LeftTab/setting/general.vue'
 import Terminal from '@/views/components/LeftTab/setting/terminal.vue'
 import Extensions from '@/views/components/LeftTab/setting/extensions.vue'
 import AI from '@/views/components/LeftTab/setting/ai.vue'
-import Billing from '@/views/components/LeftTab/setting/billing.vue'
 import Model from '@/views/components/LeftTab/setting/model.vue'
 import Shortcuts from '@/views/components/LeftTab/setting/shortcuts.vue'
 import Privacy from '@/views/components/LeftTab/setting/privacy.vue'
