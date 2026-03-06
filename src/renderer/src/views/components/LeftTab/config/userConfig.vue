@@ -74,13 +74,6 @@
           <Shortcuts />
         </a-tab-pane>
         <a-tab-pane
-          key="13"
-          :tab="$t('user.trustedDevices')"
-          type="card"
-        >
-          <TrustedDevices :is-active="activeKey === '13'" />
-        </a-tab-pane>
-        <a-tab-pane
           key="10"
           :tab="$t('user.privacy')"
           type="card"
@@ -94,25 +87,13 @@
         >
           <About />
         </a-tab-pane>
-        <a-tab-pane
-          key="12"
-          type="card"
-        >
-          <template #tab>
-            <span class="documentation-tab-label">
-              {{ $t('user.documentation') }}
-              <ExportOutlined class="export-outlined-icon" />
-            </span>
-          </template>
-          <div></div>
-        </a-tab-pane>
       </a-tabs>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount } from 'vue'
 import General from '@/views/components/LeftTab/setting/general.vue'
 import Terminal from '@/views/components/LeftTab/setting/terminal.vue'
 import Extensions from '@/views/components/LeftTab/setting/extensions.vue'
@@ -120,14 +101,11 @@ import AI from '@/views/components/LeftTab/setting/ai.vue'
 import Model from '@/views/components/LeftTab/setting/model.vue'
 import Shortcuts from '@/views/components/LeftTab/setting/shortcuts.vue'
 import Privacy from '@/views/components/LeftTab/setting/privacy.vue'
-import TrustedDevices from '@/views/components/LeftTab/setting/trustedDevices.vue'
 import Rules from '@/views/components/LeftTab/setting/rules.vue'
 import About from '@/views/components/LeftTab/setting/about.vue'
 import Mcp from '@/views/components/LeftTab/setting/mcp.vue'
 import Skills from '@/views/components/LeftTab/setting/skills.vue'
-import { ExportOutlined } from '@ant-design/icons-vue'
 import eventBus from '@/utils/eventBus'
-import { getDocsBaseUrl } from '@/utils/edition'
 
 const activeKey = ref('0')
 
@@ -138,16 +116,6 @@ const switchToTerminalTab = () => {
 const switchToModelSettingsTab = () => {
   activeKey.value = '3'
 }
-
-// Watch for documentation tab click and redirect
-watch(activeKey, (newKey) => {
-  if (newKey === '12') {
-    const baseUrl = getDocsBaseUrl()
-    window.open(`${baseUrl}/`, '_blank')
-    // Reset to previous tab or default tab after opening documentation
-    activeKey.value = '0'
-  }
-})
 
 onMounted(() => {
   eventBus.on('switchToTerminalTab', switchToTerminalTab)
