@@ -39,11 +39,11 @@ const menuTabsData = [
     key: 'kubernetes',
     icon: new URL('@/assets/menu/kubernetes.svg', import.meta.url).href
   },
-  {
-    name: 'User',
-    key: 'user',
-    icon: new URL('@/assets/menu/user.svg', import.meta.url).href
-  },
+  // {
+  //   name: 'User',
+  //   key: 'user',
+  //   icon: new URL('@/assets/menu/user.svg', import.meta.url).href
+  // },
   {
     name: 'Setting',
     key: 'setting',
