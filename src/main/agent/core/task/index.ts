@@ -62,6 +62,7 @@ interface MessageUpdater {
 }
 
 import { AssistantMessageContent, parseAssistantMessageV2, ToolParamName, ToolUseName, TextContent, ToolUse } from '@core/assistant-message'
+import { detectShellType, ShellType } from '../../../ssh/agentHandle'
 import { RemoteTerminalManager, ConnectionInfo, RemoteTerminalInfo, RemoteTerminalProcessResultPromise } from '../../integrations/remote-terminal'
 import { LocalTerminalManager, LocalCommandProcess } from '../../integrations/local-terminal'
 import { createLlmCaller } from '../../services/interaction-detector/llm-caller'
@@ -3697,7 +3698,26 @@ USERNAME:${localSystemInfo.userName}`
             } else {
               // Optimization: Get all system information at once to avoid multiple network requests
               // Simplified script to avoid complex quoting issues in JumpServer environment
-              const systemInfoScript = `uname -a | sed 's/^/OS_VERSION:/' && echo "DEFAULT_SHELL:$SHELL" && echo "HOME_DIR:$HOME" && hostname | sed 's/^/HOSTNAME:/' && whoami | sed 's/^/USERNAME:/'`
+
+              // Get terminal connection to detect shell type
+              let shellType = ShellType.BASH // default to bash
+              try {
+                const terminalInfo = await this.connectTerminal(host.host)
+                if (terminalInfo && terminalInfo.sessionId) {
+                  shellType = await detectShellType(terminalInfo.sessionId)
+                }
+              } catch {
+                // If detection fails, default to bash
+                shellType = ShellType.BASH
+              }
+
+              // Use shell-specific system information scripts
+              const systemInfoScripts = {
+                [ShellType.BASH]: `uname -a | sed 's/^/OS_VERSION:/' && echo "DEFAULT_SHELL:$SHELL" && echo "HOME_DIR:$HOME" && hostname | sed 's/^/HOSTNAME:/' && whoami | sed 's/^/USERNAME:/'`,
+                [ShellType.POWERSHELL]: `Write-Host "OS_VERSION: $(Get-WmiObject -Class Win32_OperatingSystem).Caption $((Get-WmiObject -Class Win32_OperatingSystem).Version)"; Write-Host "DEFAULT_SHELL:PowerShell"; Write-Host "HOME_DIR:$env:USERPROFILE"; Write-Host "HOSTNAME:$env:COMPUTERNAME"; Write-Host "USERNAME:$env:USERNAME"`
+              }
+
+              const systemInfoScript = systemInfoScripts[shellType] || systemInfoScripts[ShellType.BASH]
               systemInfoOutput = await this.executeCommandInRemoteServer(systemInfoScript, host.host)
             }
 

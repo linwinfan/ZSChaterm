@@ -14,6 +14,100 @@ const remoteConnections = new Map<string, Client>()
 const remoteShellStreams = new Map()
 const reusedRemoteSessions = new Map<string, { poolKey: string }>()
 
+// Shell type detection
+export enum ShellType {
+  BASH = 'bash',
+  POWERSHELL = 'powershell',
+  UNKNOWN = 'unknown'
+}
+
+// Cache for detected shell types
+const shellTypeCache = new Map<string, ShellType>()
+
+// Helper function for internal shell detection
+async function detectShellTypeInternal(conn: Client, command: string): Promise<{ success: boolean; output?: string; error?: string }> {
+  return new Promise((resolve) => {
+    conn.exec(command, { pty: false }, (err, stream) => {
+      if (err) {
+        resolve({ success: false, error: err.message })
+        return
+      }
+
+      let output = ''
+      let finished = false
+
+      const safeResolve = (result: { success: boolean; output?: string; error?: string }) => {
+        if (!finished) {
+          finished = true
+          resolve(result)
+        }
+      }
+
+      stream.on('data', (data: Buffer) => {
+        output += data.toString()
+      })
+
+      stream.stderr.on('data', (data: Buffer) => {
+        output += data.toString()
+      })
+
+      stream.on('close', () => {
+        safeResolve({ success: true, output })
+      })
+
+      // Set short timeout for detection commands
+      setTimeout(() => {
+        try {
+          stream.close()
+        } catch {}
+        safeResolve({ success: false, output, error: 'Detection command timed out' })
+      }, 5000)
+    })
+  })
+}
+
+export async function detectShellType(sessionId: string): Promise<ShellType> {
+  // Check cache first
+  if (shellTypeCache.has(sessionId)) {
+    return shellTypeCache.get(sessionId)!
+  }
+
+  const conn = remoteConnections.get(sessionId)
+  if (!conn) {
+    console.error(`SSH connection does not exist for shell detection: ${sessionId}`)
+    return ShellType.BASH // Default to bash for compatibility
+  }
+
+  try {
+    // First try PowerShell detection
+    const psResult = await detectShellTypeInternal(conn, 'echo $PSVersionTable.PSVersion')
+    if (psResult.success && psResult.output && psResult.output.includes('Major')) {
+      console.log(`[ShellDetection] Detected PowerShell for session ${sessionId}`)
+      shellTypeCache.set(sessionId, ShellType.POWERSHELL)
+      return ShellType.POWERSHELL
+    }
+
+    // Then try shell environment variable detection
+    const shellResult = await detectShellTypeInternal(conn, 'echo $SHELL')
+    if (shellResult.success && shellResult.output) {
+      if (shellResult.output.includes('bash') || shellResult.output.includes('zsh') || shellResult.output.includes('ksh')) {
+        console.log(`[ShellDetection] Detected Bash/Zsh/Ksh for session ${sessionId}: ${shellResult.output.trim()}`)
+        shellTypeCache.set(sessionId, ShellType.BASH)
+        return ShellType.BASH
+      }
+    }
+
+    // Default to bash for compatibility
+    console.log(`[ShellDetection] Defaulting to Bash for session ${sessionId}`)
+    shellTypeCache.set(sessionId, ShellType.BASH)
+    return ShellType.BASH
+  } catch (error) {
+    console.error(`[ShellDetection] Error detecting shell type for session ${sessionId}:`, error)
+    // Default to bash on error
+    return ShellType.BASH
+  }
+}
+
 // Helper function to determine if an exit code represents a real system error
 // We only treat very specific exit codes as actual errors that should interrupt the flow
 function isSystemError(_command: string, exitCode: number | null): boolean {
@@ -21,6 +115,39 @@ function isSystemError(_command: string, exitCode: number | null): boolean {
     return false // null or 0 is always success
   }
   return false
+}
+
+// Helper function to get appropriate pty configuration based on shell type
+function getPtyConfig(shellType: ShellType): { pty: boolean } {
+  // Disable pty for PowerShell to avoid conhost.exe issues
+  // Keep pty enabled for other shell types for full terminal functionality
+  return {
+    pty: shellType !== ShellType.POWERSHELL
+  }
+}
+
+// Helper function to build command based on shell type
+function buildShellCommand(command: string, shellType: ShellType): string {
+  if (shellType === ShellType.POWERSHELL) {
+    // PowerShell command execution with Base64 encoding
+    const base64Command = Buffer.from(command, 'utf-8').toString('base64')
+    return `[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${base64Command}')) | Invoke-Expression`
+  } else {
+    // Default to bash for all other shell types
+    const base64Command = Buffer.from(command, 'utf-8').toString('base64')
+    return `CHATERM_COMMAND_B64='${base64Command}' exec bash -l -c 'eval "$(echo $CHATERM_COMMAND_B64 | base64 -d)"'`
+  }
+}
+
+// Helper function to build streaming command based on shell type
+function buildStreamingShellCommand(command: string, shellType: ShellType): string {
+  if (shellType === ShellType.POWERSHELL) {
+    // PowerShell command execution for streaming
+    return `${command.replace(/"/g, '\"')}`
+  } else {
+    // Default to bash for all other shell types
+    return `exec bash -l -c '${command.replace(/'/g, "'\\''")}'`
+  }
 }
 
 export async function remoteSshConnect(connectionInfo: ConnectionInfo): Promise<{ id?: string; error?: string }> {
@@ -141,8 +268,10 @@ export async function remoteSshExec(
   }
   console.log(`Starting SSH command: ${command} (Session: ${sessionId})`)
 
-  const base64Command = Buffer.from(command, 'utf-8').toString('base64')
-  const shellCommand = `CHATERM_COMMAND_B64='${base64Command}' exec bash -l -c 'eval "$(echo $CHATERM_COMMAND_B64 | base64 -d)"'`
+  // Detect shell type automatically
+  const shellType = await detectShellType(sessionId)
+  const shellCommand = buildShellCommand(command, shellType)
+  console.log(shellCommand)
 
   return new Promise((resolve) => {
     let timeoutHandler: NodeJS.Timeout
@@ -156,7 +285,8 @@ export async function remoteSshExec(
       }
     }
 
-    conn.exec(shellCommand, { pty: true }, (err, stream) => {
+    const ptyConfig = getPtyConfig(shellType)
+    conn.exec(shellCommand, ptyConfig, (err, stream) => {
       if (err) {
         safeResolve({ success: false, error: err.message })
         return
@@ -224,7 +354,10 @@ export async function remoteSshExecStream(
 
   console.log(`Starting SSH command (stream): ${command} (Session: ${sessionId})`)
 
-  const shellCommand = `exec bash -l -c '${command.replace(/'/g, "'\\''")}'`
+  // Detect shell type automatically
+  const shellType = await detectShellType(sessionId)
+  const shellCommand = buildStreamingShellCommand(command, shellType)
+  console.log(shellCommand)
 
   return new Promise((resolve) => {
     let timeoutHandler: NodeJS.Timeout
@@ -238,7 +371,8 @@ export async function remoteSshExecStream(
       }
     }
 
-    conn.exec(shellCommand, { pty: true }, (err, stream) => {
+    const ptyConfig = getPtyConfig(shellType)
+    conn.exec(shellCommand, ptyConfig, (err, stream) => {
       if (err) {
         safeResolve({ success: false, error: err.message })
         return
@@ -313,6 +447,9 @@ export async function remoteSshDisconnect(sessionId: string): Promise<{ success?
     stream.end()
     remoteShellStreams.delete(sessionId)
   }
+
+  // Clean up shell type cache
+  shellTypeCache.delete(sessionId)
 
   const reuseInfo = reusedRemoteSessions.get(sessionId)
   if (reuseInfo) {

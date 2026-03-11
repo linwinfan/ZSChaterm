@@ -5,6 +5,9 @@ import { spawn } from 'child_process'
 import { Duplex } from 'stream'
 import type { CommandGenerationContext } from '@shared/WebviewMessage'
 
+// Move the import to after the function definition to avoid circular dependency
+import { detectShellType, ShellType } from './agentHandle'
+
 function safeAppPath(): string {
   try {
     const { app } = require('electron') as { app?: { getAppPath?: () => string } }
@@ -1621,18 +1624,35 @@ const getSystemInfo = async (id: string): Promise<CommandGenerationContext> => {
     throw new Error('No active SSH connection found')
   }
 
-  const systemInfoScript = `uname -a | sed 's/^/OS_VERSION:/' && echo "DEFAULT_SHELL:$SHELL" && echo "HOME_DIR:$HOME" && hostname | sed 's/^/HOSTNAME:/' && whoami | sed 's/^/USERNAME:/' && (sudo -n true 2>/dev/null && echo "SUDO_CHECK:has sudo permission" || echo "SUDO_CHECK:no sudo permission")`
+  // Detect shell type to use appropriate system info script
+  const shellType = await detectShellType(id)
 
-  const inferPlatformFromOsVersion = (osVersion: string): string => {
+  // Platform-specific system information scripts
+  const systemInfoScripts = {
+    [ShellType.BASH]: `uname -a | sed 's/^/OS_VERSION:/' && echo "DEFAULT_SHELL:$SHELL" && echo "HOME_DIR:$HOME" && hostname | sed 's/^/HOSTNAME:/' && whoami | sed 's/^/USERNAME:/' && (sudo -n true 2>/dev/null && echo "SUDO_CHECK:has sudo permission" || echo "SUDO_CHECK:no sudo permission")`,
+    [ShellType.POWERSHELL]: `Write-Host "OS_VERSION: $(Get-WmiObject -Class Win32_OperatingSystem).Caption $((Get-WmiObject -Class Win32_OperatingSystem).Version)"; ` +
+                           `Write-Host "DEFAULT_SHELL:PowerShell"; ` +
+                           `Write-Host "HOME_DIR:$env:USERPROFILE"; ` +
+                           `Write-Host "HOSTNAME:$env:COMPUTERNAME"; ` +
+                           `Write-Host "USERNAME:$env:USERNAME"; ` +
+                           `Write-Host "SUDO_CHECK:$(if (([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) { 'has sudo permission' } else { 'no sudo permission' })"`
+  }
+
+  const systemInfoScript = systemInfoScripts[shellType] || systemInfoScripts[ShellType.BASH]
+
+  const inferPlatformFromOsVersion = (osVersion: string, shell: string): string => {
     const v = (osVersion || '').toLowerCase()
+    if (shell.toLowerCase().includes('powershell')) return 'win32'
     if (v.includes('darwin')) return 'darwin'
     if (v.includes('linux')) return 'linux'
     if (v.includes('mingw') || v.includes('msys') || v.includes('cygwin')) return 'win32'
+    if (v.includes('windows') || v.includes('microsoft')) return 'win32'
     return 'unknown'
   }
 
   return new Promise((resolve, reject) => {
-    conn.exec(systemInfoScript, (err, stream) => {
+    const ptyConfig = { pty: shellType !== ShellType.POWERSHELL }
+    conn.exec(systemInfoScript, ptyConfig, (err, stream) => {
       if (err) {
         return reject(err)
       }
@@ -1680,7 +1700,7 @@ const getSystemInfo = async (id: string): Promise<CommandGenerationContext> => {
           }
         })
 
-        result.platform = inferPlatformFromOsVersion(result.osVersion || '')
+        result.platform = inferPlatformFromOsVersion(result.osVersion || '', result.shell || '')
         if (!result.shell) {
           result.shell = 'bash'
         }
