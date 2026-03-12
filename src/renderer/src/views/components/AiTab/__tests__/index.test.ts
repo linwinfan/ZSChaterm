@@ -35,30 +35,11 @@ const mockWindowApi = {
 }
 
 // Mock dependencies
-vi.mock('@/services/userConfigStoreService', () => ({
-  default: {
-    getConfig: vi.fn().mockResolvedValue({}),
-    setConfig: vi.fn().mockResolvedValue(undefined)
-  }
-}))
-
-vi.mock('@/utils/eventBus', () => ({
-  default: {
-    emit: vi.fn(),
-    on: vi.fn(),
-    off: vi.fn()
-  }
-}))
-
 vi.mock('@renderer/agent/storage/state', () => ({
   getGlobalState: vi.fn(),
   updateGlobalState: vi.fn(),
   storeSecret: vi.fn(),
   getSecret: vi.fn()
-}))
-
-vi.mock('@api/user/user', () => ({
-  getUser: vi.fn()
 }))
 
 describe('AiTab Component - Composable Integration Tests', () => {

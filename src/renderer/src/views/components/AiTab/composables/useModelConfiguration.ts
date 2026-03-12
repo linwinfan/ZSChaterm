@@ -3,7 +3,6 @@ import { createGlobalState } from '@vueuse/core'
 import { getGlobalState, updateGlobalState, storeSecret, getSecret } from '@renderer/agent/storage/state'
 import { GlobalStateKey } from '@renderer/agent/storage/state-keys'
 import { notification } from 'ant-design-vue'
-import { getUser } from '@api/user/user'
 import { focusChatInput } from './useTabManagement'
 import { useSessionState } from './useSessionState'
 
@@ -18,13 +17,6 @@ interface ModelOption {
   checked: boolean
   type: string
   apiProvider: string
-}
-
-interface DefaultModel {
-  id: string
-  name?: string
-  provider?: string
-  [key: string]: unknown
 }
 
 const isEmptyValue = (value: unknown): boolean => value === undefined || value === ''
@@ -67,7 +59,7 @@ export const useModelConfiguration = createGlobalState(() => {
 
   const initModel = async () => {
     try {
-      // First initialize model options list
+      // Initialize model options list from existing global state
       const modelOptions = (await getGlobalState('modelOptions')) as ModelOption[]
 
       modelOptions.sort((a, b) => {
@@ -178,47 +170,17 @@ export const useModelConfiguration = createGlobalState(() => {
   const initModelOptions = async () => {
     try {
       modelsLoading.value = true
-      const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
+      // Just load existing model options without server calls
       const savedModelOptions = ((await getGlobalState('modelOptions')) || []) as ModelOption[]
-      console.log('savedModelOptions', savedModelOptions)
 
-      if (savedModelOptions.length !== 0) {
-        return
-      }
-
-      // Skip loading built-in models if user skipped login
-      if (isSkippedLogin) {
+      if (savedModelOptions.length === 0) {
         // Initialize with empty model options for guest users
-        await updateGlobalState('modelOptions', [])
+        const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
+        if (isSkippedLogin) {
+          await updateGlobalState('modelOptions', [])
+        }
         return
       }
-
-      let defaultModels: DefaultModel[] = []
-
-      await getUser({}).then((res) => {
-        console.log('res', res)
-        defaultModels = res?.data?.models || []
-        updateGlobalState('defaultBaseUrl', res?.data?.llmGatewayAddr)
-        storeSecret('defaultApiKey', res?.data?.key)
-      })
-
-      const modelOptions: ModelOption[] = defaultModels.map((model) => ({
-        id: String(model) || '',
-        name: String(model) || '',
-        checked: true,
-        type: 'standard',
-        apiProvider: 'default'
-      }))
-
-      const serializableModelOptions = modelOptions.map((model) => ({
-        id: model.id,
-        name: model.name,
-        checked: Boolean(model.checked),
-        type: model.type || 'standard',
-        apiProvider: model.apiProvider || 'default'
-      }))
-
-      await updateGlobalState('modelOptions', serializableModelOptions)
     } catch (error) {
       console.error('Failed to get/save model options:', error)
       notification.error({
@@ -230,54 +192,11 @@ export const useModelConfiguration = createGlobalState(() => {
   }
 
   const refreshModelOptions = async (): Promise<void> => {
+    // This function is now a no-op since we don't fetch from server anymore
     const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
     if (isSkippedLogin) return
 
-    let serverModels: string[] = []
-    try {
-      const res = await getUser({})
-      serverModels = (res?.data?.models || []).map((model) => String(model))
-      await updateGlobalState('defaultBaseUrl', res?.data?.llmGatewayAddr)
-      await storeSecret('defaultApiKey', res?.data?.key)
-    } catch (error) {
-      console.error('Failed to refresh model options:', error)
-      return
-    }
-
-    // Skip update if server returns empty list to avoid accidental clearing
-    if (serverModels.length === 0) {
-      return
-    }
-
-    const savedModelOptions = ((await getGlobalState('modelOptions')) || []) as ModelOption[]
-    const serverSet = new Set(serverModels)
-
-    const existingStandard = savedModelOptions.filter((opt) => opt.type === 'standard')
-    const existingCustom = savedModelOptions.filter((opt) => opt.type !== 'standard')
-
-    const retainedStandard = existingStandard
-      .filter((opt) => serverSet.has(opt.name))
-      .map((opt) => ({
-        id: opt.id || opt.name,
-        name: opt.name,
-        checked: Boolean(opt.checked),
-        type: 'standard',
-        apiProvider: opt.apiProvider || 'default'
-      }))
-
-    const retainedNames = new Set(retainedStandard.map((opt) => opt.name))
-    const newStandard = serverModels
-      .filter((name) => !retainedNames.has(name))
-      .map((name) => ({
-        id: name,
-        name,
-        checked: true,
-        type: 'standard',
-        apiProvider: 'default'
-      }))
-
-    // Order: retained standard models, new standard models, then custom models
-    await updateGlobalState('modelOptions', [...retainedStandard, ...newStandard, ...existingCustom])
+    // Simply refresh from local state without server calls
     await initModel()
   }
 

@@ -445,7 +445,6 @@ import { notification } from 'ant-design-vue'
 import { updateGlobalState, getGlobalState, getSecret, storeSecret, getAllExtensionState } from '@renderer/agent/storage/state'
 import eventBus from '@/utils/eventBus'
 import i18n from '@/locales'
-import { getUser } from '@api/user/user'
 
 // Define interface for model options
 interface ModelOption {
@@ -457,13 +456,13 @@ interface ModelOption {
 }
 
 // Define interface for default models from API
-interface DefaultModel {
-  id: string
-  name?: string
-  provider?: string
+// interface DefaultModel {
+//   id: string
+//   name?: string
+//   provider?: string
 
-  [key: string]: unknown
-}
+//   [key: string]: unknown
+// }
 
 const { t } = i18n.global
 const modelOptions = ref<ModelOption[]>([])
@@ -864,48 +863,7 @@ const loadModelOptions = async () => {
       await saveModelOptions()
       return
     }
-
-    let defaultModels: DefaultModel[] = []
-    await getUser({}).then((res) => {
-      defaultModels = res?.data?.models || []
-      updateGlobalState('defaultBaseUrl', res?.data?.llmGatewayAddr)
-      storeSecret('defaultApiKey', res?.data?.key)
-    })
-    const savedModelOptions = (await getGlobalState('modelOptions')) || []
-    if (savedModelOptions && Array.isArray(savedModelOptions)) {
-      // 1. Filter out models that type=='standard' and do not exist in defaultModels
-      const filteredOptions = savedModelOptions.filter((option) => {
-        if (option.type !== 'standard') return true
-        return defaultModels.some((defaultModel) => defaultModel === option.name)
-      })
-
-      // 2. Add models that do not exist in savedModelOptions in defaultModels
-      defaultModels.forEach((defaultModel) => {
-        const exists = filteredOptions.some((option) => option.name === defaultModel)
-        if (!exists) {
-          filteredOptions.push({
-            id: defaultModel || '',
-            name: defaultModel || defaultModel || '',
-            checked: true,
-            type: 'standard',
-            apiProvider: 'default'
-          })
-        }
-      })
-
-      // Ensure loaded data contains all necessary properties
-      modelOptions.value = filteredOptions.map((option) => ({
-        id: option.id || '',
-        name: option.name || '',
-        checked: Boolean(option.checked),
-        type: option.type || 'standard',
-        apiProvider: option.apiProvider || 'default'
-      }))
-
-      // Sort model list: built-in models first, user-defined models last
-      sortModelOptions()
-    }
-    await saveModelOptions()
+    
   } catch (error) {
     console.error('Failed to load model options:', error)
   }

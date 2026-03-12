@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { useModelConfiguration } from '../useModelConfiguration'
 import * as stateModule from '@renderer/agent/storage/state'
-import { getUser } from '@api/user/user'
 import { ref } from 'vue'
 
 // Create a shared mock ref that can be updated in tests
@@ -13,10 +12,6 @@ vi.mock('@renderer/agent/storage/state', () => ({
   updateGlobalState: vi.fn(),
   storeSecret: vi.fn(),
   getSecret: vi.fn()
-}))
-
-vi.mock('@api/user/user', () => ({
-  getUser: vi.fn()
 }))
 
 vi.mock('../useTabManagement', () => ({
@@ -141,50 +136,6 @@ describe('useModelConfiguration', () => {
     })
   })
 
-  describe('initModelOptions', () => {
-    it('should skip initialization when model options already exist', async () => {
-      vi.mocked(stateModule.getGlobalState).mockImplementation(async (key) => {
-        if (key === 'modelOptions') return mockModelOptions
-        return null
-      })
-
-      const { initModelOptions } = useModelConfiguration()
-      await initModelOptions()
-
-      // Should return early and not call getUser since modelOptions already exists
-      expect(stateModule.getGlobalState).toHaveBeenCalledWith('modelOptions')
-    })
-
-    it('should fetch and save model options when none exist', async () => {
-      const mockGetUser = vi.fn().mockResolvedValue({
-        data: {
-          models: ['claude-3-5-sonnet', 'gpt-4'],
-          llmGatewayAddr: 'https://api.example.com',
-          key: 'test-key'
-        }
-      })
-
-      vi.mocked(stateModule.getGlobalState).mockImplementation(async (key) => {
-        if (key === 'modelOptions') return []
-        return null
-      })
-
-      // Mock getUser
-      const userModule = await import('@api/user/user')
-      vi.mocked(userModule.getUser).mockImplementation(mockGetUser)
-
-      const { initModelOptions } = useModelConfiguration()
-      await initModelOptions()
-
-      // Should fetch models from API
-      expect(mockGetUser).toHaveBeenCalled()
-      // Should save fetched models
-      expect(stateModule.updateGlobalState).toHaveBeenCalledWith('modelOptions', expect.any(Array))
-      expect(stateModule.updateGlobalState).toHaveBeenCalledWith('defaultBaseUrl', 'https://api.example.com')
-      expect(stateModule.storeSecret).toHaveBeenCalledWith('defaultApiKey', 'test-key')
-    })
-  })
-
   describe('handleChatAiModelChange', () => {
     it('should update apiProvider when model changes', async () => {
       vi.mocked(stateModule.getGlobalState).mockImplementation(async (key) => {
@@ -257,103 +208,6 @@ describe('useModelConfiguration', () => {
       // Verify that the function handles invalid config gracefully
       expect(result).toBeDefined()
       expect(result.success).toBe(false)
-    })
-  })
-
-  describe('refreshModelOptions', () => {
-    it('merges server models into existing options and preserves custom + checked state', async () => {
-      localStorage.removeItem('login-skipped')
-
-      const existing = [
-        { id: 's1', name: 'gpt-4', checked: false, type: 'standard', apiProvider: 'default' },
-        { id: 'c1', name: 'custom-x', checked: true, type: 'custom', apiProvider: 'openai' },
-        { id: 's2', name: 'old-standard', checked: true, type: 'standard', apiProvider: 'default' }
-      ]
-
-      // Expected order: retained standard, new standard, then custom
-      const mergedOptions = [
-        { id: 's1', name: 'gpt-4', checked: false, type: 'standard', apiProvider: 'default' },
-        { id: 'claude-3', name: 'claude-3', checked: true, type: 'standard', apiProvider: 'default' },
-        { id: 'c1', name: 'custom-x', checked: true, type: 'custom', apiProvider: 'openai' }
-      ]
-
-      let callCount = 0
-      vi.mocked(stateModule.getGlobalState).mockImplementation(async (key) => {
-        if (key === 'modelOptions') {
-          // First call returns existing, subsequent calls return merged
-          callCount++
-          return callCount === 1 ? existing : mergedOptions
-        }
-        if (key === 'apiProvider') return 'default'
-        if (key === 'defaultModelId') return ''
-        return null
-      })
-
-      vi.mocked(getUser).mockResolvedValue({
-        data: {
-          models: ['gpt-4', 'claude-3'],
-          llmGatewayAddr: 'https://api.example.com',
-          key: 'server-key'
-        }
-      } as any)
-
-      const { refreshModelOptions, AgentAiModelsOptions } = useModelConfiguration()
-      await refreshModelOptions()
-
-      // Verify order: retained standard, new standard, then custom
-      expect(stateModule.updateGlobalState).toHaveBeenCalledWith('modelOptions', [
-        { id: 's1', name: 'gpt-4', checked: false, type: 'standard', apiProvider: 'default' },
-        { id: 'claude-3', name: 'claude-3', checked: true, type: 'standard', apiProvider: 'default' },
-        { id: 'c1', name: 'custom-x', checked: true, type: 'custom', apiProvider: 'openai' }
-      ])
-      expect(stateModule.updateGlobalState).toHaveBeenCalledWith('defaultBaseUrl', 'https://api.example.com')
-      expect(stateModule.storeSecret).toHaveBeenCalledWith('defaultApiKey', 'server-key')
-      // Verify UI options are updated (initModel was called)
-      expect(AgentAiModelsOptions.value.map((o) => o.label)).toEqual(['claude-3', 'custom-x'])
-    })
-
-    it('does not update modelOptions when request fails', async () => {
-      localStorage.removeItem('login-skipped')
-
-      vi.mocked(stateModule.getGlobalState).mockImplementation(async (key) => {
-        if (key === 'modelOptions') return []
-        return null
-      })
-
-      vi.mocked(getUser).mockRejectedValue(new Error('network'))
-
-      const { refreshModelOptions } = useModelConfiguration()
-      await refreshModelOptions()
-
-      expect(stateModule.updateGlobalState).not.toHaveBeenCalledWith('modelOptions', expect.anything())
-    })
-
-    it('does not update modelOptions when server returns empty list', async () => {
-      localStorage.removeItem('login-skipped')
-
-      const existing = [{ id: 's1', name: 'gpt-4', checked: true, type: 'standard', apiProvider: 'default' }]
-
-      vi.mocked(stateModule.getGlobalState).mockImplementation(async (key) => {
-        if (key === 'modelOptions') return existing
-        return null
-      })
-
-      vi.mocked(getUser).mockResolvedValue({
-        data: {
-          models: [],
-          llmGatewayAddr: 'https://api.example.com',
-          key: 'server-key'
-        }
-      } as any)
-
-      const { refreshModelOptions } = useModelConfiguration()
-      await refreshModelOptions()
-
-      // Should not update modelOptions when server returns empty list
-      expect(stateModule.updateGlobalState).not.toHaveBeenCalledWith('modelOptions', expect.anything())
-      // But should still update base URL and API key
-      expect(stateModule.updateGlobalState).toHaveBeenCalledWith('defaultBaseUrl', 'https://api.example.com')
-      expect(stateModule.storeSecret).toHaveBeenCalledWith('defaultApiKey', 'server-key')
     })
   })
 })
