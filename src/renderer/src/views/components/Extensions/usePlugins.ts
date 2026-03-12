@@ -168,10 +168,10 @@ const loadPlugins = async () => {
 
 const loadStorePlugins = async () => {
   try {
-    const res: any = await listStorePlugins()
-    const data = res?.data || res
-    const plugins = data?.plugins || []
-
+    // const res: any = await listStorePlugins()
+    // const data = res?.data || res
+    // const plugins = data?.plugins || []
+    const plugins = []
     storePlugins.value = plugins.map((p: any) => ({
       pluginId: p.pluginId,
       name: p.name,

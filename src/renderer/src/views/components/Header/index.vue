@@ -144,22 +144,23 @@ const switchIcon = (dir, value) => {
 }
 const checkVersion = async () => {
   try {
-    const info = await api.checkUpdate()
-    console.log('Update check result:', info)
+    console.log('No update available')
+    // const info = await api.checkUpdate()
+    // console.log('Update check result:', info)
 
-    // Check if update is available based on the actual response structure
-    if (info && (info.isUpdateAvailable || info.updateInfo)) {
-      console.log('Update available, starting download...')
-      api.download()
-      api.autoUpdate((params) => {
-        console.log('Update status:', params)
-        if (params.status == 4) {
-          isAvailable.value = true
-        }
-      })
-    } else {
-      console.log('No update available')
-    }
+    // // Check if update is available based on the actual response structure
+    // if (info && (info.isUpdateAvailable || info.updateInfo)) {
+    //   console.log('Update available, starting download...')
+    //   api.download()
+    //   api.autoUpdate((params) => {
+    //     console.log('Update status:', params)
+    //     if (params.status == 4) {
+    //       isAvailable.value = true
+    //     }
+    //   })
+    // } else {
+    //   console.log('No update available')
+    // }
   } catch (error) {
     console.error('Failed to check for updates:', error)
   }

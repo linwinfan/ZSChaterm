@@ -33,7 +33,7 @@ const urls = {
   mobileLogin: '/user/login-mobile',
   updateUser: '/user/info',
   changePassword: '/user/password',
-  checkUserDevice: '/user/check-device',
+  // checkUserDevice: '/user/check-device',
   sendEmailBindCode: '/user/bind-email/send-code',
   verifyAndBindEmail: '/user/bind-email/verify',
   sendMobileBindCode: '/user/bind-mobile/send-code',
@@ -197,13 +197,13 @@ export function changePassword(data) {
   })
 }
 
-export function checkUserDevice(data) {
-  return request({
-    method: 'post',
-    url: urls.checkUserDevice,
-    data: data
-  })
-}
+// export function checkUserDevice(data) {
+//   return request({
+//     method: 'post',
+//     url: urls.checkUserDevice,
+//     data: data
+//   })
+// }
 
 export function sendEmailBindCode(params) {
   return request({
