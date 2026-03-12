@@ -966,7 +966,9 @@ export default {
     imageReadFailed: '图片读取失败',
     pleaseSelectImage: '请选择图片文件',
     avatarSettings: '头像设置',
-    localUpload: '本地上传'
+    guestCannotBindEmail: '访客用户无法绑定邮箱',
+    guestCannotBindMobile: '访客用户无法绑定手机号',
+    guestCannotUpdateAvatar: '访客用户无法更新头像',
   },
   update: {
     available: '有最新版本可以更新',

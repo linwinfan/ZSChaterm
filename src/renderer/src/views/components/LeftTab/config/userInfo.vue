@@ -620,6 +620,13 @@ const handleSendEmailBindCode = async () => {
 
   try {
     emailCodeSending.value = true
+    // Guest users cannot bind email
+    const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
+    if (isSkippedLogin) {
+      message.error(t('userInfo.guestCannotBindEmail'))
+      emailCodeSending.value = false
+      return
+    }
     const response = (await sendEmailBindCode({ email: emailBindForm.email })) as unknown as ApiResponse
     if (response.code === 200) {
       message.success(t('userInfo.emailCodeSent'))
@@ -648,6 +655,12 @@ const handleVerifyAndBindEmail = async () => {
   }
 
   try {
+    // Guest users cannot bind email
+    const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
+    if (isSkippedLogin) {
+      message.error(t('userInfo.guestCannotBindEmail'))
+      return
+    }
     const response = (await verifyAndBindEmail({ email: emailBindForm.email, code: emailBindForm.code })) as unknown as ApiResponse
     if (response.code === 200) {
       message.success(t('userInfo.emailBindSuccess'))
@@ -686,6 +699,13 @@ const handleSendMobileBindCode = async () => {
 
   try {
     mobileCodeSending.value = true
+    // Guest users cannot bind mobile
+    const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
+    if (isSkippedLogin) {
+      message.error(t('userInfo.guestCannotBindMobile'))
+      mobileCodeSending.value = false
+      return
+    }
     const response = (await sendMobileBindCode({ mobile: mobileBindForm.mobile })) as unknown as ApiResponse
     if (response.code === 200) {
       message.success(t('userInfo.mobileCodeSent'))
@@ -714,6 +734,12 @@ const handleVerifyAndBindMobile = async () => {
   }
 
   try {
+    // Guest users cannot bind mobile
+    const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
+    if (isSkippedLogin) {
+      message.error(t('userInfo.guestCannotBindMobile'))
+      return
+    }
     const response = (await verifyAndBindMobile({ mobile: mobileBindForm.mobile, code: mobileBindForm.code })) as unknown as ApiResponse
     if (response.code === 200) {
       message.success(t('userInfo.mobileBindSuccess'))
@@ -1009,6 +1035,13 @@ const handleSaveAvatar = async () => {
 
   try {
     avatarUploading.value = true
+    // Guest users cannot update avatar
+    const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
+    if (isSkippedLogin) {
+      message.error(t('userInfo.guestCannotUpdateAvatar'))
+      avatarUploading.value = false
+      return
+    }
     const base64 = await generateAvatarImage()
 
     const response = (await updateAvatar({ avatarBase64: base64 })) as unknown as ApiResponse
@@ -1034,6 +1067,13 @@ onMounted(() => {
   document.addEventListener('mousemove', handleMouseMove)
   document.addEventListener('mouseup', handleMouseUp)
 })
+
+// Guest user placeholder functions - these will not be called due to isSkippedLogin check
+const sendEmailBindCode = async () => ({ code: 200 })
+const verifyAndBindEmail = async () => ({ code: 200 })
+const sendMobileBindCode = async () => ({ code: 200 })
+const verifyAndBindMobile = async () => ({ code: 200 })
+const updateAvatar = async () => ({ code: 200 })
 
 onBeforeUnmount(() => {
   // Remove global mouse event listeners

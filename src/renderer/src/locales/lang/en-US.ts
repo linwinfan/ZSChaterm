@@ -976,7 +976,9 @@ export default {
     imageReadFailed: 'Failed to read image',
     pleaseSelectImage: 'Please select an image file',
     avatarSettings: 'Avatar Settings',
-    localUpload: 'Local Upload'
+    guestCannotBindEmail: 'Guest users cannot bind email',
+    guestCannotBindMobile: 'Guest users cannot bind mobile number',
+    guestCannotUpdateAvatar: 'Guest users cannot update avatar',
   },
   update: {
     available: 'A new version is available',

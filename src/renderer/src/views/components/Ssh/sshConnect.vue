@@ -124,9 +124,7 @@ import {
   type JumpServerStatusData
 } from './utils/jumpServerStatusHandler'
 import { getLastNonEmptyLine, isTerminalPromptLine } from './utils/terminalPrompt'
-//import { useDeviceStore } from '@/store/useDeviceStore'
 import { isFocusInAiTab } from '@/utils/domUtils'
-//import { checkUserDevice } from '@api/user/user'
 import { keywordHighlightService } from '@/services/keywordHighlightService'
 const { t } = useI18n()
 const selectFlag = ref(false)
@@ -350,23 +348,9 @@ let dbConfigStash: {
 } = {}
 let config
 
-// const deviceStore = useDeviceStore()
-const isOfficeDevice = ref(false)
 const isLocalConnect = ref(false)
 
-// const getUserInfo = async () => {
-//   try {
-//     const res = (await checkUserDevice({ ip: deviceStore.getDeviceIp, macAddress: deviceStore.getMacAddress })) as any
-//     if (res && res.code === 200) {
-//       isOfficeDevice.value = res.data.isOfficeDevice
-//     }
-//   } catch (error) {
-//     console.error(t('common.getUserInfoFailed'), error)
-//   }
-// }
-
 onMounted(async () => {
-  //await getUserInfo()
   config = await serviceUserConfig.getConfig()
   dbConfigStash = config
   queryCommandFlag.value = config.autoCompleteStatus == 1
@@ -1165,7 +1149,6 @@ const connectSSH = async () => {
       sshType: connSshType,
       terminalType: config.terminalType,
       agentForward: config.sshAgentsStatus === 1,
-      isOfficeDevice: isOfficeDevice.value,
       connIdentToken: jmsToken.value || '',
       asset_type: connAssetType, // Pass asset_type to main process for switch handling
       proxyCommand: props.connectData.proxyCommand || ''
