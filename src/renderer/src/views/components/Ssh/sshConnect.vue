@@ -1197,6 +1197,8 @@ const connectSSH = async () => {
         // Ensure scroll to bottom after successful connection
         terminal.value?.scrollToBottom()
         terminal.value?.focus()
+        // Auto open AI CHAT if not already opened
+        eventBus.emit('openAiRight')
       }, 200)
     } else {
       const resolvedMessage = result?.messageKey ? t(result.messageKey, result.messageParams || {}) : (result?.message as string)
@@ -1343,6 +1345,8 @@ const connectLocalSSH = async () => {
       handleResize()
       setTimeout(() => {
         handleResize()
+        // Auto open AI CHAT if not already opened
+        eventBus.emit('openAiRight')
       }, 200)
     } else {
       const errorMsg = formatStatusMessage(`Connection failed: ${result.message}`, 'error')
