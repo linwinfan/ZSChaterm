@@ -552,7 +552,7 @@ const getUserInfo = () => {
     localIp: deviceStore.getDeviceIp,
     macAddress: deviceStore.getMacAddress
   }
-  unChange.value = false  // Always read-only for guest users
+  unChange.value = false // Always read-only for guest users
   formState.username = userInfo.value.username || ''
   formState.name = userInfo.value.name || ''
   formState.mobile = userInfo.value.mobile || ''
@@ -765,41 +765,6 @@ const handleResetPassword = async () => {
   message.info(t('userInfo.guestReadOnly'))
 }
 
-const validatePassword = () => {
-  if (formState.newPassword.length < 6) {
-    message.error(t('userInfo.passwordLengthError'))
-    return false
-  }
-  if (strength.value < 1) {
-    message.error(t('userInfo.passwordStrengthError'))
-    return false
-  }
-  if (formState.newPassword !== formState.confirmPassword) {
-    message.error(t('userInfo.passwordMismatch'))
-    return false
-  }
-  return true
-}
-const validateSave = () => {
-  if (!formState.username || formState.username.length < 6 || formState.username.length > 20) {
-    message.error(t('userInfo.usernameLengthError'))
-    return false
-  }
-
-  if (!/^[a-zA-Z0-9_]+$/.test(formState.username)) {
-    message.error(t('userInfo.usernameFormatError'))
-    return false
-  }
-
-  if (!formState.name || formState.name.trim().length === 0) {
-    message.error(t('userInfo.nameRequired'))
-    return false
-  } else if (formState.name.length > 20) {
-    message.error(t('userInfo.nameTooLong'))
-    return false
-  }
-  return true
-}
 const handleSave = async () => {
   // Disable save for guest users
   message.info(t('userInfo.guestReadOnly'))
@@ -1069,11 +1034,11 @@ onMounted(() => {
 })
 
 // Guest user placeholder functions - these will not be called due to isSkippedLogin check
-const sendEmailBindCode = async () => ({ code: 200 })
-const verifyAndBindEmail = async () => ({ code: 200 })
-const sendMobileBindCode = async () => ({ code: 200 })
-const verifyAndBindMobile = async () => ({ code: 200 })
-const updateAvatar = async () => ({ code: 200 })
+const sendEmailBindCode = async (_payload: { email: string }): Promise<ApiResponse> => ({ code: 200 })
+const verifyAndBindEmail = async (_payload: { email: string; code: string }): Promise<ApiResponse> => ({ code: 200 })
+const sendMobileBindCode = async (_payload: { mobile: string }): Promise<ApiResponse> => ({ code: 200 })
+const verifyAndBindMobile = async (_payload: { mobile: string; code: string }): Promise<ApiResponse> => ({ code: 200 })
+const updateAvatar = async (_payload: { avatarBase64: string }): Promise<ApiResponse> => ({ code: 200 })
 
 onBeforeUnmount(() => {
   // Remove global mouse event listeners

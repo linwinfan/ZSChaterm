@@ -12,6 +12,13 @@ import piniaPluginPersistedstate from 'pinia-plugin-persistedstate'
 import { notification } from 'ant-design-vue'
 import { shortcutService } from './services/shortcutService'
 import { APP_EDITION } from './utils/edition'
+import * as storageState from './agent/storage/state'
+import { setupIndexDBMigrationListener } from './services/indexdb-migration-listener'
+import { initializeStartupModelCheck } from './services/llmStartupCheck'
+import { waitForAppUnlock } from './components/global/app-lock'
+import { userConfigStore } from '@/services/userConfigStoreService'
+
+let isUserConfigIpcRegistered = false
 
 // Set document title based on edition
 document.title = APP_EDITION === 'cn' ? 'Chaterm CN' : 'Chaterm'
@@ -20,15 +27,6 @@ document.title = APP_EDITION === 'cn' ? 'Chaterm CN' : 'Chaterm'
 notification.config({
   top: '30px'
 })
-// Import storage functions
-import * as storageState from './agent/storage/state'
-// Import IndexedDB migration listener
-import { setupIndexDBMigrationListener } from './services/indexdb-migration-listener'
-// Import LLM startup check
-import { initializeStartupModelCheck } from './services/llmStartupCheck'
-
-// Initialize IndexedDB migration listener
-setupIndexDBMigrationListener()
 
 const pinia = createPinia()
 pinia.use(piniaPluginPersistedstate)
@@ -58,30 +56,71 @@ initializeStartupModelCheck()
 
 if (import.meta.hot) {
   import.meta.hot.on('vite:afterUpdate', () => {
-    shortcutService.init()
+    void waitForAppUnlock().then(() => {
+      shortcutService.init()
+    })
   })
 }
 
-import { userConfigStore } from '@/services/userConfigStoreService'
+function registerUserConfigIpcHandler() {
+  if (isUserConfigIpcRegistered) {
+    return
+  }
 
-// Register IPC handlers when renderer process starts
-function setupIPCHandlers() {
   const electronAPI = (window as any).electron
 
-  if (!electronAPI?.ipcRenderer) return
+  if (!electronAPI?.ipcRenderer) {
+    return
+  }
+
   const { ipcRenderer } = electronAPI
 
-  ipcRenderer.on('userConfig:get', async () => {
+  ipcRenderer.on('userConfig:get', async (_event, payload: { requestId: string }) => {
     try {
       const config = await userConfigStore.getConfig()
-      ipcRenderer.send('userConfig:get-response', config)
+      ipcRenderer.send('userConfig:get-response', {
+        requestId: payload.requestId,
+        config
+      })
     } catch (error) {
-      const e = error as Error
-      ipcRenderer.send('userConfig:get-error', e.message)
+      const currentError = error as Error
+      ipcRenderer.send('userConfig:get-error', {
+        requestId: payload.requestId,
+        message: currentError.message
+      })
     }
+  })
+
+  isUserConfigIpcRegistered = true
+}
+
+function enablePostUnlockRendererServices() {
+  registerUserConfigIpcHandler()
+  setupIndexDBMigrationListener()
+}
+
+function setupDeferredRendererRegistrations() {
+  const electronAPI = (window as any).electron
+
+  if (!electronAPI?.ipcRenderer) {
+    return
+  }
+
+  const { ipcRenderer } = electronAPI
+
+  ipcRenderer.on('app:register-user-config-ipc', () => {
+    registerUserConfigIpcHandler()
+  })
+
+  ipcRenderer.on('app:register-indexdb-migration-listener', () => {
+    setupIndexDBMigrationListener()
+  })
+
+  void waitForAppUnlock().then(() => {
+    enablePostUnlockRendererServices()
   })
 }
 
-setupIPCHandlers()
+setupDeferredRendererRegistrations()
 
 export { pinia }

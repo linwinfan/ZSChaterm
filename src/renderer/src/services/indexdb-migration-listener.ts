@@ -1,10 +1,15 @@
 import { getUserInfo } from '@/utils/permission'
 
+let isIndexDBMigrationListenerRegistered = false
+
 /**
  * Initialize IndexedDB migration listener
  * Listen to migration data requests from main process, read data directly from IndexedDB and respond
  */
 export function setupIndexDBMigrationListener(): void {
+  if (isIndexDBMigrationListenerRegistered) {
+    return
+  }
   // ===== IndexedDB Migration IPC Listener =====
   // Register migration data request listener (directly operate IndexedDB, not dependent on simplified services)
   if (window.electron?.ipcRenderer) {
@@ -203,6 +208,7 @@ export function setupIndexDBMigrationListener(): void {
         })
       }
     })
+    isIndexDBMigrationListenerRegistered = true
     console.log('[Renderer] IndexedDB migration listener registered')
   }
   // ===== Migration Listener End =====

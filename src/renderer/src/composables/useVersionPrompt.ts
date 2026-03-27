@@ -1,5 +1,6 @@
 import { onMounted, watch, computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
+import { waitForAppUnlock } from '@/components/global/app-lock'
 import { useVersionPromptStore } from '@/store/versionPromptStore'
 
 const FETCH_DELAY_MS = 1200
@@ -13,7 +14,9 @@ export function useVersionPrompt() {
 
   const loadPromptWithDelay = async () => {
     await new Promise((resolve) => setTimeout(resolve, FETCH_DELAY_MS))
+
     try {
+      await waitForAppUnlock()
       await promptStore.loadPrompt()
       hasLoaded.value = true
     } catch (error) {

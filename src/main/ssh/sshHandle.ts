@@ -1630,12 +1630,13 @@ const getSystemInfo = async (id: string): Promise<CommandGenerationContext> => {
   // Platform-specific system information scripts
   const systemInfoScripts = {
     [ShellType.BASH]: `uname -a | sed 's/^/OS_VERSION:/' && echo "DEFAULT_SHELL:$SHELL" && echo "HOME_DIR:$HOME" && hostname | sed 's/^/HOSTNAME:/' && whoami | sed 's/^/USERNAME:/' && (sudo -n true 2>/dev/null && echo "SUDO_CHECK:has sudo permission" || echo "SUDO_CHECK:no sudo permission")`,
-    [ShellType.POWERSHELL]: `Write-Host "OS_VERSION: $(Get-WmiObject -Class Win32_OperatingSystem).Caption $((Get-WmiObject -Class Win32_OperatingSystem).Version)"; ` +
-                           `Write-Host "DEFAULT_SHELL:PowerShell"; ` +
-                           `Write-Host "HOME_DIR:$env:USERPROFILE"; ` +
-                           `Write-Host "HOSTNAME:$env:COMPUTERNAME"; ` +
-                           `Write-Host "USERNAME:$env:USERNAME"; ` +
-                           `Write-Host "SUDO_CHECK:$(if (([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) { 'has sudo permission' } else { 'no sudo permission' })"`
+    [ShellType.POWERSHELL]:
+      `Write-Host "OS_VERSION: $(Get-WmiObject -Class Win32_OperatingSystem).Caption $((Get-WmiObject -Class Win32_OperatingSystem).Version)"; ` +
+      `Write-Host "DEFAULT_SHELL:PowerShell"; ` +
+      `Write-Host "HOME_DIR:$env:USERPROFILE"; ` +
+      `Write-Host "HOSTNAME:$env:COMPUTERNAME"; ` +
+      `Write-Host "USERNAME:$env:USERNAME"; ` +
+      `Write-Host "SUDO_CHECK:$(if (([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) { 'has sudo permission' } else { 'no sudo permission' })"`
   }
 
   const systemInfoScript = systemInfoScripts[shellType] || systemInfoScripts[ShellType.BASH]

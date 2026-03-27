@@ -22,7 +22,6 @@ import { nextTick } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import ModelComponent from '../model.vue'
 import { notification } from 'ant-design-vue'
-import eventBus from '@/utils/eventBus'
 import { updateGlobalState, getGlobalState, getSecret, storeSecret, getAllExtensionState } from '@renderer/agent/storage/state'
 
 // Mock ant-design-vue components
@@ -137,11 +136,11 @@ describe('Model Component', () => {
             template: '<div class="a-card"><div class="ant-card-body"><slot /></div></div>'
           },
           'a-checkbox': {
-            template: '<label class="a-checkbox"><input type="checkbox" :checked="checked" @change="$emit('change', $event)" /><slot /></label>',
+            template: `<label class="a-checkbox"><input type="checkbox" :checked="checked" @change="$emit('change', $event)" /><slot /></label>`,
             props: ['checked']
           },
           'a-switch': {
-            template: '<input type="checkbox" class="a-switch" :checked="checked" @change="$emit('update:checked', $event.target.checked)" />',
+            template: `<input type="checkbox" class="a-switch" :checked="checked" @change="$emit('update:checked', $event.target.checked)" />`,
             props: ['checked']
           },
           'a-form-item': {
@@ -149,19 +148,19 @@ describe('Model Component', () => {
             props: ['label', 'label-col', 'wrapper-col']
           },
           'a-input': {
-            template: '<input class="a-input" :value="value" @input="$emit('update:value', $event.target.value)" />',
+            template: `<input class="a-input" :value="value" @input="$emit('update:value', $event.target.value)" />`,
             props: ['value', 'placeholder', 'size', 'type']
           },
           'a-input-password': {
-            template: '<input type="password" class="a-input-password" :value="value" @input="$emit('update:value', $event.target.value)" />',
+            template: `<input type="password" class="a-input-password" :value="value" @input="$emit('update:value', $event.target.value)" />`,
             props: ['value', 'placeholder']
           },
           'a-select': {
-            template: '<select class="a-select" :value="value" @change="$emit('update:value', $event.target.value)"><slot /></select>',
+            template: `<select class="a-select" :value="value" @change="$emit('update:value', $event.target.value)"><slot /></select>`,
             props: ['value', 'options', 'placeholder', 'size', 'show-search']
           },
           'a-button': {
-            template: '<button class="a-button" :class="{ loading }" :disabled="disabled" @click="$emit('click')"><slot /></button>',
+            template: `<button class="a-button" :class="{ loading }" :disabled="disabled" @click="$emit('click')"><slot /></button>`,
             props: ['type', 'size', 'loading', 'disabled']
           }
         },
@@ -260,13 +259,24 @@ describe('Model Component', () => {
       expect(getSecret).toHaveBeenCalled()
     })
 
-    it('should load model options on mount', async () => {
+    it('should load model options on mount for guest users', async () => {
+      localStorage.setItem('login-skipped', 'true')
+
       wrapper = createWrapper()
       await nextTick()
       // Wait for async operations in onMounted
       await new Promise((resolve) => setTimeout(resolve, 50))
 
       expect(getGlobalState).toHaveBeenCalledWith('modelOptions')
+    })
+
+    it('should not load model options on mount when login is not skipped', async () => {
+      wrapper = createWrapper()
+      await nextTick()
+      // Wait for async operations in onMounted
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      expect(getGlobalState).not.toHaveBeenCalledWith('modelOptions')
     })
 
     it('should handle config load errors', async () => {
@@ -286,6 +296,7 @@ describe('Model Component', () => {
 
   describe('Model List Display', () => {
     beforeEach(async () => {
+      localStorage.setItem('login-skipped', 'true')
       ;(getGlobalState as ReturnType<typeof vi.fn>).mockImplementation(async (key: string) => {
         if (key === 'modelOptions') {
           return [
@@ -315,20 +326,22 @@ describe('Model Component', () => {
       expect(modelList.exists()).toBe(true)
     })
 
-    it('should render model items', () => {
+    it('should render guest custom model items', () => {
       const modelItems = wrapper.findAll('.model-item')
-      expect(modelItems.length).toBeGreaterThan(0)
+      expect(modelItems.length).toBe(1)
     })
 
-    it('should display model names correctly', () => {
+    it('should display guest custom model names correctly', () => {
       const modelItems = wrapper.findAll('.model-item')
-      expect(modelItems.length).toBeGreaterThan(0)
+      expect(modelItems).toHaveLength(1)
+      expect(modelItems[0].text()).toContain('custom-model')
+      expect(modelItems[0].text()).not.toContain('gpt-4')
     })
 
-    it('should show thinking icon for Thinking models', async () => {
+    it('should show thinking icon for Thinking custom models', async () => {
       ;(getGlobalState as ReturnType<typeof vi.fn>).mockImplementation(async (key: string) => {
         if (key === 'modelOptions') {
-          return [{ id: 'gpt-4', name: 'gpt-4-Thinking', checked: true, type: 'standard', apiProvider: 'default' }]
+          return [{ id: 'custom-thinking', name: 'custom-model-Thinking', checked: true, type: 'custom', apiProvider: 'openai' }]
         }
         if (key === 'awsRegion') return 'us-east-1'
         if (key === 'awsUseCrossRegionInference') return false
@@ -375,7 +388,7 @@ describe('Model Component', () => {
       expect(removeButton.exists()).toBe(true)
     })
 
-    it('should not display remove button for standard models', async () => {
+    it('should not display remove button for standard models in guest mode', async () => {
       ;(getGlobalState as ReturnType<typeof vi.fn>).mockImplementation(async (key: string) => {
         if (key === 'modelOptions') {
           return [{ id: 'gpt-4', name: 'gpt-4', checked: true, type: 'standard', apiProvider: 'default' }]
@@ -387,6 +400,7 @@ describe('Model Component', () => {
       await nextTick()
       await nextTick()
 
+      expect(wrapper.findAll('.model-item')).toHaveLength(0)
       const removeButton = wrapper.find('.remove-button')
       expect(removeButton.exists()).toBe(false)
     })

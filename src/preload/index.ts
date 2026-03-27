@@ -380,6 +380,42 @@ const initUserDatabase = async (data: { uid: number }) => {
   }
 }
 
+const getAppLockStatus = async () => {
+  try {
+    const result = await ipcRenderer.invoke('app-lock:get-status')
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const setAppLockPassword = async (password: string) => {
+  try {
+    const result = await ipcRenderer.invoke('app-lock:set-password', { password })
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const verifyAppLockPassword = async (password: string) => {
+  try {
+    const result = await ipcRenderer.invoke('app-lock:verify-password', { password })
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const lockApp = async () => {
+  try {
+    const result = await ipcRenderer.invoke('app-lock:lock')
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
 // User snippet operations
 const userSnippetOperation = async (data: { operation: 'list' | 'create' | 'delete' | 'update' | 'swap' | 'reorder'; params?: unknown }) => {
   try {
@@ -524,6 +560,10 @@ const api = {
   getTaskMetadata,
   getUserHosts,
   initUserDatabase,
+  getAppLockStatus,
+  setAppLockPassword,
+  verifyAppLockPassword,
+  lockApp,
   userSnippetOperation,
   refreshOrganizationAssets,
   updateOrganizationAssetFavorite,

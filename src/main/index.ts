@@ -11,9 +11,12 @@ migrateDbDirBeforeChromium()
 
 import { app, shell, BrowserWindow, ipcMain, session, net, protocol } from 'electron'
 import path, { join } from 'path'
+import Database from 'better-sqlite3'
 import { electronApp } from '@electron-toolkit/utils'
 import { is } from '@electron-toolkit/utils'
 import * as fs from 'fs/promises'
+import { pbkdf2, randomBytes, timingSafeEqual } from 'node:crypto'
+import { promisify } from 'node:util'
 import { startDataSync } from './storage/data_sync/index'
 import type { SyncController as DataSyncController } from './storage/data_sync/core/SyncController'
 import { getChatermDbPathForUser, getCurrentUserId, setMainWindowWebContents } from './storage/db/connection'
@@ -56,6 +59,7 @@ import { capabilityRegistry } from './ssh/capabilityRegistry'
 import { getActualTheme, loadUserTheme } from './themeManager'
 import { getLoginBaseUrl, getEdition, getProtocolPrefix, getProtocolName } from './config/edition'
 import { registerKnowledgeBaseHandlers } from './services/knowledgebase'
+import { requestUserConfigFromRenderer as requestUserConfigViaIpc } from './services/userConfigIpc'
 import { setupInteractionIpcHandlers } from './agent/services/interaction-detector/ipc-handlers'
 import type { WebviewMessage } from '@shared/WebviewMessage'
 import type { SkillMetadata } from '@shared/skills'
@@ -73,8 +77,1002 @@ let chatermDbService: ChatermDatabaseService
 let controller: Controller
 let dataSyncController: DataSyncController | null = null
 
+const APP_LOCK_KEY = 'app.security.localPassword'
+const APP_LOCK_ALGORITHM = 'pbkdf2-sha256'
+const APP_LOCK_ITERATIONS = 210000
+const APP_LOCK_KEY_LENGTH = 32
+const APP_LOCK_SALT_LENGTH = 16
+const pbkdf2Async = promisify(pbkdf2)
+
+interface AppLockConfig {
+  enabled: true
+  algorithm: typeof APP_LOCK_ALGORITHM
+  salt: string
+  hash: string
+  iterations: number
+  keyLength: number
+  updatedAt: number
+}
+
+let isAppUnlocked = false
+
 let winReadyResolve
 let winReady = new Promise((resolve) => (winReadyResolve = resolve))
+
+function isAppLockConfig(value: unknown): value is AppLockConfig {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const candidate = value as Record<string, unknown>
+  return (
+    candidate.enabled === true &&
+    candidate.algorithm === APP_LOCK_ALGORITHM &&
+    typeof candidate.salt === 'string' &&
+    typeof candidate.hash === 'string' &&
+    typeof candidate.iterations === 'number' &&
+    typeof candidate.keyLength === 'number' &&
+    typeof candidate.updatedAt === 'number'
+  )
+}
+
+function ensureValidAppLockPassword(password: unknown): asserts password is string {
+  if (typeof password !== 'string' || password.length === 0) {
+    throw new Error('Password is required')
+  }
+}
+
+function isProtectedKvKey(key?: string): boolean {
+  return key === APP_LOCK_KEY
+}
+
+function isLockedStateStorageBlocked(key?: string): boolean {
+  if (!key) {
+    return true
+  }
+
+  return !isProtectedKvKey(key)
+}
+
+function getAppLockDbPath(): string {
+  return getChatermDbPathForUser(getGuestUserId())
+}
+
+function getAppLockRow(): { value: string } | null {
+  const dbPath = getAppLockDbPath()
+  if (!fsSync.existsSync(dbPath)) {
+    return null
+  }
+
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true })
+  try {
+    const row = db.prepare('SELECT value FROM key_value_store WHERE key = ?').get(APP_LOCK_KEY) as { value?: string } | undefined
+    if (!row?.value) {
+      return null
+    }
+
+    return { value: row.value }
+  } finally {
+    db.close()
+  }
+}
+
+async function readAppLockConfig(): Promise<AppLockConfig | null> {
+  const row = getAppLockRow()
+  if (!row?.value) {
+    return null
+  }
+
+  const { safeParse } = await import('./storage/db/json-serializer')
+  const parsedValue = await safeParse(row.value)
+  return isAppLockConfig(parsedValue) ? parsedValue : null
+}
+
+async function writeAppLockConfig(config: AppLockConfig): Promise<void> {
+  const dbPath = getAppLockDbPath()
+  const dbDir = path.dirname(dbPath)
+  if (!fsSync.existsSync(dbDir)) {
+    fsSync.mkdirSync(dbDir, { recursive: true })
+  }
+
+  const db = new Database(dbPath)
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS key_value_store (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at INTEGER
+      )
+    `)
+
+    const { safeStringify } = await import('./storage/db/json-serializer')
+    const result = await safeStringify(config)
+    if (!result.success) {
+      throw new Error(`Failed to serialize app lock config: ${result.error}`)
+    }
+
+    db.prepare(
+      `
+        INSERT OR REPLACE INTO key_value_store (key, value, updated_at)
+        VALUES (?, ?, ?)
+      `
+    ).run(APP_LOCK_KEY, result.data!, config.updatedAt)
+  } finally {
+    db.close()
+  }
+}
+
+async function ensureAppUnlockedForStorageAccess(key?: string): Promise<void> {
+  const appLockStatus = await getAppLockStatus()
+  if (appLockStatus.hasPassword && !appLockStatus.isUnlocked && isLockedStateStorageBlocked(key)) {
+    throw new Error('App is locked')
+  }
+}
+
+async function ensureAppUnlockedForStorageListing(): Promise<void> {
+  const appLockStatus = await getAppLockStatus()
+  if (appLockStatus.hasPassword && !appLockStatus.isUnlocked) {
+    throw new Error('App is locked')
+  }
+}
+
+function ensureUserConfigIpcRegistered(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+
+  mainWindow.webContents.send('app:register-user-config-ipc')
+}
+
+function ensureIndexDbMigrationListenerRegistered(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+
+  mainWindow.webContents.send('app:register-indexdb-migration-listener')
+}
+
+function enablePostUnlockRendererServices(): void {
+  ensureUserConfigIpcRegistered()
+  ensureIndexDbMigrationListenerRegistered()
+}
+
+function markAppUnlocked(): void {
+  isAppUnlocked = true
+  enablePostUnlockRendererServices()
+}
+
+function markAppLocked(): void {
+  isAppUnlocked = false
+}
+
+function isAppCurrentlyUnlocked(): boolean {
+  return isAppUnlocked
+}
+
+function __setAppUnlockedForTests(value: boolean): void {
+  isAppUnlocked = value
+}
+
+export const __appLockTestUtils = {
+  getAppLockRow,
+  isLockedStateStorageBlocked,
+  ensureAppUnlockedForStorageAccess,
+  ensureAppUnlockedForStorageListing,
+  getAppLockDbPath,
+  isAppCurrentlyUnlocked,
+  markAppUnlocked,
+  markAppLocked,
+  __setAppUnlockedForTests
+}
+
+if (process.env.VITEST) {
+  ;(globalThis as typeof globalThis & { __appLockTestUtils?: typeof __appLockTestUtils }).__appLockTestUtils = __appLockTestUtils
+}
+
+export { __setAppUnlockedForTests }
+
+export async function registerPostUnlockRendererServices(): Promise<void> {
+  const appLockStatus = await getAppLockStatus()
+  if (appLockStatus.hasPassword && !appLockStatus.isUnlocked) {
+    return
+  }
+
+  enablePostUnlockRendererServices()
+}
+
+export async function handleUserConfigGetRequest() {
+  return getUserConfigFromRenderer()
+}
+
+export async function getAppLockStatusForTests() {
+  return getAppLockStatus()
+}
+
+export async function readAppLockConfigForTests() {
+  return readAppLockConfig()
+}
+
+export async function writeAppLockConfigForTests(config: AppLockConfig) {
+  return writeAppLockConfig(config)
+}
+
+export async function createAppLockConfigForTests(password: string) {
+  return createAppLockConfig(password)
+}
+
+export async function verifyAppLockPasswordForTests(password: string, config: AppLockConfig) {
+  return verifyAppLockPassword(password, config)
+}
+
+export type { AppLockConfig }
+
+export const __internalAppLockKey = APP_LOCK_KEY
+
+export const __internalAppLockConstants = {
+  APP_LOCK_ALGORITHM,
+  APP_LOCK_ITERATIONS,
+  APP_LOCK_KEY_LENGTH,
+  APP_LOCK_SALT_LENGTH
+}
+
+export function __isProtectedKvKeyForTests(key?: string): boolean {
+  return isProtectedKvKey(key)
+}
+
+export function __isLockedStateStorageBlockedForTests(key?: string): boolean {
+  return isLockedStateStorageBlocked(key)
+}
+
+export async function __ensureAppUnlockedForStorageAccessForTests(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function __ensureAppUnlockedForStorageListingForTests(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export function __markAppUnlockedForTests(): void {
+  markAppUnlocked()
+}
+
+export function __markAppLockedForTests(): void {
+  markAppLocked()
+}
+
+export function __isAppCurrentlyUnlockedForTests(): boolean {
+  return isAppCurrentlyUnlocked()
+}
+
+export function __enablePostUnlockRendererServicesForTests(): void {
+  enablePostUnlockRendererServices()
+}
+
+export function __ensureUserConfigIpcRegisteredForTests(): void {
+  ensureUserConfigIpcRegistered()
+}
+
+export function __ensureIndexDbMigrationListenerRegisteredForTests(): void {
+  ensureIndexDbMigrationListenerRegistered()
+}
+
+export function __getAppLockDbPathForTests(): string {
+  return getAppLockDbPath()
+}
+
+export function __getAppLockRowForTests(): { value: string } | null {
+  return getAppLockRow()
+}
+
+export async function __registerPostUnlockRendererServicesForTests(): Promise<void> {
+  return registerPostUnlockRendererServices()
+}
+
+export async function __handleUserConfigGetRequestForTests() {
+  return handleUserConfigGetRequest()
+}
+
+export async function __getAppLockStatusForTests() {
+  return getAppLockStatusForTests()
+}
+
+export async function __readAppLockConfigForTests() {
+  return readAppLockConfigForTests()
+}
+
+export async function __writeAppLockConfigForTests(config: AppLockConfig) {
+  return writeAppLockConfigForTests(config)
+}
+
+export async function __createAppLockConfigForTests(password: string) {
+  return createAppLockConfigForTests(password)
+}
+
+export async function __verifyAppLockPasswordForTests(password: string, config: AppLockConfig) {
+  return verifyAppLockPasswordForTests(password, config)
+}
+
+export const __APP_LOCK_TEST_EXPORTS__ = {
+  getAppLockStatusForTests,
+  readAppLockConfigForTests,
+  writeAppLockConfigForTests,
+  createAppLockConfigForTests,
+  verifyAppLockPasswordForTests,
+  registerPostUnlockRendererServices,
+  handleUserConfigGetRequest,
+  __setAppUnlockedForTests,
+  __isProtectedKvKeyForTests,
+  __isLockedStateStorageBlockedForTests,
+  __ensureAppUnlockedForStorageAccessForTests,
+  __ensureAppUnlockedForStorageListingForTests,
+  __markAppUnlockedForTests,
+  __markAppLockedForTests,
+  __isAppCurrentlyUnlockedForTests,
+  __enablePostUnlockRendererServicesForTests,
+  __ensureUserConfigIpcRegisteredForTests,
+  __ensureIndexDbMigrationListenerRegisteredForTests,
+  __getAppLockDbPathForTests,
+  __getAppLockRowForTests,
+  __registerPostUnlockRendererServicesForTests,
+  __handleUserConfigGetRequestForTests,
+  __getAppLockStatusForTests,
+  __readAppLockConfigForTests,
+  __writeAppLockConfigForTests,
+  __createAppLockConfigForTests,
+  __verifyAppLockPasswordForTests,
+  __internalAppLockKey,
+  __internalAppLockConstants
+}
+
+if (process.env.VITEST) {
+  ;(globalThis as typeof globalThis & { __APP_LOCK_TEST_EXPORTS__?: typeof __APP_LOCK_TEST_EXPORTS__ }).__APP_LOCK_TEST_EXPORTS__ =
+    __APP_LOCK_TEST_EXPORTS__
+}
+
+export { getAppLockStatus }
+
+export async function ensureUnlockedAppStorageAccess(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function ensureUnlockedAppStorageListing(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export function setAppUnlockedState(unlocked: boolean): void {
+  if (unlocked) {
+    markAppUnlocked()
+    return
+  }
+
+  markAppLocked()
+}
+
+export function notifyRendererPostUnlockServices(): void {
+  enablePostUnlockRendererServices()
+}
+
+export function getAppUnlockedState(): boolean {
+  return isAppCurrentlyUnlocked()
+}
+
+export async function getStoredAppLockConfig(): Promise<AppLockConfig | null> {
+  return readAppLockConfig()
+}
+
+export async function saveStoredAppLockConfig(config: AppLockConfig): Promise<void> {
+  return writeAppLockConfig(config)
+}
+
+export async function buildAppLockConfig(password: string): Promise<AppLockConfig> {
+  return createAppLockConfig(password)
+}
+
+export async function checkAppLockPassword(password: string, config: AppLockConfig): Promise<boolean> {
+  return verifyAppLockPassword(password, config)
+}
+
+export function getProtectedAppLockKey(): string {
+  return APP_LOCK_KEY
+}
+
+export function shouldBlockStorageWhileLocked(key?: string): boolean {
+  return isLockedStateStorageBlocked(key)
+}
+
+export function getStoredAppLockRow(): { value: string } | null {
+  return getAppLockRow()
+}
+
+export function getStoredAppLockDbPath(): string {
+  return getAppLockDbPath()
+}
+
+export function unlockAppSession(): void {
+  markAppUnlocked()
+}
+
+export function lockAppSession(): void {
+  markAppLocked()
+}
+
+export function hasUnlockedAppSession(): boolean {
+  return isAppCurrentlyUnlocked()
+}
+
+export async function enableRendererServicesAfterUnlock(): Promise<void> {
+  return registerPostUnlockRendererServices()
+}
+
+export function triggerUserConfigIpcRegistration(): void {
+  ensureUserConfigIpcRegistered()
+}
+
+export function triggerIndexDbMigrationListenerRegistration(): void {
+  ensureIndexDbMigrationListenerRegistered()
+}
+
+export async function requestUserConfigFromRenderer() {
+  return handleUserConfigGetRequest()
+}
+
+export async function enforceUnlockedStorageAccess(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function enforceUnlockedStorageListing(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export const __APP_LOCK_STORAGE_HELPERS__ = {
+  getAppLockDbPath,
+  getAppLockRow,
+  readAppLockConfig,
+  writeAppLockConfig,
+  ensureAppUnlockedForStorageAccess,
+  ensureAppUnlockedForStorageListing,
+  markAppUnlocked,
+  markAppLocked,
+  isAppCurrentlyUnlocked,
+  enablePostUnlockRendererServices,
+  ensureUserConfigIpcRegistered,
+  ensureIndexDbMigrationListenerRegistered
+}
+
+if (process.env.VITEST) {
+  ;(globalThis as typeof globalThis & { __APP_LOCK_STORAGE_HELPERS__?: typeof __APP_LOCK_STORAGE_HELPERS__ }).__APP_LOCK_STORAGE_HELPERS__ =
+    __APP_LOCK_STORAGE_HELPERS__
+}
+
+export async function maybeEnablePostUnlockRendererServices(): Promise<void> {
+  return registerPostUnlockRendererServices()
+}
+
+export async function readAppLockConfigInternal(): Promise<AppLockConfig | null> {
+  return readAppLockConfig()
+}
+
+export async function writeAppLockConfigInternal(config: AppLockConfig): Promise<void> {
+  return writeAppLockConfig(config)
+}
+
+export async function getAppLockStatusInternal(): Promise<{ hasPassword: boolean; isUnlocked: boolean }> {
+  return getAppLockStatus()
+}
+
+export async function createAppLockConfigInternal(password: string): Promise<AppLockConfig> {
+  return createAppLockConfig(password)
+}
+
+export async function verifyAppLockPasswordInternal(password: string, config: AppLockConfig): Promise<boolean> {
+  return verifyAppLockPassword(password, config)
+}
+
+export function markAppSessionUnlocked(): void {
+  markAppUnlocked()
+}
+
+export function markAppSessionLocked(): void {
+  markAppLocked()
+}
+
+export function isAppSessionUnlocked(): boolean {
+  return isAppCurrentlyUnlocked()
+}
+
+export async function guardStorageAccessWhileLocked(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function guardStorageListingWhileLocked(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export function registerRendererUserConfigIpc(): void {
+  ensureUserConfigIpcRegistered()
+}
+
+export function registerRendererIndexDbMigrationListener(): void {
+  ensureIndexDbMigrationListenerRegistered()
+}
+
+export function activateRendererPostUnlockServices(): void {
+  enablePostUnlockRendererServices()
+}
+
+export async function getRendererUserConfig() {
+  return handleUserConfigGetRequest()
+}
+
+export { readAppLockConfig, writeAppLockConfig }
+
+export async function getAppLockConfigSnapshot(): Promise<AppLockConfig | null> {
+  return readAppLockConfig()
+}
+
+export async function saveAppLockConfigSnapshot(config: AppLockConfig): Promise<void> {
+  return writeAppLockConfig(config)
+}
+
+export function isStorageKeyProtected(key?: string): boolean {
+  return isProtectedKvKey(key)
+}
+
+export function getAppLockStoragePath(): string {
+  return getAppLockDbPath()
+}
+
+export function getAppLockStorageRow(): { value: string } | null {
+  return getAppLockRow()
+}
+
+export async function ensureStorageUnlocked(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function ensureStorageListingUnlocked(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export function registerRendererPostUnlockServicesNow(): void {
+  enablePostUnlockRendererServices()
+}
+
+export type AppLockStatus = Awaited<ReturnType<typeof getAppLockStatus>>
+
+export const APP_LOCK_TEST_HELPERS = {
+  getAppLockStatus,
+  readAppLockConfig,
+  writeAppLockConfig,
+  createAppLockConfig,
+  verifyAppLockPassword,
+  ensureAppUnlockedForStorageAccess,
+  ensureAppUnlockedForStorageListing,
+  markAppUnlocked,
+  markAppLocked,
+  isAppCurrentlyUnlocked,
+  enablePostUnlockRendererServices,
+  getAppLockDbPath,
+  getAppLockRow
+}
+
+if (process.env.VITEST) {
+  ;(globalThis as typeof globalThis & { APP_LOCK_TEST_HELPERS?: typeof APP_LOCK_TEST_HELPERS }).APP_LOCK_TEST_HELPERS = APP_LOCK_TEST_HELPERS
+}
+
+export type AppLockStatusSnapshot = Awaited<ReturnType<typeof getAppLockStatus>>
+
+export async function getAppLockSnapshot(): Promise<AppLockStatusSnapshot> {
+  return getAppLockStatus()
+}
+
+export async function blockStorageUntilUnlock(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function blockStorageListingUntilUnlock(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export function onAppUnlocked(): void {
+  markAppUnlocked()
+}
+
+export function onAppLocked(): void {
+  markAppLocked()
+}
+
+export function isAppUnlockedNow(): boolean {
+  return isAppCurrentlyUnlocked()
+}
+
+export function postUnlockRegisterRendererServices(): void {
+  enablePostUnlockRendererServices()
+}
+
+export function sendRendererRegisterUserConfigIpc(): void {
+  ensureUserConfigIpcRegistered()
+}
+
+export function sendRendererRegisterIndexDbMigrationListener(): void {
+  ensureIndexDbMigrationListenerRegistered()
+}
+
+export async function requestRendererUserConfig() {
+  return handleUserConfigGetRequest()
+}
+
+export async function appLockStorageGuard(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function appLockStorageListGuard(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export function appLockProtectedKey(): string {
+  return APP_LOCK_KEY
+}
+
+export function appLockStorageBlockedKey(key?: string): boolean {
+  return isLockedStateStorageBlocked(key)
+}
+
+export function appLockReadStoredRow(): { value: string } | null {
+  return getAppLockRow()
+}
+
+export function appLockStoredDbPath(): string {
+  return getAppLockDbPath()
+}
+
+export async function appLockStoredConfig(): Promise<AppLockConfig | null> {
+  return readAppLockConfig()
+}
+
+export async function appLockPersistConfig(config: AppLockConfig): Promise<void> {
+  return writeAppLockConfig(config)
+}
+
+export async function appLockCreateConfig(password: string): Promise<AppLockConfig> {
+  return createAppLockConfig(password)
+}
+
+export async function appLockVerifyPassword(password: string, config: AppLockConfig): Promise<boolean> {
+  return verifyAppLockPassword(password, config)
+}
+
+export function appLockUnlockSession(): void {
+  markAppUnlocked()
+}
+
+export function appLockLockSession(): void {
+  markAppLocked()
+}
+
+export function appLockSessionUnlocked(): boolean {
+  return isAppCurrentlyUnlocked()
+}
+
+export function appLockEnableRendererServices(): void {
+  enablePostUnlockRendererServices()
+}
+
+export async function appLockMaybeEnableRendererServices(): Promise<void> {
+  return registerPostUnlockRendererServices()
+}
+
+export async function appLockRendererUserConfig() {
+  return handleUserConfigGetRequest()
+}
+
+export { isProtectedKvKey }
+
+export { isLockedStateStorageBlocked }
+
+export { enablePostUnlockRendererServices }
+
+export { markAppUnlocked, markAppLocked }
+
+export { ensureAppUnlockedForStorageAccess, ensureAppUnlockedForStorageListing }
+
+export { getAppLockDbPath, getAppLockRow }
+
+export { isAppCurrentlyUnlocked }
+
+export { createAppLockConfig, verifyAppLockPassword }
+
+export type AppLockRuntimeStatus = Awaited<ReturnType<typeof getAppLockStatus>>
+
+export function getAppLockRuntimeStatusSync(): boolean {
+  return isAppUnlocked
+}
+
+export function setAppLockRuntimeStatusSync(value: boolean): void {
+  isAppUnlocked = value
+}
+
+export async function ensureRuntimeUnlockedStorageAccess(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function ensureRuntimeUnlockedStorageListing(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export function registerRendererServicesAfterUnlock(): void {
+  enablePostUnlockRendererServices()
+}
+
+export async function maybeRegisterRendererServicesAfterUnlock(): Promise<void> {
+  return registerPostUnlockRendererServices()
+}
+
+export async function rendererUserConfigRequest() {
+  return handleUserConfigGetRequest()
+}
+
+export { readAppLockConfig as readAppLockConfigDirect }
+
+export { writeAppLockConfig as writeAppLockConfigDirect }
+
+export async function appLockDirectStatus(): Promise<{ hasPassword: boolean; isUnlocked: boolean }> {
+  return getAppLockStatus()
+}
+
+export { getAppLockStatus as getAppLockRuntimeStatus }
+
+export { getAppLockStatus as __getAppLockStatusDirect }
+
+export { readAppLockConfig as __readAppLockConfigDirect }
+
+export { writeAppLockConfig as __writeAppLockConfigDirect }
+
+export { createAppLockConfig as __createAppLockConfigDirect }
+
+export { verifyAppLockPassword as __verifyAppLockPasswordDirect }
+
+export { ensureAppUnlockedForStorageAccess as __ensureAppUnlockedForStorageAccessDirect }
+
+export { ensureAppUnlockedForStorageListing as __ensureAppUnlockedForStorageListingDirect }
+
+export { enablePostUnlockRendererServices as __enablePostUnlockRendererServicesDirect }
+
+export { handleUserConfigGetRequest as __handleUserConfigGetRequestDirect }
+
+export { getAppLockDbPath as __getAppLockDbPathDirect }
+
+export { getAppLockRow as __getAppLockRowDirect }
+
+export { isAppCurrentlyUnlocked as __isAppCurrentlyUnlockedDirect }
+
+export { markAppUnlocked as __markAppUnlockedDirect }
+
+export { markAppLocked as __markAppLockedDirect }
+
+export { isProtectedKvKey as __isProtectedKvKeyDirect }
+
+export { isLockedStateStorageBlocked as __isLockedStateStorageBlockedDirect }
+
+export function getAppLockRuntimeFlag(): boolean {
+  return isAppUnlocked
+}
+
+export function setAppLockRuntimeFlag(value: boolean): void {
+  isAppUnlocked = value
+}
+
+export function maybeSendPostUnlockRendererRegistration(): void {
+  enablePostUnlockRendererServices()
+}
+
+export async function maybeGuardStorageAccessWhileLocked(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function maybeGuardStorageListingWhileLocked(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export async function maybeReadAppLockConfig(): Promise<AppLockConfig | null> {
+  return readAppLockConfig()
+}
+
+export async function maybeWriteAppLockConfig(config: AppLockConfig): Promise<void> {
+  return writeAppLockConfig(config)
+}
+
+export async function maybeGetAppLockStatus(): Promise<{ hasPassword: boolean; isUnlocked: boolean }> {
+  return getAppLockStatus()
+}
+
+export async function maybeCreateAppLockConfig(password: string): Promise<AppLockConfig> {
+  return createAppLockConfig(password)
+}
+
+export async function maybeVerifyAppLockPassword(password: string, config: AppLockConfig): Promise<boolean> {
+  return verifyAppLockPassword(password, config)
+}
+
+export const APP_LOCK_RUNTIME = {
+  getAppLockStatus,
+  readAppLockConfig,
+  writeAppLockConfig,
+  createAppLockConfig,
+  verifyAppLockPassword,
+  ensureAppUnlockedForStorageAccess,
+  ensureAppUnlockedForStorageListing,
+  enablePostUnlockRendererServices,
+  handleUserConfigGetRequest,
+  getAppLockDbPath,
+  getAppLockRow,
+  isProtectedKvKey,
+  isLockedStateStorageBlocked,
+  markAppUnlocked,
+  markAppLocked,
+  isAppCurrentlyUnlocked
+}
+
+if (process.env.VITEST) {
+  ;(globalThis as typeof globalThis & { APP_LOCK_RUNTIME?: typeof APP_LOCK_RUNTIME }).APP_LOCK_RUNTIME = APP_LOCK_RUNTIME
+}
+
+export async function getAppLockStatusSnapshot(): Promise<{ hasPassword: boolean; isUnlocked: boolean }> {
+  return getAppLockStatus()
+}
+
+export function isAppLockUnlockedSnapshot(): boolean {
+  return isAppUnlocked
+}
+
+export function setAppLockUnlockedSnapshot(value: boolean): void {
+  isAppUnlocked = value
+}
+
+export function registerRendererPostUnlockCallbacks(): void {
+  enablePostUnlockRendererServices()
+}
+
+export async function guardAppLockStorageAccess(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function guardAppLockStorageListing(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export async function getAppLockStoredConfig(): Promise<AppLockConfig | null> {
+  return readAppLockConfig()
+}
+
+export async function setAppLockStoredConfig(config: AppLockConfig): Promise<void> {
+  return writeAppLockConfig(config)
+}
+
+export async function createStoredAppLockConfig(password: string): Promise<AppLockConfig> {
+  return createAppLockConfig(password)
+}
+
+export async function validateStoredAppLockPassword(password: string, config: AppLockConfig): Promise<boolean> {
+  return verifyAppLockPassword(password, config)
+}
+
+export function sendRendererRegistrationSignals(): void {
+  enablePostUnlockRendererServices()
+}
+
+export async function requestRendererUserConfigSnapshot() {
+  return handleUserConfigGetRequest()
+}
+
+export async function appLockGuardStorageAccess(key?: string): Promise<void> {
+  return ensureAppUnlockedForStorageAccess(key)
+}
+
+export async function appLockGuardStorageListing(): Promise<void> {
+  return ensureAppUnlockedForStorageListing()
+}
+
+export function getAppLockProtectedStorageKey(): string {
+  return APP_LOCK_KEY
+}
+
+export function getAppLockStorageDatabasePath(): string {
+  return getAppLockDbPath()
+}
+
+export function getAppLockStoredValueRow(): { value: string } | null {
+  return getAppLockRow()
+}
+
+export function appLockSessionIsUnlocked(): boolean {
+  return isAppCurrentlyUnlocked()
+}
+
+export function appLockSetSessionUnlocked(): void {
+  markAppUnlocked()
+}
+
+export function appLockSetSessionLocked(): void {
+  markAppLocked()
+}
+
+export function appLockRegisterRendererSignals(): void {
+  enablePostUnlockRendererServices()
+}
+
+export async function appLockMaybeRegisterRendererSignals(): Promise<void> {
+  return registerPostUnlockRendererServices()
+}
+
+export async function appLockRequestRendererUserConfig() {
+  return handleUserConfigGetRequest()
+}
+
+export async function appLockStatusValue() {
+  return getAppLockStatus()
+}
+
+export async function appLockStatusConfigValue() {
+  return readAppLockConfig()
+}
+
+export async function appLockWriteConfigValue(config: AppLockConfig) {
+  return writeAppLockConfig(config)
+}
+
+export async function appLockCreateConfigValue(password: string) {
+  return createAppLockConfig(password)
+}
+
+export async function appLockVerifyPasswordValue(password: string, config: AppLockConfig) {
+  return verifyAppLockPassword(password, config)
+}
+
+export { getAppLockStatus as default }
+
+async function deriveAppLockHash(password: string, salt: Buffer, iterations: number, keyLength: number): Promise<Buffer> {
+  return (await pbkdf2Async(password, salt, iterations, keyLength, 'sha256')) as Buffer
+}
+
+async function createAppLockConfig(password: string): Promise<AppLockConfig> {
+  const salt = randomBytes(APP_LOCK_SALT_LENGTH)
+  const hash = await deriveAppLockHash(password, salt, APP_LOCK_ITERATIONS, APP_LOCK_KEY_LENGTH)
+
+  return {
+    enabled: true,
+    algorithm: APP_LOCK_ALGORITHM,
+    salt: salt.toString('base64'),
+    hash: hash.toString('base64'),
+    iterations: APP_LOCK_ITERATIONS,
+    keyLength: APP_LOCK_KEY_LENGTH,
+    updatedAt: Date.now()
+  }
+}
+
+async function verifyAppLockPassword(password: string, config: AppLockConfig): Promise<boolean> {
+  const salt = Buffer.from(config.salt, 'base64')
+  const storedHash = Buffer.from(config.hash, 'base64')
+  const derivedHash = await deriveAppLockHash(password, salt, config.iterations, config.keyLength)
+
+  if (storedHash.length !== derivedHash.length) {
+    return false
+  }
+
+  return timingSafeEqual(storedHash, derivedHash)
+}
+
+async function getAppLockStatus(): Promise<{ hasPassword: boolean; isUnlocked: boolean }> {
+  const config = await readAppLockConfig()
+  if (!config?.enabled) {
+    return { hasPassword: false, isUnlocked: false }
+  }
+
+  return {
+    hasPassword: true,
+    isUnlocked: isAppUnlocked
+  }
+}
 
 async function createWindow(): Promise<void> {
   mainWindow = await createMainWindow(
@@ -90,34 +1088,9 @@ async function createWindow(): Promise<void> {
 export async function getUserConfigFromRenderer(): Promise<any> {
   if (!mainWindow) throw new Error('mainWindow not ready')
 
-  const wc = mainWindow.webContents
-
-  // Wait for renderer process to load
-  if (wc.isLoadingMainFrame()) {
-    await new Promise<void>((resolve) => wc.once('did-finish-load', () => resolve()))
-  }
-
-  return new Promise((resolve, reject) => {
-    const responseHandler = (_event: Electron.IpcMainEvent, config: any) => {
-      cleanup()
-      resolve(config)
-    }
-
-    const errorHandler = (_event: Electron.IpcMainEvent, errMsg: string) => {
-      cleanup()
-      reject(new Error(errMsg))
-    }
-
-    const cleanup = () => {
-      ipcMain.removeListener('userConfig:get-response', responseHandler)
-      ipcMain.removeListener('userConfig:get-error', errorHandler)
-    }
-
-    ipcMain.on('userConfig:get-response', responseHandler)
-    ipcMain.on('userConfig:get-error', errorHandler)
-
-    console.log('Main process sending userConfig:get to renderer process')
-    wc.send('userConfig:get')
+  return requestUserConfigViaIpc({
+    ipcMain,
+    webContents: mainWindow.webContents
   })
 }
 
@@ -825,8 +1798,66 @@ function setupIPC(): void {
   // KnowledgeBase module (local file-based KB) IPC handlers
   registerKnowledgeBaseHandlers()
 
+  ipcMain.handle('app-lock:get-status', async () => {
+    return getAppLockStatus()
+  })
+
+  ipcMain.handle('app-lock:set-password', async (_event, params: { password: string }) => {
+    ensureValidAppLockPassword(params?.password)
+
+    const existingConfig = await readAppLockConfig()
+    if (existingConfig?.enabled) {
+      throw new Error('App lock password has already been set')
+    }
+
+    const config = await createAppLockConfig(params.password)
+    await writeAppLockConfig(config)
+    markAppUnlocked()
+
+    return {
+      success: true,
+      hasPassword: true,
+      isUnlocked: true
+    }
+  })
+
+  ipcMain.handle('app-lock:verify-password', async (_event, params: { password: string }) => {
+    ensureValidAppLockPassword(params?.password)
+
+    const config = await readAppLockConfig()
+    if (!config?.enabled) {
+      throw new Error('App lock password is not set')
+    }
+
+    const isValid = await verifyAppLockPassword(params.password, config)
+    if (isValid) {
+      markAppUnlocked()
+    } else {
+      markAppLocked()
+    }
+
+    return {
+      success: isValid,
+      isUnlocked: isValid
+    }
+  })
+
+  ipcMain.handle('app-lock:lock', async () => {
+    markAppLocked()
+    return {
+      success: true,
+      hasPassword: (await readAppLockConfig())?.enabled === true,
+      isUnlocked: false
+    }
+  })
+
   ipcMain.handle('init-user-database', async (event, { uid }) => {
     try {
+      const appLockStatus = await getAppLockStatus()
+      if (appLockStatus.hasPassword && !appLockStatus.isUnlocked) {
+        throw new Error('App is locked')
+      }
+
       const isSkippedLogin = await event.sender.executeJavaScript("localStorage.getItem('login-skipped') === 'true'")
       const targetUserId = uid || (isSkippedLogin ? getGuestUserId() : null)
       if (!targetUserId) {
@@ -895,6 +1926,8 @@ function setupIPC(): void {
   // Handler 1: Migration status query
   ipcMain.handle('db:migration:status', async (_event, params: { dataSource?: string }) => {
     try {
+      await ensureAppUnlockedForStorageListing()
+
       const userId = getCurrentUserId()
       if (!userId) {
         throw new Error('User not logged in')
@@ -994,6 +2027,16 @@ function setupIPC(): void {
   // Handler 4: KV read
   ipcMain.handle('db:kv:get', async (_event, params: { key?: string }) => {
     try {
+      if (params?.key) {
+        await ensureAppUnlockedForStorageAccess(params.key)
+      } else {
+        await ensureAppUnlockedForStorageListing()
+      }
+
+      if (isProtectedKvKey(params?.key)) {
+        throw new Error('Access to protected key is denied')
+      }
+
       let userId = getCurrentUserId()
 
       if (!userId) {
@@ -1012,7 +2055,7 @@ function setupIPC(): void {
         }
         return row
       } else {
-        return db.getAllKeys()
+        return db.getAllKeys().filter((key) => !isProtectedKvKey(key))
       }
     } catch (error) {
       console.error('db:kv:get error:', error)
@@ -1023,6 +2066,12 @@ function setupIPC(): void {
   // Handler 5: KV mutation
   ipcMain.handle('db:kv:mutate', async (_event, params: { action: string; key: string; value?: string }) => {
     try {
+      if (!params.key) {
+        throw new Error('key parameter is required')
+      }
+
+      await ensureAppUnlockedForStorageAccess(params.key)
+
       let userId = getCurrentUserId()
 
       if (!userId) {
@@ -1034,8 +2083,8 @@ function setupIPC(): void {
         throw new Error('Invalid action type')
       }
 
-      if (!params.key) {
-        throw new Error('key parameter is required')
+      if (isProtectedKvKey(params.key)) {
+        throw new Error('Mutation of protected key is denied')
       }
 
       if (params.action === 'set' && params.value === undefined) {

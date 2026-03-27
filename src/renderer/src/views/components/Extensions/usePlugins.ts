@@ -1,5 +1,4 @@
 import { computed, ref } from 'vue'
-import { listStorePlugins } from '@/api/plugin/plugin'
 
 const api = (window as any).api
 

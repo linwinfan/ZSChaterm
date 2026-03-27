@@ -54,9 +54,8 @@ export interface UserConfig {
 }
 
 export class UserConfigStoreService {
-  constructor() {
-    this.initDB()
-  }
+  private isInitialized = false
+  private initializationPromise: Promise<void> | null = null
 
   async initDB(): Promise<void> {
     try {
@@ -70,9 +69,25 @@ export class UserConfigStoreService {
           value: JSON.stringify(this.getDefaultConfig())
         })
       }
+      this.isInitialized = true
     } catch (error) {
       console.error('Error initializing userConfig in SQLite:', error)
+      throw error
     }
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (this.isInitialized) {
+      return
+    }
+
+    if (!this.initializationPromise) {
+      this.initializationPromise = this.initDB().finally(() => {
+        this.initializationPromise = null
+      })
+    }
+
+    await this.initializationPromise
   }
 
   private getDefaultConfig(): UserConfig {
@@ -124,6 +139,8 @@ export class UserConfigStoreService {
 
   async getConfig(): Promise<UserConfig> {
     try {
+      await this.ensureInitialized()
+
       const result = await window.api.kvGet({ key: 'userConfig' })
       let savedConfig: any = {}
       if (result?.value) {
@@ -167,6 +184,8 @@ export class UserConfigStoreService {
 
   async saveConfig(config: Partial<UserConfig>): Promise<void> {
     try {
+      await this.ensureInitialized()
+
       const defaultConfig = await this.getConfig()
 
       const sanitizedConfig: UserConfig = {

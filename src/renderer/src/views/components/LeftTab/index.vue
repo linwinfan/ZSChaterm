@@ -167,14 +167,12 @@
 </template>
 
 <script setup lang="ts">
-import { removeToken } from '@/utils/permission'
 const emit = defineEmits(['toggle-menu', 'open-user-tab'])
 import { menuTabsData } from './constants/data'
 import { onMounted, onUnmounted, ref } from 'vue'
 import { userInfoStore } from '@/store/index'
 import { pinia } from '@/main'
 import eventBus from '@/utils/eventBus'
-import { dataSyncService } from '@/services/dataSyncService'
 const pluginViews = ref<any[]>([])
 const userStore = userInfoStore(pinia)
 const activeKey = ref('workspace')
@@ -241,11 +239,6 @@ const openAiRight = () => {
     beforeActive
   })
 }
-const userInfo = () => {
-  emit('open-user-tab', 'userInfo')
-  showUserMenu.value = false
-}
-
 const userConfig = () => {
   emit('open-user-tab', 'userConfig')
   showUserMenu.value = false
@@ -258,21 +251,6 @@ const files = () => {
 
 const kubernetes = () => {
   // K8s feature is under development, no action on click
-}
-const logout = async () => {
-  try {
-    if (dataSyncService.getInitializationStatus()) {
-      console.log('Data sync is enabled during logout, stopping...')
-      await dataSyncService.disableDataSync()
-      dataSyncService.reset()
-      console.log('Data sync has been stopped')
-    }
-  } catch (error) {
-    console.error('Failed to stop data sync during logout:', error)
-  }
-
-  // For guest mode, simply close user menu
-  showUserMenu.value = false
 }
 const api = (window as any).api
 

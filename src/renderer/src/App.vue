@@ -6,12 +6,14 @@
     ></div>
     <router-view></router-view>
     <VersionPromptModal :store="promptStore" />
+    <AppLockDialog />
     <MfaDialog />
     <UserSelectionDialog />
   </div>
 </template>
 <script setup lang="ts">
 import { onMounted } from 'vue'
+import { AppLockDialog, initializeAppLock } from './components/global/app-lock'
 import { MfaDialog, setupGlobalMfaListeners } from './components/global/mfa'
 import { UserSelectionDialog, setupGlobalUserSelectionListeners } from './components/global/user-selection'
 import { useNotificationListener } from './composables/useNotificationListener'
@@ -19,6 +21,8 @@ import { useBackgroundManager } from './composables/useBackgroundManager'
 import VersionPromptModal from './components/global/version-prompt/VersionPromptModal.vue'
 import { useVersionPrompt } from './composables/useVersionPrompt'
 import './styles/app.less'
+
+void initializeAppLock()
 
 // Setup notification listener
 useNotificationListener()

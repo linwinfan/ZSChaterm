@@ -3,6 +3,7 @@
  * Reliable startup check without Vue composable dependencies
  */
 
+import { waitForAppUnlock } from '@/components/global/app-lock'
 import eventBus from '@/utils/eventBus'
 import { getGlobalState } from '@renderer/agent/storage/state'
 
@@ -36,6 +37,7 @@ export const initializeStartupModelCheck = () => {
   // Use a longer timeout to ensure app and storage are fully ready
   setTimeout(async () => {
     try {
+      await waitForAppUnlock()
       console.log('Starting LLM model startup check...')
 
       // Check if models are available

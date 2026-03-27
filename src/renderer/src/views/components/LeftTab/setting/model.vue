@@ -863,7 +863,6 @@ const loadModelOptions = async () => {
       await saveModelOptions()
       return
     }
-    
   } catch (error) {
     console.error('Failed to load model options:', error)
   }

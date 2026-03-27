@@ -132,6 +132,16 @@ export interface BastionDefinition {
   uiHints?: Record<string, unknown>
 }
 
+export interface AppLockStatus {
+  hasPassword: boolean
+  isUnlocked: boolean
+}
+
+export interface AppLockVerifyResult {
+  success: boolean
+  isUnlocked: boolean
+}
+
 interface ApiType {
   getCookie: (name: string) => Promise<{
     success: boolean
@@ -292,6 +302,10 @@ interface ApiType {
   }>
   getUserHosts: (search: string, limit?: number) => Promise<any>
   initUserDatabase: (data: { uid: number }) => Promise<any>
+  getAppLockStatus: () => Promise<AppLockStatus>
+  setAppLockPassword: (password: string) => Promise<AppLockStatus & { success: boolean }>
+  verifyAppLockPassword: (password: string) => Promise<AppLockVerifyResult>
+  lockApp: () => Promise<AppLockStatus & { success: boolean }>
   // File dialog and local file operations
   saveCustomBackground: (sourcePath: string) => Promise<{
     success: boolean

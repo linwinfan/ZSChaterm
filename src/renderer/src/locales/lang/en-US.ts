@@ -187,6 +187,18 @@ export default {
     authCallbackDetected: 'Authentication callback URL detected',
     linuxPlatformHandleAuth: 'Handling authentication callback on Linux platform'
   },
+  appLock: {
+    titleSetup: 'Set App Password',
+    titleUnlock: 'Enter App Password',
+    setupDescription:
+      'This app does not have a local access password yet. Set one before entering the app. The password is stored only as a secure hash and is never saved in plaintext.',
+    unlockDescription: 'Local access protection is enabled. Enter the password to unlock the app before continuing.',
+    setupSubmit: 'Set Password and Enter',
+    unlockSubmit: 'Unlock App',
+    unlockPasswordPlaceholder: 'Please input app password',
+    unlockFailed: 'Incorrect password, please try again',
+    operationFailed: 'App lock operation failed, please try again'
+  },
   workspace: {
     workspace: 'Workspace',
     personal: 'Personal',
@@ -978,7 +990,7 @@ export default {
     avatarSettings: 'Avatar Settings',
     guestCannotBindEmail: 'Guest users cannot bind email',
     guestCannotBindMobile: 'Guest users cannot bind mobile number',
-    guestCannotUpdateAvatar: 'Guest users cannot update avatar',
+    guestCannotUpdateAvatar: 'Guest users cannot update avatar'
   },
   update: {
     available: 'A new version is available',

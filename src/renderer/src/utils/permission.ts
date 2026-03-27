@@ -14,13 +14,18 @@ export function removeToken() {
   localStorage.removeItem('userInfo')
   localStorage.removeItem('login-skipped')
 }
+type PermissionUserInfo = ReturnType<typeof userInfoStore>['userInfo'] & {
+  username?: string
+  mobile?: string
+}
+
 export const setUserInfo = (info) => {
   const userStore = userInfoStore(pinia)
   userStore.updateInfo(info)
 }
-export const getUserInfo = () => {
+export const getUserInfo = (): PermissionUserInfo => {
   const userStore = userInfoStore(pinia)
-  let userInfo = userStore.userInfo
+  let userInfo: PermissionUserInfo = userStore.userInfo
 
   // If no user info from store, default to guest
   if (!userInfo || !userInfo.uid) {
@@ -29,7 +34,9 @@ export const getUserInfo = () => {
       username: 'guest',
       name: 'Guest',
       email: 'guest@chaterm.ai',
-      token: 'guest_token'
+      token: 'guest_token',
+      avatar: '',
+      registrationType: ''
     }
   }
 

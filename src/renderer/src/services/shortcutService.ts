@@ -40,7 +40,6 @@ export class ShortcutService {
   public static get instance(): ShortcutService {
     if (!ShortcutService._instance) {
       ShortcutService._instance = new ShortcutService()
-      ShortcutService._instance.init()
     }
     return ShortcutService._instance
   }

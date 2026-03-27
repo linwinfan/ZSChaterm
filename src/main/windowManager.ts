@@ -44,12 +44,27 @@ export async function createMainWindow(onCookieUrlChange?: (url: string) => void
     }
   })
 
+  let hasShownWindow = false
+
+  const showWindowOnce = () => {
+    if (hasShownWindow || mainWindow.isDestroyed() || mainWindow.isVisible()) {
+      return
+    }
+
+    hasShownWindow = true
+    mainWindow.show()
+  }
+
   /**
    * Show the window only after the 'ready-to-show' event to avoid a white flash.
    */
-  // mainWindow.on('ready-to-show', () => {
-  //   mainWindow.show()
-  // })
+  mainWindow.once('ready-to-show', () => {
+    showWindowOnce()
+  })
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    showWindowOnce()
+  })
 
   /**
    * On macOS the red close button merely hides the window instead of quitting the app.

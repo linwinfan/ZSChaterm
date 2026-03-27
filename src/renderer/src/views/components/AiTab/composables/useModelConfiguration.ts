@@ -1,6 +1,6 @@
 import { ref, watch, computed } from 'vue'
 import { createGlobalState } from '@vueuse/core'
-import { getGlobalState, updateGlobalState, storeSecret, getSecret } from '@renderer/agent/storage/state'
+import { getGlobalState, updateGlobalState, getSecret } from '@renderer/agent/storage/state'
 import { GlobalStateKey } from '@renderer/agent/storage/state-keys'
 import { notification } from 'ant-design-vue'
 import { focusChatInput } from './useTabManagement'

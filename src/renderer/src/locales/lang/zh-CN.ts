@@ -187,6 +187,17 @@ export default {
     authCallbackDetected: '检测到认证回调 URL',
     linuxPlatformHandleAuth: '在 Linux 平台上处理认证回调'
   },
+  appLock: {
+    titleSetup: '设置应用密码',
+    titleUnlock: '输入应用密码',
+    setupDescription: '当前应用尚未设置本地访问密码，请先设置密码后再进入应用。密码只会以安全哈希形式保存，不会明文存储。',
+    unlockDescription: '当前应用已启用本地访问保护，请先输入密码解锁后再继续使用。',
+    setupSubmit: '设置并进入应用',
+    unlockSubmit: '解锁应用',
+    unlockPasswordPlaceholder: '请输入应用密码',
+    unlockFailed: '密码错误，请重新输入',
+    operationFailed: '应用锁操作失败，请重试'
+  },
   workspace: {
     workspace: '工作空间',
     personal: '个人空间',
@@ -968,7 +979,7 @@ export default {
     avatarSettings: '头像设置',
     guestCannotBindEmail: '访客用户无法绑定邮箱',
     guestCannotBindMobile: '访客用户无法绑定手机号',
-    guestCannotUpdateAvatar: '访客用户无法更新头像',
+    guestCannotUpdateAvatar: '访客用户无法更新头像'
   },
   update: {
     available: '有最新版本可以更新',
