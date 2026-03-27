@@ -38,3 +38,4 @@ coverage/
 nul
 scripts/testssh.js
 scripts/testssh2.js
+.claude/
