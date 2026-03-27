@@ -1,2 +1,63 @@
+#!/usr/bin/env sh
+set -e
+
+if ! command -v npm >/dev/null 2>&1; then
+  for extra_dir in /opt/homebrew/bin /usr/local/bin "$HOME/.volta/bin" "$HOME/.asdf/shims" "$HOME/.fnm" "$HOME/.fnm/bin"; do
+    if [ -d "$extra_dir" ]; then
+      PATH="$extra_dir:$PATH"
+    fi
+  done
+  export PATH
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  if [ -s "$HOME/.asdf/asdf.sh" ]; then
+    . "$HOME/.asdf/asdf.sh"
+  fi
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  if [ -x "$HOME/.fnm/fnm" ]; then
+    eval "$("$HOME/.fnm/fnm" env --shell sh)"
+  elif command -v fnm >/dev/null 2>&1; then
+    eval "$(fnm env --shell sh)"
+  fi
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  if [ -s "$HOME/.nvm/nvm.sh" ]; then
+    . "$HOME/.nvm/nvm.sh"
+    NVM_NODE_PATH="$(nvm which default 2>/dev/null || nvm which current 2>/dev/null || true)"
+    case "$NVM_NODE_PATH" in
+      */bin/node)
+        PATH="${NVM_NODE_PATH%/node}:$PATH"
+        export PATH
+        ;;
+    esac
+  fi
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  NVM_SINGLE_BIN=''
+  NVM_SINGLE_COUNT=0
+  for candidate_dir in "$HOME"/.nvm/versions/node/*/bin; do
+    if [ -x "$candidate_dir/npm" ]; then
+      NVM_SINGLE_BIN="$candidate_dir"
+      NVM_SINGLE_COUNT=$((NVM_SINGLE_COUNT + 1))
+    fi
+  done
+
+  if [ "$NVM_SINGLE_COUNT" -eq 1 ] && [ -n "$NVM_SINGLE_BIN" ]; then
+    PATH="$NVM_SINGLE_BIN:$PATH"
+    export PATH
+  fi
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  echo "[ERROR] npm not found in PATH while running .husky/pre-commit" >&2
+  echo "[ERROR] If you use nvm with multiple Node versions, set a concrete default alias like: nvm alias default v24.14.0" >&2
+  exit 127
+fi
+
 npm run lint:staged
 npm run typecheck
