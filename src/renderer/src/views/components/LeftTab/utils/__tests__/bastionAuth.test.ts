@@ -2,8 +2,20 @@ import { describe, it, expect } from 'vitest'
 import { resolveBastionAuthType, type BastionDefinitionSummary } from '../types'
 
 describe('resolveBastionAuthType', () => {
-  it('forces keyBased for jumpserver', () => {
-    expect(resolveBastionAuthType('organization', [], 'password')).toBe('keyBased')
+  it('keeps password for jumpserver when current auth is password', () => {
+    expect(resolveBastionAuthType('organization', [], 'password')).toBe('password')
+  })
+
+  it('keeps keyBased for jumpserver when current auth is keyBased', () => {
+    expect(resolveBastionAuthType('organization', [], 'keyBased')).toBe('keyBased')
+  })
+
+  it('defaults to keyBased for jumpserver when current auth is invalid', () => {
+    expect(resolveBastionAuthType('organization', [], 'token')).toBe('keyBased')
+  })
+
+  it('defaults to keyBased for jumpserver when current auth is missing', () => {
+    expect(resolveBastionAuthType('organization', [])).toBe('keyBased')
   })
 
   it('falls back to definition authPolicy when current is not allowed', () => {

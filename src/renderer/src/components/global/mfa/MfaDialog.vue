@@ -1,7 +1,7 @@
 <template>
   <a-modal
     v-model:visible="showOtpDialog"
-    :title="$t('mfa.title')"
+    :title="otpTitle || $t('mfa.title')"
     width="400px"
     :mask-closable="false"
     :keyboard="false"
@@ -19,6 +19,7 @@
         </div>
         <OtpInput
           v-model="otpCode"
+          :input-type="otpInputType"
           :has-error="showOtpDialogErr || showOtpDialogCheckErr"
           :error-message="getErrorMessage()"
           @complete="handleOtpComplete"
@@ -39,7 +40,11 @@ import {
   showOtpDialog,
   showOtpDialogErr,
   showOtpDialogCheckErr,
+  otpTitle,
   otpPrompt,
+  otpInputType,
+  otpValidationMessage,
+  otpFailureMessage,
   otpCode,
   otpTimeRemaining,
   cancelOtp,
@@ -49,12 +54,35 @@ import {
 
 const { t } = useI18n()
 
+const isUsernamePrompt = () => {
+  return /username/i.test(otpTitle.value) || /username/i.test(otpPrompt.value)
+}
+
+const isPasswordPrompt = () => {
+  return otpInputType.value === 'password' || /password/i.test(otpTitle.value) || /password/i.test(otpPrompt.value)
+}
+
 // Error message helper
 const getErrorMessage = () => {
   if (showOtpDialogCheckErr.value) {
+    if (otpValidationMessage.value) {
+      return otpValidationMessage.value
+    }
+    if (isUsernamePrompt()) {
+      return t('personal.pleaseInputUsername')
+    }
+    if (isPasswordPrompt()) {
+      return t('personal.pleaseInputPassword')
+    }
     return t('mfa.pleaseInputVerificationCode')
   }
   if (showOtpDialogErr.value) {
+    if (otpFailureMessage.value) {
+      return otpFailureMessage.value
+    }
+    if (isPasswordPrompt()) {
+      return t('personal.pleaseInputPassword')
+    }
     return t('mfa.verificationCodeError')
   }
   return ''

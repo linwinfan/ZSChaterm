@@ -21,11 +21,27 @@ vi.mock('electron', () => ({
   ipcMain: { handle: vi.fn(), on: vi.fn(), once: vi.fn(), removeAllListeners: vi.fn() }
 }))
 
-let jumpServerAssets: Array<{ name: string; address: string; description?: string }> = []
+type JumpServerRefreshResult = {
+  assets: Array<{ name: string; address: string; comment?: string }>
+  profile: 'standard' | 'mingyu'
+  recognized: boolean
+  complete: boolean
+  debugLogPath?: string
+}
+
+let jumpServerRefreshResult: JumpServerRefreshResult = {
+  assets: [],
+  profile: 'standard',
+  recognized: true,
+  complete: true
+}
 vi.mock('../../../../ssh/jumpserver/asset', () => ({
   default: class JumpServerClientMock {
     async getAllAssets() {
-      return jumpServerAssets
+      return jumpServerRefreshResult
+    }
+    getDebugLogPath() {
+      return jumpServerRefreshResult.debugLogPath
     }
     close() {
       return undefined
@@ -64,6 +80,7 @@ type OrgAssetRow = {
 type Capture = {
   insertArgs?: unknown[]
   updateArgs?: unknown[]
+  deletedHosts: string[]
 }
 
 const normalizeSql = (sql: string) => sql.replace(/\s+/g, ' ').trim().toLowerCase()
@@ -91,6 +108,15 @@ function createMockDb(options: { assetType: string; existingAssets?: OrgAssetRow
 
       if (normalized.includes('select host, hostname, uuid, favorite from t_organization_assets')) {
         return createStatement({ all: () => existingAssets })
+      }
+
+      if (normalized.includes('delete from t_organization_assets where organization_uuid = ? and host = ?')) {
+        return createStatement({
+          run: (...args: unknown[]) => {
+            capture.deletedHosts.push(String(args[1]))
+            return { changes: 1 }
+          }
+        })
       }
 
       if (normalized.includes('update t_organization_assets')) {
@@ -128,7 +154,12 @@ describe('refreshOrganizationAssetsLogic', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     capabilityRegistry.getBastion = getBastion as typeof capabilityRegistry.getBastion
-    jumpServerAssets = []
+    jumpServerRefreshResult = {
+      assets: [],
+      profile: 'standard',
+      recognized: true,
+      complete: true
+    }
   })
 
   it('updates jump_server_type to qizhi for existing qizhi assets', async () => {
@@ -142,7 +173,7 @@ describe('refreshOrganizationAssetsLogic', () => {
       }))
     })
 
-    const capture: Capture = {}
+    const capture: Capture = { deletedHosts: [] }
     const db = createMockDb({
       assetType: 'organization-qizhi',
       existingAssets: [
@@ -181,7 +212,7 @@ describe('refreshOrganizationAssetsLogic', () => {
       }))
     })
 
-    const capture: Capture = {}
+    const capture: Capture = { deletedHosts: [] }
     const db = createMockDb({
       assetType: 'organization-tencent',
       existingAssets: [
@@ -209,12 +240,18 @@ describe('refreshOrganizationAssetsLogic', () => {
   })
 
   it('persists jumpserver asset comment for update and insert', async () => {
-    jumpServerAssets = [
-      { name: 'Linux_10.30.5.14', address: '10.30.5.14', description: 'comment-1' },
-      { name: 'Linux_10.30.5.15', address: '10.30.5.15', description: 'comment-2' }
-    ]
+    jumpServerRefreshResult = {
+      assets: [
+        { name: 'Linux_10.30.5.14', address: '10.30.5.14', comment: 'comment-1' },
+        { name: 'Linux_10.30.5.15', address: '10.30.5.15', comment: 'comment-2' }
+      ],
+      profile: 'standard',
+      recognized: true,
+      complete: true,
+      debugLogPath: '/tmp/jumpserver-assets-success.log'
+    }
 
-    const capture: Capture = {}
+    const capture: Capture = { deletedHosts: [] }
     const db = createMockDb({
       assetType: 'organization',
       existingAssets: [
@@ -228,7 +265,7 @@ describe('refreshOrganizationAssetsLogic', () => {
       capture
     })
 
-    await refreshOrganizationAssetsLogic(db as any, 'org-1', {
+    const result = await refreshOrganizationAssetsLogic(db as any, 'org-1', {
       host: '127.0.0.1',
       port: 22,
       username: 'admin',
@@ -239,5 +276,90 @@ describe('refreshOrganizationAssetsLogic', () => {
     expect(capture.insertArgs).toBeDefined()
     expect(capture.updateArgs).toContain('comment-1')
     expect(capture.insertArgs).toContain('comment-2')
+    expect(result.data.debugLogPath).toBe('/tmp/jumpserver-assets-success.log')
+  })
+
+  it('updates Mingyu current-page assets and skips stale deletion when built-in jumpserver refresh is incomplete', async () => {
+    jumpServerRefreshResult = {
+      assets: [
+        { name: 'Linux_10.30.5.14', address: '10.30.5.14', comment: 'comment-1' },
+        { name: 'Linux_10.30.5.15', address: '10.30.5.15', comment: 'comment-2' }
+      ],
+      profile: 'mingyu',
+      recognized: true,
+      complete: false,
+      debugLogPath: '/tmp/jumpserver-assets-mingyu-incomplete.log'
+    }
+
+    const capture: Capture = { deletedHosts: [] }
+    const db = createMockDb({
+      assetType: 'organization',
+      existingAssets: [
+        {
+          host: '10.30.5.14',
+          hostname: 'Linux_10.30.5.14',
+          uuid: 'asset-1',
+          favorite: 0
+        },
+        {
+          host: '10.30.5.99',
+          hostname: 'Linux_10.30.5.99',
+          uuid: 'asset-2',
+          favorite: 0
+        }
+      ],
+      capture
+    })
+
+    const result = await refreshOrganizationAssetsLogic(db as any, 'org-1', {
+      host: '127.0.0.1',
+      port: 22,
+      username: 'admin',
+      password: 'secret'
+    })
+
+    expect(result.data.message).toBe('success')
+    expect(result.data.debugLogPath).toBe('/tmp/jumpserver-assets-mingyu-incomplete.log')
+    expect(capture.updateArgs).toBeDefined()
+    expect(capture.insertArgs).toBeDefined()
+    expect(capture.updateArgs).toContain('comment-1')
+    expect(capture.insertArgs).toContain('comment-2')
+    expect(capture.deletedHosts).toEqual([])
+  })
+
+  it('fails refresh when built-in jumpserver output is not recognized', async () => {
+    jumpServerRefreshResult = {
+      assets: [],
+      profile: 'standard',
+      recognized: false,
+      complete: false,
+      debugLogPath: '/tmp/jumpserver-assets-failed.log'
+    }
+
+    const capture: Capture = { deletedHosts: [] }
+    const db = createMockDb({
+      assetType: 'organization',
+      existingAssets: [
+        {
+          host: '10.30.5.99',
+          hostname: 'Linux_10.30.5.99',
+          uuid: 'asset-2',
+          favorite: 0
+        }
+      ],
+      capture
+    })
+
+    const result = await refreshOrganizationAssetsLogic(db as any, 'org-1', {
+      host: '127.0.0.1',
+      port: 22,
+      username: 'admin',
+      password: 'secret'
+    })
+
+    expect(result.data.message).toBe('failed')
+    expect(String(result.data.error)).toContain('not recognized')
+    expect(result.data.debugLogPath).toBe('/tmp/jumpserver-assets-failed.log')
+    expect(capture.deletedHosts).toEqual([])
   })
 })

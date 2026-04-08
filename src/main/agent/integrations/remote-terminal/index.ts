@@ -6,7 +6,13 @@
 
 import { BrownEventEmitter } from './event'
 import { remoteSshConnect, remoteSshExecStream, remoteSshDisconnect } from '../../../ssh/agentHandle'
-import { handleJumpServerConnection, jumpserverShellStreams } from './jumpserverHandle'
+import {
+  handleJumpServerConnection,
+  jumpserverShellStreams,
+  jumpserverConnections,
+  jumpserverConnectionStatus,
+  jumpServerExec
+} from './jumpserverHandle'
 import { capabilityRegistry, BastionErrorCode } from '../../../ssh/capabilityRegistry'
 import { runMarkerBasedCommand, type MarkerStream } from './marker-based-runner'
 
@@ -673,6 +679,78 @@ export class RemoteTerminalProcess extends BrownEventEmitter<RemoteTerminalProce
       throw new Error('JumpServer connection not found')
     }
 
+    // Check if this is a mingyu session - use simplified direct execution like normal SSH
+    // Check both jumpserverConnectionStatus (has profile field set by jumpserverHandle) and
+    // jumpserverConnections (has navigationPath.profile for other JumpServer types)
+    const connectionStatus = jumpserverConnectionStatus.get(sessionId) as { profile?: string } | undefined
+    const connectionData = jumpserverConnections.get(sessionId)
+    const isMingyu = connectionStatus?.profile === 'mingyu' || connectionData?.navigationPath?.profile === 'mingyu'
+
+    if (isMingyu) {
+      // Mingyu type: use simplified direct command execution (like normal SSH)
+      await this.runMingyuDirectCommand(sessionId, command, cwd)
+    } else {
+      // Other JumpServer types: use marker-based command execution
+      await this.runJumpServerMarkerCommand(sessionId, command, cwd)
+    }
+  }
+
+  /**
+   * Mingyu direct command execution - similar to normal SSH using conn.exec()
+   * Mingyu sessions have already completed menu navigation manually,
+   * so we can execute commands via exec channel (not visible in terminal).
+   */
+  private async runMingyuDirectCommand(sessionId: string, command: string, cwd?: string): Promise<void> {
+    const logPrefix = `Mingyu ${sessionId}`
+
+    // Build command with working directory
+    const cleanCwd = cleanWorkingDirectory(cwd, logPrefix)
+    const commandToExecute = cleanCwd ? `cd "${cleanCwd}" && ${command}` : command
+
+    console.log(`[MingyuDirect] Executing via exec: ${commandToExecute}`)
+
+    try {
+      const result = await jumpServerExec(sessionId, commandToExecute)
+
+      if (result.stdout) {
+        const lines = result.stdout.split(/\r?\n/)
+        for (const line of lines) {
+          if (line.trim()) {
+            this.emit('line', line)
+          }
+        }
+      }
+
+      if (result.stderr) {
+        const lines = result.stderr.split(/\r?\n/)
+        for (const line of lines) {
+          if (line.trim()) {
+            this.emit('line', line)
+          }
+        }
+      }
+
+      this.emit('exitCode', result.exitCode ?? 0)
+      this.emit('completed')
+      this.emit('continue')
+    } catch (error) {
+      console.error(`[MingyuDirect] Exec failed:`, error)
+      this.emit('error', error instanceof Error ? error : new Error(String(error)))
+      this.emit('completed')
+      this.emit('continue')
+    }
+  }
+
+  /**
+   * JumpServer marker-based command execution (original implementation)
+   * Used for standard JumpServer types that require Base64 encoding and marker tracking.
+   */
+  private async runJumpServerMarkerCommand(sessionId: string, command: string, cwd?: string): Promise<void> {
+    const stream = jumpserverShellStreams.get(sessionId)
+    if (!stream) {
+      throw new Error('JumpServer connection not found')
+    }
+
     const logPrefix = `JumpServer ${sessionId}`
     const cleanCwd = cleanWorkingDirectory(cwd, logPrefix)
 
@@ -843,6 +921,7 @@ export class RemoteTerminalManager {
         // Use JumpServer connection
         const jumpServerSessionId = `jumpserver_${Date.now()}_${Math.random().toString(36).substring(2, 14)}`
         const assetUuid = this.connectionInfo.assetUuid || this.connectionInfo.id || jumpServerSessionId
+        const targetAsset = this.connectionInfo.comment || this.connectionInfo.host
         const jumpServerConnectionInfo = {
           id: jumpServerSessionId,
           host: this.connectionInfo.asset_ip!,
@@ -852,6 +931,8 @@ export class RemoteTerminalManager {
           privateKey: this.connectionInfo.privateKey,
           passphrase: this.connectionInfo.passphrase,
           targetIp: this.connectionInfo.host!,
+          targetHostname: this.connectionInfo.targetHostname || this.connectionInfo.hostname || '',
+          targetAsset,
           needProxy: this.connectionInfo.needProxy || false,
           proxyName: this.connectionInfo.proxyName || '',
           ident: this.connectionInfo.ident,

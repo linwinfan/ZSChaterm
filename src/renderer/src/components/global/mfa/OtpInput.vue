@@ -3,7 +3,7 @@
     <input
       ref="inputRef"
       :value="inputValue"
-      type="text"
+      :type="inputType"
       class="otp-text-input"
       :class="{ error: hasError }"
       :disabled="disabled"
@@ -32,6 +32,7 @@ interface Props {
   errorMessage?: string
   disabled?: boolean
   autoFocus?: boolean
+  inputType?: 'text' | 'password'
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -40,7 +41,8 @@ const props = withDefaults(defineProps<Props>(), {
   hasError: false,
   errorMessage: '',
   disabled: false,
-  autoFocus: true
+  autoFocus: true,
+  inputType: 'text'
 })
 
 // Emits

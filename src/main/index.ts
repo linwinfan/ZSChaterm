@@ -3233,6 +3233,7 @@ ipcMain.handle('refresh-organization-assets', async (event, data) => {
       keyboardInteractiveHandler,
       authResultCallback
     )
+    console.log('Main process refreshOrganizationAssets debug log path:', result?.data?.debugLogPath ?? 'not available')
     return result
   } catch (error) {
     console.error('Failed to refresh organization assets:', error)

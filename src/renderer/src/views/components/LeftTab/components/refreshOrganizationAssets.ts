@@ -27,7 +27,9 @@ export const handleRefreshOrganizationAssets = async (host: any, onSuccess?: () 
       }
     })
 
+    const debugLogPath = result?.data?.debugLogPath
     console.log('Refresh organization assets result:', result)
+    console.log('Refresh organization assets debug log path:', debugLogPath ?? 'not available')
 
     if (result?.data?.message === 'success') {
       hide()
@@ -39,7 +41,7 @@ export const handleRefreshOrganizationAssets = async (host: any, onSuccess?: () 
         onSuccess()
       }
     } else {
-      throw new Error('Refresh failed')
+      throw new Error(result?.data?.error || 'Refresh failed')
     }
   } catch (error) {
     console.error('Failed to refresh organization assets:', error)

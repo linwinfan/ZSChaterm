@@ -16,7 +16,8 @@ export {
   jumpserverMarkedCommands,
   jumpserverLastCommand,
   jumpserverInputBuffer,
-  jumpserverConnectionStatus
+  jumpserverConnectionStatus,
+  jumpserverUuidToConnectionId
 } from './jumpserver/state'
 
 export { navigateToJumpServerAsset, createJumpServerExecStream, executeCommandOnJumpServerExec } from './jumpserver/streamManager'

@@ -4,7 +4,11 @@ import { ref } from 'vue'
 export const showOtpDialog = ref(false)
 export const showOtpDialogErr = ref(false)
 export const showOtpDialogCheckErr = ref(false)
+export const otpTitle = ref('')
 export const otpPrompt = ref('')
+export const otpInputType = ref<'text' | 'password'>('text')
+export const otpValidationMessage = ref('')
+export const otpFailureMessage = ref('')
 export const otpCode = ref('')
 export const currentOtpId = ref<string | null>(null)
 export const otpTimeRemaining = ref(0)
@@ -56,7 +60,11 @@ export const resetOtpDialog = () => {
   showOtpDialog.value = false
   showOtpDialogErr.value = false
   showOtpDialogCheckErr.value = false
+  otpTitle.value = ''
   otpPrompt.value = ''
+  otpInputType.value = 'text'
+  otpValidationMessage.value = ''
+  otpFailureMessage.value = ''
   otpCode.value = ''
   currentOtpId.value = null
   otpAttempts.value = 0
@@ -73,7 +81,11 @@ export const handleOtpRequest = (data: any) => {
   console.log('Received two-factor authentication request:', data.id)
 
   currentOtpId.value = data.id
+  otpTitle.value = data.title || ''
   otpPrompt.value = data.prompts.join('\n')
+  otpInputType.value = data.inputType === 'password' ? 'password' : 'text'
+  otpValidationMessage.value = data.validationMessage || ''
+  otpFailureMessage.value = data.failureMessage || ''
   showOtpDialog.value = true
   showOtpDialogErr.value = false
   showOtpDialogCheckErr.value = false

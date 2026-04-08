@@ -38,8 +38,9 @@ vi.mock('../jumpserverHandle', () => ({
   jumpServerDisconnect: vi.fn()
 }))
 
-describe('RemoteTerminalManager plugin bastion routing', () => {
+describe('RemoteTerminalManager routing', () => {
   beforeEach(() => {
+    vi.clearAllMocks()
     getBastionMock.mockReset()
   })
 
@@ -107,5 +108,33 @@ describe('RemoteTerminalManager plugin bastion routing', () => {
     const calls = connectMock.mock.calls as unknown as Array<[{ targetAsset?: string }]>
     const connectArgs = calls[0]?.[0]
     expect(connectArgs?.targetAsset).toBe('ext-22b7275c90-1020-1(10.30.5.14:22|Linux_10.30.5.14)')
+  })
+
+  it('passes target hostname and asset to built-in jumpserver connections', async () => {
+    const { handleJumpServerConnection } = await import('../jumpserverHandle')
+    vi.mocked(handleJumpServerConnection).mockResolvedValue({ status: 'connected', message: 'ok' })
+
+    const { RemoteTerminalManager } = await import('../index')
+    const manager = new RemoteTerminalManager()
+
+    manager.setConnectionInfo({
+      sshType: 'jumpserver',
+      asset_ip: '10.0.0.2',
+      host: '10.30.5.14',
+      hostname: 'db-01',
+      port: 22,
+      username: 'root',
+      password: 'secret',
+      comment: 'db-01(10.30.5.14:22)',
+      needProxy: false
+    })
+
+    await manager.createTerminal()
+
+    expect(handleJumpServerConnection).toHaveBeenCalledTimes(1)
+    const calls = vi.mocked(handleJumpServerConnection).mock.calls as unknown as Array<[{ targetHostname?: string; targetAsset?: string }]>
+    const connectArgs = calls[0]?.[0]
+    expect(connectArgs?.targetHostname).toBe('db-01')
+    expect(connectArgs?.targetAsset).toBe('db-01(10.30.5.14:22)')
   })
 })
