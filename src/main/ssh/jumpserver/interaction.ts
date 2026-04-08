@@ -1233,6 +1233,7 @@ export const setupJumpServerInteraction = (
     jumpserverConnectionStatus.delete(connectionId)
     jumpserverLastCommand.delete(connectionId)
     jumpserverInputBuffer.delete(connectionId)
+    jumpserverUuidToConnectionId.delete(jumpserverUuid)
 
     if (connectionPhase !== 'connected' && !connectionFailed) {
       const closeError =

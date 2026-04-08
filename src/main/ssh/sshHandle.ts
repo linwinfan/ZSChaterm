@@ -2371,6 +2371,15 @@ export const registerSSHHandlers = () => {
       recordDisconnectRequestByTransport(id, 'jumpserver')
       const stream = jumpserverShellStreams.get(id)
       if (stream) {
+        // For bastion hosts (JumpServer), we need to send exit command first
+        // to properly notify the bastion that the session is closing.
+        // Without this, the bastion may keep the session alive and next
+        // connection will show "Reusing existing connection" message.
+        try {
+          stream.write('exit\r')
+        } catch (e) {
+          // Ignore write errors, proceed to close anyway
+        }
         stream.end()
         jumpserverShellStreams.delete(id)
       }
