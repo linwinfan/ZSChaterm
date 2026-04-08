@@ -47,7 +47,6 @@ vi.mock('../mfa', () => ({
   handleJumpServerKeyboardInteractive: handleJumpServerKeyboardInteractiveMock
 }))
 
-import { getSensitiveInputDiagnostics } from '../../debugTranscript'
 import { setupJumpServerInteraction } from '../interaction'
 
 class MockJumpServerStream extends EventEmitter {

@@ -32,10 +32,10 @@ export interface JumpServerNavigationPath {
 
 export interface JumpServerConnectionData {
   conn: Client
-  stream: any
-  jumpserverUuid: string
-  targetIp: string
-  navigationPath: JumpServerNavigationPath
+  stream?: any
+  jumpserverUuid?: string
+  targetIp?: string
+  navigationPath?: JumpServerNavigationPath
 }
 
 export interface JumpServerMarkedCommand {

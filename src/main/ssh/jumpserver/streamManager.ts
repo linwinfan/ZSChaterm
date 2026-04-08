@@ -573,6 +573,11 @@ export async function createJumpServerExecStream(connectionId: string): Promise<
         throw new Error(`JumpServer connection missing navigation path: ${connectionId}`)
       }
 
+      if (!jumpserverUuid) {
+        console.error(`[JumpServer] JumpServer UUID not recorded`)
+        throw new Error(`JumpServer connection missing jumpserverUuid: ${connectionId}`)
+      }
+
       const execStream: any = await new Promise((resolve, reject) => {
         conn.shell({ term: 'xterm-256color' }, (err: Error | undefined, stream: any) => {
           if (err) {

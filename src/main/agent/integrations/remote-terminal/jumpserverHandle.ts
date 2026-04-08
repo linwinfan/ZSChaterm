@@ -253,7 +253,7 @@ const initializeJumpServerShell = (
     connectionPhase = 'connected'
     outputBuffer = ''
 
-    jumpserverConnections.set(connectionId, conn)
+    jumpserverConnections.set(connectionId, { conn, jumpserverUuid, targetIp: connectionInfo.targetIp, navigationPath: { needsPassword: true } })
     jumpserverShellStreams.set(connectionId, stream)
     jumpserverConnectionStatus.set(connectionId, {
       isVerified: true,
@@ -841,8 +841,8 @@ export const jumpServerDisconnect = async (sessionId: string): Promise<{ status:
   }
 
   const conn = jumpserverConnections.get(sessionId)
-  if (conn && status?.source !== 'shared') {
-    conn.end()
+  if (conn?.conn && status?.source !== 'shared') {
+    conn.conn.end()
   }
 
   jumpserverConnectionStatus.delete(sessionId)
@@ -870,6 +870,9 @@ export const jumpServerShellWrite = (sessionId: string, data: string, marker?: s
         marker,
         output: '',
         completed: false,
+        rawChunks: [],
+        rawBytes: 0,
+        raw: [],
         lastActivity: Date.now(),
         idleTimer: null
       })
