@@ -107,6 +107,22 @@ const buildMingyuSelectionCommands = (entry: MingyuAssetEntry): string[] => {
   return uniqueCommands([`:${numericSelector}`, MINGYU_ENTER_SELECTION_COMMAND, `open ${entry.selector}`])
 }
 
+/**
+ * Build arrow key navigation command to move cursor to target line
+ * Add extra j presses to ensure we land on the correct line
+ * @param targetLine - The line number to navigate to (1-based)
+ * @returns Arrow key commands string followed by enter
+ */
+export const buildMingyuArrowNavigationCommands = (targetLine: number): string => {
+  if (targetLine <= 0) {
+    return ''
+  }
+  // targetLine=1: send two j's to move from header/focus to first asset
+  // targetLine>1: move (targetLine - 1) lines down, plus 2 extra for header/focus compensation
+  const downPresses = targetLine === 1 ? 2 : targetLine - 1 + 2
+  return 'j'.repeat(downPresses)
+}
+
 const isStandardAssetHeaderLine = (line: string): boolean => {
   const upperLine = line.toUpperCase()
 

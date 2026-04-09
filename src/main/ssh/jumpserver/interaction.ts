@@ -15,7 +15,8 @@ import {
   hasUserSelectionPrompt,
   resolveMingyuTargetSelection,
   normalizeMingyuLoginUser,
-  MINGYU_ENTER_SELECTION_COMMAND
+  MINGYU_ENTER_SELECTION_COMMAND,
+  buildMingyuArrowNavigationCommands
 } from './parser'
 import { handleJumpServerUserSelectionWithEvent } from './userSelection'
 import {
@@ -879,10 +880,30 @@ export const setupJumpServerInteraction = (
       })
 
       if (navigationPath.profile === 'mingyu') {
-        // For mingyu bastion hosts, don't auto-select - let user manually operate the shell
-        // like normal SSH. After MFA, just mark as connected and let user navigate the menu.
-        console.log('JumpServer mingyu menu detected, letting user manually operate')
-        sendStatusUpdate('JumpServer mingyu menu detected. Please select target manually in terminal.', 'info', 'ssh.jumpserver.manualOperation')
+        // For mingyu bastion hosts, try to navigate to target using arrow keys first
+        // Then let user manually operate the shell
+        console.log('JumpServer mingyu menu detected, trying to navigate to target')
+        sendStatusUpdate('JumpServer mingyu menu detected. Navigating to target...', 'info', 'ssh.jumpserver.navigatingToTarget')
+
+        // Try to resolve target position and send arrow keys
+        const selectionResult = resolveMingyuTargetSelection(outputBuffer, {
+          targetIp: connectionInfo.targetIp,
+          targetHostname: navigationPath.targetHostname,
+          targetAsset: navigationPath.targetAsset
+        })
+
+        if (selectionResult.status === 'matched') {
+          const targetLine = selectionResult.match.entry.id
+          const arrowCommands = buildMingyuArrowNavigationCommands(targetLine)
+          if (arrowCommands) {
+            console.log(`[JumpServer] Mingyu navigating to line ${targetLine} with: ${arrowCommands}`)
+            writeNavigationCommand(arrowCommands, {
+              context: 'mingyu-arrow-navigation',
+              profile: 'mingyu',
+              targetLine
+            })
+          }
+        }
 
         // Mark as connected but DON'T create exec stream - we want the shell to be interactive
         if (connectionEstablished) {
