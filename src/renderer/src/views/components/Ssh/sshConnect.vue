@@ -281,6 +281,8 @@ const showSearch = ref(false)
 const searchAddon = ref<SearchAddon | null>(null)
 const showAiButton = ref(false)
 let jumpServerStatusHandler: ReturnType<typeof createJumpServerStatusHandler> | null = null
+// Listener for auto-opening AI Chat after JumpServer connection is fully established
+let jumpServerAiChatAutoOpenListener: (() => void) | null = null
 const translateJumpServerStatus = (data: JumpServerStatusData) => {
   if (data.messageKey) {
     return t(data.messageKey, data.messageParams || {})
@@ -1129,6 +1131,21 @@ const connectSSH = async () => {
     if (shouldUseBastionStatusChannel(connSshType) && terminal.value) {
       jumpServerStatusHandler = createJumpServerStatusHandler(terminal.value, connectionId.value, translateJumpServerStatus)
       jumpServerStatusHandler.setupStatusListener(api)
+
+      // Setup listener for auto-opening AI Chat only after JumpServer connection is fully established
+      // This prevents focus fighting when login is still in progress
+      jumpServerAiChatAutoOpenListener = api.onJumpServerStatusUpdate((data: JumpServerStatusData) => {
+        if (data.id === connectionId.value && data.messageKey === 'ssh.jumpserver.connectedToTarget') {
+          setTimeout(() => {
+            eventBus.emit('openAiRight')
+          }, 200)
+          // Cleanup listener after AI Chat is opened
+          if (jumpServerAiChatAutoOpenListener) {
+            jumpServerAiChatAutoOpenListener()
+            jumpServerAiChatAutoOpenListener = null
+          }
+        }
+      })
     }
 
     const jmsToken = ref(localStorage.getItem('jms-token'))
@@ -1160,10 +1177,8 @@ const connectSSH = async () => {
 
     const result = await api.connect(connData)
 
-    if (jumpServerStatusHandler) {
-      jumpServerStatusHandler.cleanup()
-      jumpServerStatusHandler = null
-    }
+    // Note: jumpServerStatusHandler and jumpServerAiChatAutoOpenListener remain active
+    // They are cleaned up in catch block or when AI Chat auto-opens via status update
 
     const isSwitchDevice = connAssetType?.startsWith('person-switch-') ?? false
     if (isSwitchDevice) {
@@ -1197,8 +1212,11 @@ const connectSSH = async () => {
         // Ensure scroll to bottom after successful connection
         terminal.value?.scrollToBottom()
         terminal.value?.focus()
-        // Auto open AI CHAT if not already opened
-        eventBus.emit('openAiRight')
+        // For JumpServer/bastion connections, AI Chat auto-open is handled by status listener
+        // to avoid focus fighting during login. Only auto-open for direct SSH connections.
+        if (!shouldUseBastionStatusChannel(connSshType)) {
+          eventBus.emit('openAiRight')
+        }
       }, 200)
     } else {
       const resolvedMessage = result?.messageKey ? t(result.messageKey, result.messageParams || {}) : (result?.message as string)
@@ -1209,6 +1227,10 @@ const connectSSH = async () => {
     if (jumpServerStatusHandler) {
       jumpServerStatusHandler.cleanup()
       jumpServerStatusHandler = null
+    }
+    if (jumpServerAiChatAutoOpenListener) {
+      jumpServerAiChatAutoOpenListener()
+      jumpServerAiChatAutoOpenListener = null
     }
 
     const errorMsg = formatStatusMessage(t('ssh.connectionError', { message: error.message || t('ssh.unknownError') }), 'error')

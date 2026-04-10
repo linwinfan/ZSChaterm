@@ -36,6 +36,10 @@ try {
 import { createProxySocket } from './proxy'
 import { buildErrorResponse } from './jumpserver/errorUtils'
 import { getJumpServerExitCommand, hasJumpServerCommandPrompt } from './jumpserver/navigator'
+
+// Shell prompt detection regex - matches shell prompts ending with $ or #
+// Supports formats like: [root@host ~]#, user@host:~$, root@host#, etc.
+const SHELL_PROMPT_REGEX = /[$#]\s*$/m
 import {
   ensureDebugTranscriptSession,
   recordDebugTranscriptEvent,
@@ -56,6 +60,10 @@ import {
   jumpserverLastCommand,
   createJumpServerExecStream
 } from './jumpserverHandle'
+
+// Track which JumpServer connections have already sent connectedToTarget
+// Key: connectionId, Value: true
+const jumpserverConnectedToTargetSent = new Set<string>()
 import path from 'path'
 import fs from 'fs'
 import { SSHAgentManager } from './ssh-agent/ChatermSSHAgent'
@@ -1775,6 +1783,24 @@ export const registerSSHHandlers = () => {
         if (raw) {
           recordShellBridgeDataForTransport(id, 'jumpserver', raw)
         }
+
+        // Detect shell prompt for JumpServer connections that didn't send connectedToTarget
+        // This handles mingyu-type connections where the target shell prompt arrives via main-shell stream
+        if (!jumpserverConnectedToTargetSent.has(id) && SHELL_PROMPT_REGEX.test(chunk)) {
+          jumpserverConnectedToTargetSent.add(id)
+          const connData = jumpserverConnections.get(id)
+          const jumpserverUuid = connData?.jumpserverUuid
+          if (jumpserverUuid) {
+            event.sender.send('jumpserver:status-update', {
+              id: id,
+              message: 'Successfully connected to target server, you can start operating',
+              messageKey: 'ssh.jumpserver.connectedToTarget',
+              type: 'success',
+              timestamp: new Date().toLocaleTimeString()
+            })
+          }
+        }
+
         event.sender.send(`ssh:shell:data:${id}`, { data: chunk, raw, marker: '' })
         flushTimer = null
       }
@@ -1870,6 +1896,7 @@ export const registerSSHHandlers = () => {
         console.log(`JumpServer shell stream closed for id=${id}`)
         event.sender.send(`ssh:shell:close:${id}`)
         jumpserverShellStreams.delete(id)
+        jumpserverConnectedToTargetSent.delete(id)
       })
 
       return { status: 'success', message: 'JumpServer Shell ready' }

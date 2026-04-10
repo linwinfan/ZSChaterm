@@ -905,16 +905,10 @@ export const setupJumpServerInteraction = (
           }
         }
 
-        // Mark as connected but DON'T create exec stream - we want the shell to be interactive
-        if (connectionEstablished) {
-          return
-        }
-        connectionEstablished = true
-        clearNoProgressWatchdog()
-        noteProgress('connection-success', { reason: 'Mingyu manual operation' })
-        setConnectionPhase('connected', 'mingyu-menu-ready', {})
-        outputBuffer = ''
-
+        // For mingyu, we cannot detect when the target connection is fully established
+        // because mingyu uses a different data channel for the target's output.
+        // So we don't send connectedToTarget here - AI Chat will not auto-open for mingyu.
+        // The user can manually open AI Chat after login is complete.
         jumpserverConnections.set(connectionId, {
           conn,
           stream,
@@ -926,7 +920,6 @@ export const setupJumpServerInteraction = (
         jumpserverConnectionStatus.set(connectionId, { isVerified: true, source: 'shared', profile: 'mingyu' })
         // Update mapping for quick lookup by jumpserverUuid (for AI CHAT reuse)
         jumpserverUuidToConnectionId.set(jumpserverUuid, connectionId)
-
         // Resolve the promise to signal connection is ready
         resolve({ status: 'connected', message: 'Mingyu shell ready for manual operation' })
         return
