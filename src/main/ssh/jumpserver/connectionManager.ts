@@ -232,7 +232,8 @@ const attemptJumpServerConnection = async (
 
     if (connectionInfo.assetUuid) {
       for (const [, existingData] of jumpserverConnections.entries()) {
-        if (existingData.jumpserverUuid === jumpserverUuid) {
+        // Skip reuse for mingyu profile - each target host needs independent auth context
+        if (existingData.jumpserverUuid === jumpserverUuid && existingData.navigationPath?.profile !== 'mingyu') {
           sendStatusUpdate('Reusing existing connection, creating new shell session...', 'info', 'ssh.jumpserver.reuseConnection')
           recordJumpServerConnectionEvent({
             rootSessionId: connectionId,
