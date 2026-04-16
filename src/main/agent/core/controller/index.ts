@@ -669,7 +669,12 @@ export class Controller {
 
       return await Promise.race([titleGenerationPromise, timeoutPromise])
     } catch (error) {
-      console.error('Chat title generation failed:', error)
+      // Only log as error if it's not a timeout (timeout is expected when API is slow)
+      if (error instanceof Error && error.message === 'Title generation timeout') {
+        console.warn('Chat title generation timed out (API may be slow)')
+      } else {
+        console.error('Chat title generation failed:', error)
+      }
       // Always return empty string to avoid disrupting task execution
       return ''
     }

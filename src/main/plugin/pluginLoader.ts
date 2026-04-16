@@ -43,6 +43,14 @@ export async function loadAllPlugins() {
   globalContext.clear()
 
   capabilityRegistry.clearBastions()
+
+  // Re-register built-in bastion plugins (they were cleared by clearBastions())
+  import('../ssh/mingyu-plugin')
+    .then(({ registerMingyuPlugin }) => {
+      registerMingyuPlugin()
+    })
+    .catch((e) => console.warn('[pluginLoader] Failed to register Mingyu plugin:', e))
+
   const storage = new PluginStorageContext()
 
   let hostModules: PluginHostModules = {}

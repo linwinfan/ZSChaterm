@@ -805,7 +805,52 @@ export class RemoteTerminalProcess extends BrownEventEmitter<RemoteTerminalProce
    */
   private async runBastionCommand(bastionType: string, sessionId: string, command: string, cwd?: string): Promise<void> {
     const bastionCapability = capabilityRegistry.getBastion(bastionType)
-    if (!bastionCapability || !bastionCapability.getShellStream) {
+    if (!bastionCapability) {
+      throw new Error(`${bastionType} capability not available`)
+    }
+
+    // Check if bastion provides direct exec method (bypasses marker-based runner)
+    // This is critical for bastions like Mingyu where the menu intercepts shell I/O
+    if (bastionCapability.exec) {
+      console.log(`[${bastionType}] Using direct exec for command execution`)
+      const cleanCwd = cleanWorkingDirectory(cwd, `${bastionType} ${sessionId}`)
+      const commandToExecute = cleanCwd ? `cd "${cleanCwd}" && ${command}` : command
+
+      try {
+        const result = await bastionCapability.exec(sessionId, commandToExecute)
+
+        if (result.stdout) {
+          const lines = result.stdout.split(/\r?\n/)
+          for (const line of lines) {
+            if (line.trim()) {
+              this.emit('line', line)
+            }
+          }
+        }
+
+        if (result.stderr) {
+          const lines = result.stderr.split(/\r?\n/)
+          for (const line of lines) {
+            if (line.trim()) {
+              this.emit('line', line)
+            }
+          }
+        }
+
+        this.emit('exitCode', result.exitCode)
+        this.emit('completed')
+        this.emit('continue')
+        return
+      } catch (error) {
+        console.error(`[${bastionType}] Direct exec failed:`, error)
+        this.emit('error', error instanceof Error ? error : new Error(String(error)))
+        this.emit('completed')
+        this.emit('continue')
+      }
+    }
+
+    // Fallback to marker-based command execution via shell stream
+    if (!bastionCapability.getShellStream) {
       throw new Error(`${bastionType} capability shell stream not available`)
     }
 

@@ -123,6 +123,13 @@ export interface BastionCapability {
 
   /** Optional access to underlying shell stream (for agent command execution) */
   getShellStream?: (id: string) => unknown
+
+  /**
+   * Optional direct command execution via SSH exec channel.
+   * This bypasses the shell stream and uses conn.exec() directly.
+   * Useful for bastions like Mingyu where the menu intercepts shell I/O.
+   */
+  exec?: (id: string, command: string) => Promise<{ stdout: string; stderr: string; exitCode: number }>
 }
 
 // Connection related types
