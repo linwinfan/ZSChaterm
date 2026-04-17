@@ -17,6 +17,7 @@ export const MINGYU_ARROW_DOWN_SELECTION_COMMAND = '__ARROW_DOWN__'
 export const MINGYU_ARROW_UP_SELECTION_COMMAND = '__ARROW_UP__'
 
 export interface MingyuNavigationPath {
+  mingyuUuid: string
   selectedUserId?: number
   needsPassword: boolean
   targetPassword?: string
@@ -33,7 +34,7 @@ export interface MingyuNavigationPath {
 export interface MingyuConnectionData {
   conn: Client
   stream?: any
-  MingyuUuid?: string
+  mingyuUuid?: string
   targetIp?: string
   navigationPath?: MingyuNavigationPath
 }

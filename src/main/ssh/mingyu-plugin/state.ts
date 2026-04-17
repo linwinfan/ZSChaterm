@@ -1,30 +1,7 @@
 /**
  * Mingyu 独立状态管理
  */
-
-import type { Client } from 'ssh2'
-
-export interface MingyuConnectionData {
-  conn: Client
-  stream?: unknown
-  mingyuUuid?: string
-  targetIp?: string
-  navigationPath?: MingyuNavigationPath
-}
-
-export interface MingyuNavigationPath {
-  selectedUserId?: number
-  needsPassword: boolean
-  targetPassword?: string
-  //profile?: 'mingyu'
-  mingyuSelector?: string
-  mingyuSelectionCommand?: string
-  mingyuTargetOrdinal?: number
-  mingyuCurrentOrdinal?: number
-  targetHostname?: string
-  targetAsset?: string
-  targetUsername?: string
-}
+import { type MingyuConnectionData, type MingyuMarkedCommand } from './constants'
 
 // 连接状态 Map
 export const mingyuConnections = new Map<string, MingyuConnectionData>()
@@ -35,11 +12,13 @@ export const mingyuShellStreams = new Map<string, unknown>()
 // Exec 流 Map
 export const mingyuExecStreams = new Map<string, unknown>()
 
-// 标记命令 Map
-export const mingyuMarkedCommands = new Map<string, unknown>()
+export const mingyuMarkedCommands = new Map<string, MingyuMarkedCommand>()
 
 // 最后命令 Map
 export const mingyuLastCommand = new Map<string, string>()
+
+// 最后写入时间 Map (用于命令去重)
+export const markedCmdLastWriteTime = new Map<string, number>()
 
 // 输入缓冲区 Map
 export const mingyuInputBuffer = new Map<string, string>()

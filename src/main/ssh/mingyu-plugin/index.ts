@@ -126,6 +126,44 @@ export const createMingyuBastionCapability = (): BastionCapability => {
 
       stream.on('data', (data) => {
         const dataStr = Buffer.isBuffer(data) ? data.toString('utf8') : String(data)
+
+        // Check if this is a marked command output collection
+        const markedCmd = mingyuMarkedCommands.get(args.id)
+        if (markedCmd !== undefined) {
+          // For Chaterm:command marker, send each chunk immediately (same as jumpserver)
+          if (markedCmd.marker === 'Chaterm:command') {
+            const rawData = Buffer.isBuffer(data) ? data : Buffer.from(dataStr, 'utf8')
+            event.sender.send(`ssh:shell:data:${args.id}`, {
+              data: dataStr,
+              raw: rawData,
+              marker: markedCmd.marker
+            })
+            return
+          }
+          // Otherwise, accumulate output
+          markedCmd.output += dataStr
+          markedCmd.rawChunks.push(Buffer.isBuffer(data) ? data : Buffer.from(dataStr, 'utf8'))
+          markedCmd.rawBytes += Buffer.isBuffer(data) ? data.length : Buffer.byteLength(dataStr, 'utf8')
+          markedCmd.lastActivity = Date.now()
+          if (markedCmd.idleTimer) {
+            clearTimeout(markedCmd.idleTimer)
+          }
+          markedCmd.idleTimer = setTimeout(() => {
+            if (markedCmd && !markedCmd.completed) {
+              markedCmd.completed = true
+              const markedRaw = markedCmd.rawBytes ? Buffer.concat(markedCmd.rawChunks, markedCmd.rawBytes) : undefined
+              event.sender.send(`ssh:shell:data:${args.id}`, {
+                data: markedCmd.output,
+                raw: markedRaw,
+                marker: markedCmd.marker
+              })
+              mingyuMarkedCommands.delete(args.id)
+            }
+          }, 200)
+          return
+        }
+
+        // Normal shell output handling (non-marked)
         buffer += dataStr
         if (Buffer.isBuffer(data)) {
           rawChunks.push(data)
@@ -142,6 +180,23 @@ export const createMingyuBastionCapability = (): BastionCapability => {
       if (!stream) {
         console.warn('[Mingyu-plugin] Write to non-existent shell session:', args.id)
         return
+      }
+
+      // Set markedCommands for command output collection (same logic as jumpserverHandle.ts)
+      if (mingyuMarkedCommands.has(args.id)) {
+        mingyuMarkedCommands.delete(args.id)
+      }
+      if (args.marker) {
+        mingyuMarkedCommands.set(args.id, {
+          marker: args.marker,
+          output: '',
+          completed: false,
+          rawChunks: [],
+          rawBytes: 0,
+          raw: [],
+          lastActivity: Date.now(),
+          idleTimer: null
+        })
       }
 
       // Write data as-is, without appending '\n'

@@ -20,6 +20,7 @@ import { setupMingyuInteraction } from './interaction'
 import { handleMingyuKeyboardInteractive } from './mfa'
 import { buildErrorResponse } from './errorUtils'
 import { ensureDebugTranscriptSession, recordDebugTranscriptEvent, type DebugTranscriptRedaction } from '../debugTranscript'
+import { registerBastionSessionType } from '../bastionPlugin'
 import path from 'path'
 import fs from 'fs'
 
@@ -229,6 +230,10 @@ const attemptMingyuConnection = async (
             mingyuShellStreams.set(connectionId, existingStream)
             mingyuConnectionStatus.set(connectionId, { isVerified: true, source: 'mingyu', profile: 'mingyu' })
             mingyuUuidToConnectionId.set(mingyuUuid, connectionId)
+
+            // Register bastionType for the new connectionId so writeBastionSession can find it
+            registerBastionSessionType(connectionId, 'mingyu')
+            console.log(`[Mingyu-plugin] Registered bastionType 'mingyu' for reused connectionId=${connectionId}`)
 
             sendStatusUpdate('Mingyu connection reused successfully', 'success', 'ssh.mingyu.reused')
             resolve({ status: 'connected', message: 'Mingyu connection reused successfully' })

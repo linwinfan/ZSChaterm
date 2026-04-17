@@ -1,7 +1,7 @@
 import { BrowserWindow } from 'electron'
 import type { Client } from 'ssh2'
 import type { MingyuConnectionInfo } from './types'
-import { type MingyuNavigationPath } from './state'
+import { type MingyuNavigationPath } from './constants'
 import {
   mingyuConnections,
   mingyuShellStreams,
@@ -270,6 +270,7 @@ export const setupMingyuInteraction = (
   }
 
   const navigationPath: MingyuNavigationPath = {
+    mingyuUuid,
     needsPassword: false,
     targetHostname: connectionInfo.targetHostname,
     targetAsset: connectionInfo.targetAsset,
