@@ -8,8 +8,6 @@ export const jumpserverMarkedCommands = new Map<string, JumpServerMarkedCommand>
 export const jumpserverLastCommand = new Map<string, string>()
 export const jumpserverInputBuffer = new Map<string, string>()
 export const jumpserverConnectionStatus = new Map<string, { [key: string]: any }>()
-// Mapping from jumpserverUuid to connectionId for quick lookup
-export const jumpserverUuidToConnectionId = new Map<string, string>()
 
 export const getExecStreamPromise = (connectionId: string) => jumpserverExecStreamPromises.get(connectionId)
 export const setExecStreamPromise = (connectionId: string, promise: Promise<any>) => jumpserverExecStreamPromises.set(connectionId, promise)

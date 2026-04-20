@@ -4,34 +4,13 @@ import net from 'net'
 import tls from 'tls'
 import { getUserConfigFromRenderer } from '../../../index'
 import { createProxySocket } from '../../../ssh/proxy'
-import { parseJumpServerUsers, hasUserSelectionPrompt, resolveMingyuTargetSelection } from '../../../ssh/jumpserver/parser'
-import {
-  hasNoAssetsPrompt,
-  createNoAssetsError,
-  hasPasswordPrompt,
-  hasPasswordError,
-  detectDirectConnectionReason,
-  hasJumpServerInitialMenuPrompt,
-  resolveJumpServerShellProfile,
-  hasJumpServerMenuReturn,
-  getJumpServerListCommand
-} from '../../../ssh/jumpserver/navigator'
+import { parseJumpServerUsers, hasUserSelectionPrompt } from '../../../ssh/jumpserver/parser'
+import { hasNoAssetsPrompt, createNoAssetsError } from '../../../ssh/jumpserver/navigator'
 import { handleJumpServerUserSelectionWithWindow } from '../../../ssh/jumpserver/userSelection'
-import {
-  jumpserverConnections,
-  jumpserverShellStreams,
-  jumpserverConnectionStatus,
-  jumpserverUuidToConnectionId,
-  jumpserverInputBuffer,
-  jumpserverMarkedCommands,
-  jumpserverLastCommand
-} from '../../../ssh/jumpserverHandle'
+import { jumpserverConnections as globalJumpserverConnections } from '../../../ssh/jumpserverHandle'
 
-// Re-export for use by index.ts
-export { jumpserverShellStreams, jumpserverConnections, jumpserverConnectionStatus, jumpserverUuidToConnectionId }
-
-// Note: All jumpserver state maps are imported from ssh/jumpserverHandle which re-exports from ssh/jumpserver/state.ts
-// This ensures AI CHAT and main window share the same state
+// Store JumpServer connections
+export const jumpserverConnections = new Map()
 
 // Command execution result
 export interface JumpServerExecResult {
@@ -41,55 +20,33 @@ export interface JumpServerExecResult {
   exitSignal?: string
 }
 
-const prioritizeCommands = (preferredCommand: string | undefined, commands: string[]): string[] => {
-  if (!preferredCommand) {
-    return commands
-  }
+// Store shell session streams
+export const jumpserverShellStreams = new Map()
+export const jumpserverMarkedCommands = new Map()
+export const jumpserverLastCommand = new Map()
+const jumpserverInputBuffer = new Map() // Create input buffer for each session
 
-  return [preferredCommand, ...commands.filter((command) => command !== preferredCommand)]
-}
+export const jumpserverConnectionStatus = new Map()
 
 const findReusableConnection = (jumpserverUuid?: string) => {
-  console.log(`[JumpServer] findReusableConnection called, jumpserverUuid=${jumpserverUuid}, type=${typeof jumpserverUuid}`)
   if (!jumpserverUuid) {
-    console.log(`[JumpServer] findReusableConnection: jumpserverUuid is falsy, returning null`)
     return null
   }
 
-  console.log(`[JumpServer] findReusableConnection: jumpserverUuid is truthy, proceeding to search`)
-
-  // Debug: log all entries in jumpserverUuidToConnectionId
-  console.log(`[JumpServer] findReusableConnection: jumpserverUuidToConnectionId size=${jumpserverUuidToConnectionId.size}`)
-  for (const [key, value] of jumpserverUuidToConnectionId.entries()) {
-    console.log(`[JumpServer] findReusableConnection: mapping[${key}] = ${value}`)
-  }
-
-  // Use jumpserverUuidToConnectionId mapping for quick lookup
-  const connectionId = jumpserverUuidToConnectionId.get(jumpserverUuid)
-  console.log(`[JumpServer] findReusableConnection: lookup result for ${jumpserverUuid} = ${connectionId || 'null'}`)
-  if (connectionId) {
-    console.log(`[JumpServer] findReusableConnection: found connectionId=${connectionId} for jumpserverUuid=${jumpserverUuid}`)
-    const existingConn = jumpserverConnections.get(connectionId)
-    if (existingConn) {
-      const status = jumpserverConnectionStatus.get(connectionId)
-      const context = status as { profile?: string } | undefined
-      if (context?.profile === 'mingyu') {
-        const existingStream = jumpserverShellStreams.get(connectionId)
-        console.log(`[JumpServer] findReusableConnection: returning mingyu shell stream for ${connectionId}`)
-        return { conn: existingConn.conn as Client, shellStream: existingStream, isMingyu: true }
+  for (const [id, status] of jumpserverConnectionStatus.entries()) {
+    const context = status as { source?: string; jumpserverUuid?: string } | undefined
+    if (context?.jumpserverUuid === jumpserverUuid && context.source === 'shared') {
+      const existingConn = jumpserverConnections.get(id)
+      if (existingConn) {
+        return { conn: existingConn as Client }
       }
-      return { conn: existingConn.conn as Client }
     }
   }
 
-  // Fallback: search all connections
-  for (const [id, status] of jumpserverConnectionStatus.entries()) {
-    const ctx = status as { source?: string; jumpserverUuid?: string; profile?: string } | undefined
-    if (ctx?.jumpserverUuid === jumpserverUuid && ctx.source === 'shared') {
-      const existingConn = jumpserverConnections.get(id)
-      if (existingConn) {
-        return { conn: existingConn.conn as Client }
-      }
+  for (const [_id, data] of globalJumpserverConnections.entries()) {
+    const record = data as { conn?: Client; jumpserverUuid?: string } | undefined
+    if (record?.jumpserverUuid === jumpserverUuid && record.conn) {
+      return { conn: record.conn }
     }
   }
 
@@ -112,8 +69,6 @@ const initializeJumpServerShell = (
     connectionInfo: {
       password?: string
       targetIp: string
-      targetHostname?: string
-      targetAsset?: string
     } & Record<string, any>
     connectionId: string
     connectionTimeout?: NodeJS.Timeout
@@ -129,116 +84,7 @@ const initializeJumpServerShell = (
   let connectionEstablished = false
   let connectionFailed = false
   let outputBuffer = ''
-  let connectionPhase: 'connecting' | 'inputIp' | 'selectTarget' | 'selectUser' | 'inputPassword' | 'connected' = 'connecting'
-  let shellProfile: 'standard' | 'mingyu' = 'standard'
-  let mingyuListRequested = false
-  let mingyuSelectionCommands: string[] = []
-  let mingyuSelectionCommandIndex = 0
-  let mingyuLastSelectionCommand: string | null = null
-  const navigationState: {
-    selectedUserId?: number
-    password?: string
-    mingyuSelectionCommand?: string
-    targetHostname?: string
-    targetAsset?: string
-  } = {
-    targetHostname: connectionInfo.targetHostname,
-    targetAsset: connectionInfo.targetAsset
-  }
-
-  const rejectAsFailure = (error: Error, closeShell: boolean = true) => {
-    if (connectionFailed) {
-      return
-    }
-
-    connectionFailed = true
-    outputBuffer = ''
-
-    if (connectionTimeout) {
-      clearTimeout(connectionTimeout)
-    }
-
-    if (closeShell) {
-      try {
-        stream.end()
-      } catch {
-        // ignore cleanup failure
-      }
-    }
-
-    if (connectionSource === 'agent') {
-      conn.end()
-    }
-
-    reject(error)
-  }
-
-  const sendNextMingyuSelectionCommand = (context: string): boolean => {
-    if (mingyuSelectionCommandIndex >= mingyuSelectionCommands.length) {
-      return false
-    }
-
-    const command = mingyuSelectionCommands[mingyuSelectionCommandIndex++]
-    mingyuLastSelectionCommand = command
-    navigationState.mingyuSelectionCommand = command
-    outputBuffer = ''
-    console.log(`[JumpServer ${connectionId}] Mingyu selecting target (${context}): ${command}`)
-    // Use \n for :ssh commands, \r for other commands
-    const actualWrite = command.startsWith(':ssh ') ? command + '\n' : command + '\r'
-    stream.write(actualWrite)
-    return true
-  }
-
-  const tryProgressMingyuSelection = (context: string): boolean => {
-    const selectionResult = resolveMingyuTargetSelection(outputBuffer, {
-      targetIp: connectionInfo.targetIp,
-      targetHostname: navigationState.targetHostname,
-      targetAsset: navigationState.targetAsset
-    })
-
-    if (mingyuSelectionCommands.length === 0) {
-      if (selectionResult.status === 'matched') {
-        mingyuSelectionCommands = prioritizeCommands(navigationState.mingyuSelectionCommand, selectionResult.match.selectionCommands)
-        mingyuSelectionCommandIndex = 0
-        return sendNextMingyuSelectionCommand(context)
-      }
-
-      if (selectionResult.entries.length > 0) {
-        rejectAsFailure(
-          new Error(
-            selectionResult.status === 'ambiguous'
-              ? `Mingyu target selection is ambiguous for ${connectionInfo.targetIp}`
-              : `Mingyu target asset not found in current GateShell list for ${connectionInfo.targetIp}`
-          )
-        )
-        return true
-      }
-
-      if (!mingyuListRequested && hasJumpServerInitialMenuPrompt(outputBuffer, 'mingyu')) {
-        mingyuListRequested = true
-        outputBuffer = ''
-        const listCommand = getJumpServerListCommand('mingyu')
-        console.log(`[JumpServer ${connectionId}] Mingyu menu detected without visible list, requesting assets via ${listCommand}`)
-        // Use \n for JumpServer special commands (listCommand starts with 'r')
-        const actualWrite = listCommand.startsWith(':') ? listCommand + '\n' : listCommand + '\r'
-        stream.write(actualWrite)
-        return true
-      }
-
-      return false
-    }
-
-    if (hasJumpServerMenuReturn(outputBuffer, 'mingyu')) {
-      if (sendNextMingyuSelectionCommand(`${context}:retry`)) {
-        return true
-      }
-
-      rejectAsFailure(new Error(`Mingyu target selection returned to GateShell menu (${mingyuLastSelectionCommand || 'no command'})`))
-      return true
-    }
-
-    return false
-  }
+  let connectionPhase = 'connecting'
 
   const handleConnectionSuccess = (reason: string) => {
     if (connectionEstablished) {
@@ -253,7 +99,7 @@ const initializeJumpServerShell = (
     connectionPhase = 'connected'
     outputBuffer = ''
 
-    jumpserverConnections.set(connectionId, { conn, jumpserverUuid, targetIp: connectionInfo.targetIp, navigationPath: { needsPassword: true } })
+    jumpserverConnections.set(connectionId, conn)
     jumpserverShellStreams.set(connectionId, stream)
     jumpserverConnectionStatus.set(connectionId, {
       isVerified: true,
@@ -264,60 +110,73 @@ const initializeJumpServerShell = (
     resolve({ status: 'connected', message: 'Connection successful' })
   }
 
+  const hasPasswordPrompt = (text: string): boolean => {
+    return text.includes('Password:') || text.includes('password:')
+  }
+
+  const hasPasswordError = (text: string): boolean => {
+    return text.includes('password auth error') || text.includes('[Host]>')
+  }
+
+  const detectDirectConnectionReason = (text: string): string | null => {
+    if (!text) return null
+
+    const indicators = ['Connecting to', 'Last login:', 'Last failed login:']
+    for (const indicator of indicators) {
+      if (text.includes(indicator)) {
+        console.log(`[JumpServer ${connectionId}] Detected success indicator keyword: "${indicator.trim()}"`)
+        return `Indicator ${indicator.trim()}`
+      }
+    }
+
+    const lines = text.split(/\r?\n/)
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      if (trimmed === '[Host]>' || trimmed.endsWith('Opt>')) continue
+      const isPrompt =
+        (trimmed.endsWith('$') || trimmed.endsWith('#') || trimmed.endsWith(']$') || trimmed.endsWith(']#') || trimmed.endsWith('>$')) &&
+        (trimmed.includes('@') || trimmed.includes(':~') || trimmed.startsWith('['))
+      if (isPrompt) {
+        console.log(`[JumpServer ${connectionId}] Detected suspected shell prompt: "${trimmed}"`)
+        return `Prompt ${trimmed}`
+      }
+    }
+
+    return null
+  }
+
+  // Handle data output
   stream.on('data', (data: Buffer) => {
     const ansiRegex = /[\u001b\u009b][[()#;?]*.{0,2}(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nry=><]/g
     const chunk = data.toString('utf8').replace(ansiRegex, '')
     outputBuffer += chunk
-    shellProfile = resolveJumpServerShellProfile(outputBuffer, shellProfile)
 
     console.log(`[JumpServer ${connectionId}] Received data (phase: ${connectionPhase}): "${chunk.replace(/\r?\n/g, '\\n')}"`)
 
-    if (connectionPhase === 'connecting' && hasJumpServerInitialMenuPrompt(outputBuffer, shellProfile)) {
-      if (shellProfile === 'mingyu') {
-        // For mingyu bastion hosts, don't auto-select - let user manually operate the shell
-        // like normal SSH. After MFA, just mark as connected and let user navigate the menu.
-        console.log(`[JumpServer ${connectionId}] Detected Mingyu GateShell menu, letting user manually operate`)
-
-        if (connectionEstablished) {
-          return
-        }
-        connectionEstablished = true
-        if (connectionTimeout) {
-          clearTimeout(connectionTimeout)
-        }
-        connectionPhase = 'connected'
-        outputBuffer = ''
-
-        jumpserverConnections.set(connectionId, { conn, jumpserverUuid })
-        jumpserverShellStreams.set(connectionId, stream)
-        jumpserverConnectionStatus.set(connectionId, {
-          isVerified: true,
-          source: 'shared', // Mark as shared for reuse
-          jumpserverUuid,
-          profile: 'mingyu'
-        })
-        // Update mapping for quick lookup by jumpserverUuid
-        jumpserverUuidToConnectionId.set(jumpserverUuid, connectionId)
-        console.log(`[JumpServer ${connectionId}] Mingyu connection set up: jumpserverUuid=${jumpserverUuid}, mapping updated`)
-
-        resolve({ status: 'connected', message: 'Mingyu shell ready for manual operation' })
-        return
-      }
-
+    // Handle different responses based on connection phase
+    if (connectionPhase === 'connecting' && outputBuffer.includes('Opt>')) {
       console.log(`[JumpServer ${connectionId}] Detected JumpServer menu, entering target IP: ${connectionInfo.targetIp}`)
       connectionPhase = 'inputIp'
       outputBuffer = ''
       stream.write(connectionInfo.targetIp + '\r')
-      return
-    }
-
-    if (connectionPhase === 'inputIp') {
+    } else if (connectionPhase === 'inputIp') {
       if (hasNoAssetsPrompt(outputBuffer)) {
         console.error(`[JumpServer ${connectionId}] Target asset not found for IP: ${connectionInfo.targetIp}`)
-        rejectAsFailure(createNoAssetsError())
+        connectionFailed = true
+        outputBuffer = ''
+        if (connectionTimeout) {
+          clearTimeout(connectionTimeout)
+        }
+        stream.end()
+        if (connectionSource === 'agent') {
+          conn.end()
+        }
+        reject(createNoAssetsError())
         return
       }
 
+      // Check if user selection is required
       if (hasUserSelectionPrompt(outputBuffer)) {
         console.log(`[JumpServer ${connectionId}] Detected multi-user prompt, user needs to select account`)
         connectionPhase = 'selectUser'
@@ -326,136 +185,76 @@ const initializeJumpServerShell = (
 
         if (users.length === 0) {
           console.error(`[JumpServer ${connectionId}] Failed to parse user list, buffer content:`, outputBuffer)
-          rejectAsFailure(new Error('Failed to parse user list'))
+          if (connectionTimeout) {
+            clearTimeout(connectionTimeout)
+          }
+          if (connectionSource === 'agent') {
+            conn.end()
+          }
+          reject(new Error('Failed to parse user list'))
           return
         }
 
         outputBuffer = ''
 
+        // Request user selection from frontend
         handleJumpServerUserSelectionWithWindow(connectionId, users)
           .then((selectedUserId) => {
             console.log(`[JumpServer ${connectionId}] User selected account ID:`, selectedUserId)
-            connectionPhase = 'selectUser'
-            navigationState.selectedUserId = selectedUserId
+            connectionPhase = 'inputPassword'
             stream.write(selectedUserId.toString() + '\r')
           })
           .catch((err) => {
             console.error(`[JumpServer ${connectionId}] User selection failed:`, err)
-            rejectAsFailure(err as Error)
+            if (connectionTimeout) {
+              clearTimeout(connectionTimeout)
+            }
+            if (connectionSource === 'agent') {
+              conn.end()
+            }
+            reject(err)
           })
-        return
-      }
-
-      if (hasPasswordPrompt(outputBuffer)) {
+      } else if (hasPasswordPrompt(outputBuffer)) {
         console.log(`[JumpServer ${connectionId}] Detected password prompt, preparing to enter password`)
         connectionPhase = 'inputPassword'
         outputBuffer = ''
         setTimeout(() => {
           console.log(`[JumpServer ${connectionId}] Sending target server password`)
-          navigationState.password = connectionInfo.password
-          stream.write((connectionInfo.password || '') + '\r')
+          stream.write(connectionInfo.password + '\r')
         }, 100)
-        return
-      }
-
-      const reason = detectDirectConnectionReason(outputBuffer)
-      if (reason) {
-        console.log(`[JumpServer ${connectionId}] Target asset directly enters target host without password, reason: ${reason}`)
-        handleConnectionSuccess(`No password - ${reason}`)
       } else {
-        const preview = outputBuffer.slice(-200).replace(/\r?\n/g, '\\n')
-        console.log(`[JumpServer ${connectionId}] inputIp phase buffer preview: "${preview}"`)
-      }
-      return
-    }
-
-    if (connectionPhase === 'selectTarget') {
-      if (hasNoAssetsPrompt(outputBuffer)) {
-        rejectAsFailure(createNoAssetsError())
-        return
-      }
-
-      if (hasUserSelectionPrompt(outputBuffer)) {
-        console.log(`[JumpServer ${connectionId}] Detected multi-user prompt after Mingyu selection, user needs to select account`)
-        connectionPhase = 'selectUser'
-        const users = parseJumpServerUsers(outputBuffer)
-        console.log(`[JumpServer ${connectionId}] Parsed user list:`, users)
-
-        if (users.length === 0) {
-          rejectAsFailure(new Error('Failed to parse user list'))
-          return
+        const reason = detectDirectConnectionReason(outputBuffer)
+        if (reason) {
+          console.log(`[JumpServer ${connectionId}] Target asset directly enters target host without password, reason: ${reason}`)
+          handleConnectionSuccess(`No password - ${reason}`)
+        } else {
+          const preview = outputBuffer.slice(-200).replace(/\r?\n/g, '\\n')
+          console.log(`[JumpServer ${connectionId}] inputIp phase buffer preview: "${preview}"`)
         }
-
-        outputBuffer = ''
-        handleJumpServerUserSelectionWithWindow(connectionId, users)
-          .then((selectedUserId) => {
-            console.log(`[JumpServer ${connectionId}] User selected account ID:`, selectedUserId)
-            connectionPhase = 'selectUser'
-            navigationState.selectedUserId = selectedUserId
-            stream.write(selectedUserId.toString() + '\r')
-          })
-          .catch((err) => {
-            console.error(`[JumpServer ${connectionId}] User selection failed:`, err)
-            rejectAsFailure(err as Error)
-          })
-        return
       }
-
-      if (hasPasswordPrompt(outputBuffer)) {
-        console.log(`[JumpServer ${connectionId}] Detected password prompt after Mingyu selection, preparing to enter password`)
-        connectionPhase = 'inputPassword'
-        outputBuffer = ''
-        setTimeout(() => {
-          console.log(`[JumpServer ${connectionId}] Sending target server password`)
-          navigationState.password = connectionInfo.password
-          stream.write((connectionInfo.password || '') + '\r')
-        }, 100)
-        return
-      }
-
-      const reason = detectDirectConnectionReason(outputBuffer)
-      if (reason) {
-        console.log(`[JumpServer ${connectionId}] Mingyu target selection reached target host, reason: ${reason}`)
-        handleConnectionSuccess(`Mingyu selection - ${reason}`)
-        return
-      }
-
-      if (shellProfile === 'mingyu') {
-        tryProgressMingyuSelection('select-target')
-      }
-      return
-    }
-
-    if (connectionPhase === 'selectUser') {
+    } else if (connectionPhase === 'selectUser') {
+      // After user selection, check for password prompt or direct connection
       if (hasPasswordPrompt(outputBuffer)) {
         console.log(`[JumpServer ${connectionId}] Detected password prompt after user selection, preparing to enter password`)
         connectionPhase = 'inputPassword'
         outputBuffer = ''
         setTimeout(() => {
           console.log(`[JumpServer ${connectionId}] Sending target server password`)
-          navigationState.password = connectionInfo.password
-          stream.write((connectionInfo.password || '') + '\r')
+          stream.write(connectionInfo.password + '\r')
         }, 100)
-        return
+      } else {
+        const reason = detectDirectConnectionReason(outputBuffer)
+        if (reason) {
+          console.log(`[JumpServer ${connectionId}] Direct connection established after user selection, reason: ${reason}`)
+          handleConnectionSuccess(`User selection - ${reason}`)
+        }
       }
-
-      const reason = detectDirectConnectionReason(outputBuffer)
-      if (reason) {
-        console.log(`[JumpServer ${connectionId}] Direct connection established after user selection, reason: ${reason}`)
-        handleConnectionSuccess(`User selection - ${reason}`)
-        return
-      }
-
-      if (shellProfile === 'mingyu') {
-        tryProgressMingyuSelection('user-selection')
-      }
-      return
-    }
-
-    if (connectionPhase === 'inputPassword') {
-      if (hasPasswordError(outputBuffer, shellProfile)) {
+    } else if (connectionPhase === 'inputPassword') {
+      // Detect password authentication error
+      if (hasPasswordError(outputBuffer)) {
         console.error(`[JumpServer ${connectionId}] Target server password authentication failed`)
 
+        // Send MFA verification failure event to frontend
         const { BrowserWindow } = require('electron')
         const mainWindow = BrowserWindow.getAllWindows()[0]
         if (mainWindow) {
@@ -465,19 +264,20 @@ const initializeJumpServerShell = (
           })
         }
 
-        rejectAsFailure(new Error('JumpServer password authentication failed, please check if password is correct'))
+        if (connectionTimeout) {
+          clearTimeout(connectionTimeout)
+        }
+        if (connectionSource === 'agent') {
+          conn.end()
+        }
+        reject(new Error('JumpServer password authentication failed, please check if password is correct'))
         return
       }
-
+      // Detect connection success
       const reason = detectDirectConnectionReason(outputBuffer)
       if (reason) {
         console.log(`[JumpServer ${connectionId}] Entered target host after password verification, reason: ${reason}`)
         handleConnectionSuccess(`After password verification - ${reason}`)
-        return
-      }
-
-      if (shellProfile === 'mingyu' && hasJumpServerMenuReturn(outputBuffer, 'mingyu')) {
-        rejectAsFailure(new Error('Mingyu target selection returned to GateShell menu after password input'))
       }
     }
   })
@@ -498,11 +298,7 @@ const initializeJumpServerShell = (
     jumpserverLastCommand.delete(connectionId)
     jumpserverInputBuffer.delete(connectionId)
     if (connectionPhase !== 'connected' && !connectionFailed) {
-      reject(
-        shellProfile === 'mingyu'
-          ? new Error(`Mingyu target connection closed before entering target host (phase: ${connectionPhase})`)
-          : new Error('Connection closed before completion')
-      )
+      reject(new Error('Connection closed before completion'))
     }
   })
 
@@ -526,8 +322,6 @@ export const handleJumpServerConnection = async (connectionInfo: {
   privateKey?: string
   passphrase?: string
   targetIp: string
-  targetHostname?: string
-  targetAsset?: string
   needProxy: boolean
   proxyName: string
   assetUuid?: string
@@ -551,49 +345,20 @@ export const handleJumpServerConnection = async (connectionInfo: {
   }
 
   return new Promise((resolve, reject) => {
-    console.log(`[JumpServer ${connectionId}] Promise created, checking connectionId=${connectionId}, assetUuid=${connectionInfo.assetUuid}`)
     if (jumpserverConnections.has(connectionId)) {
-      console.log(`[JumpServer ${connectionId}] Connection ID exists in jumpserverConnections, reusing`)
-      // Check if this is a mingyu connection
-      const existingStatus = jumpserverConnectionStatus.get(connectionId) as { profile?: string } | undefined
-      const isMingyu = existingStatus?.profile === 'mingyu'
+      console.log(`[JumpServer ${connectionId}] Reusing existing connection`)
       jumpserverConnectionStatus.set(connectionId, {
         isVerified: true,
-        source: 'shared', // Mark as shared so findReusableConnection can find it
-        jumpserverUuid,
-        profile: isMingyu ? 'mingyu' : undefined
+        source: 'agent',
+        jumpserverUuid
       })
       return resolve({ status: 'connected', message: 'Reusing existing JumpServer connection' })
     }
 
     if (connectionInfo.assetUuid) {
-      console.log(
-        `[JumpServer ${connectionId}] assetUuid is present (${connectionInfo.assetUuid}), calling findReusableConnection with jumpserverUuid=${jumpserverUuid}`
-      )
       const reusable = findReusableConnection(jumpserverUuid)
       if (reusable) {
         console.log(`[JumpServer ${connectionId}] Found globally authenticated connection, attempting to reuse`)
-
-        // For mingyu connections, directly reuse the existing shell stream (no need to create new shell)
-        if (reusable.isMingyu && reusable.shellStream) {
-          console.log(`[JumpServer ${connectionId}] Reusing existing mingyu shell stream directly`)
-
-          // Directly set up the connection and mark as connected
-          jumpserverConnections.set(connectionId, { conn: reusable.conn, jumpserverUuid })
-          jumpserverShellStreams.set(connectionId, reusable.shellStream)
-          jumpserverConnectionStatus.set(connectionId, {
-            isVerified: true,
-            source: 'shared',
-            jumpserverUuid,
-            profile: 'mingyu'
-          })
-          // Update mapping for quick lookup
-          jumpserverUuidToConnectionId.set(jumpserverUuid, connectionId)
-
-          resolve({ status: 'connected', message: 'Mingyu connection reused successfully' })
-          return
-        }
-
         const startTime = Date.now()
         const connectionTimeout = setTimeout(() => {
           const elapsed = Date.now() - startTime
@@ -621,23 +386,19 @@ export const handleJumpServerConnection = async (connectionInfo: {
           })
         })
         return
-      } else {
-        console.log(`[JumpServer ${connectionId}] findReusableConnection returned null, will create new connection`)
       }
-    } else {
-      console.log(`[JumpServer ${connectionId}] assetUuid is NOT present, skipping findReusableConnection`)
     }
 
-    console.log(`[JumpServer ${connectionId}] Creating new SSH connection`)
     const conn = new Client()
     const startTime = Date.now()
 
+    // Add connection timeout monitoring
     const connectionTimeout = setTimeout(() => {
       const elapsed = Date.now() - startTime
       console.error(`[JumpServer ${connectionId}] Connection timeout, waited ${elapsed}ms`)
       conn.end()
       reject(new Error(`JumpServer connection timeout: Handshake not completed after ${elapsed}ms`))
-    }, 35000)
+    }, 35000) // 35 second timeout
 
     const connectConfig: {
       host: string
@@ -658,13 +419,14 @@ export const handleJumpServerConnection = async (connectionInfo: {
       keepaliveInterval: 10000,
       readyTimeout: 30000,
       ident: connectionInfo.ident,
-      tryKeyboard: true
+      tryKeyboard: true // Enable keyboard interactive authentication for 2FA
     }
 
     if (connectionInfo.needProxy) {
       connectConfig.sock = sock
     }
 
+    // Handle private key authentication
     if (connectionInfo.privateKey) {
       try {
         connectConfig.privateKey = Buffer.from(connectionInfo.privateKey)
@@ -686,12 +448,15 @@ export const handleJumpServerConnection = async (connectionInfo: {
       return reject(new Error('Missing authentication information: Private key or password required'))
     }
 
+    // Handle keyboard-interactive authentication for 2FA
     conn.on('keyboard-interactive', async (_name, _instructions, _instructionsLang, prompts, finish) => {
       try {
         console.log(`[JumpServer ${connectionId}] Two-factor authentication required, please enter verification code...`)
 
+        // Use simplified MFA handling directly
         const promptTexts = prompts.map((p: any) => p.prompt)
 
+        // Send MFA request to frontend
         const { BrowserWindow } = require('electron')
         const mainWindow = BrowserWindow.getAllWindows()[0]
         if (mainWindow) {
@@ -701,6 +466,7 @@ export const handleJumpServerConnection = async (connectionInfo: {
           })
         }
 
+        // Set timeout
         const timeoutId = setTimeout(() => {
           ipcMain.removeAllListeners(`ssh:keyboard-interactive-response:${connectionId}`)
           ipcMain.removeAllListeners(`ssh:keyboard-interactive-cancel:${connectionId}`)
@@ -709,13 +475,15 @@ export const handleJumpServerConnection = async (connectionInfo: {
             mainWindow.webContents.send('ssh:keyboard-interactive-timeout', { id: connectionId })
           }
           reject(new Error('Two-factor authentication timeout'))
-        }, 30000)
+        }, 30000) // 30 second timeout
 
+        // Listen for user response
         ipcMain.once(`ssh:keyboard-interactive-response:${connectionId}`, (_evt: any, responses: string[]) => {
           clearTimeout(timeoutId)
           finish(responses)
         })
 
+        // Listen for user cancellation
         ipcMain.once(`ssh:keyboard-interactive-cancel:${connectionId}`, () => {
           clearTimeout(timeoutId)
           finish([])
@@ -723,8 +491,8 @@ export const handleJumpServerConnection = async (connectionInfo: {
         })
       } catch (err) {
         console.error(`[JumpServer ${connectionId}] Two-factor authentication failed:`, err)
-        conn.end()
-        reject(err as Error)
+        conn.end() // Close connection
+        reject(err)
       }
     })
 
@@ -732,6 +500,7 @@ export const handleJumpServerConnection = async (connectionInfo: {
       const elapsed = Date.now() - startTime
       console.log(`[JumpServer ${connectionId}] SSH connection established successfully, elapsed ${elapsed}ms, starting shell creation`)
 
+      // Send MFA verification success event to frontend
       const { BrowserWindow } = require('electron')
       const mainWindow = BrowserWindow.getAllWindows()[0]
       if (mainWindow) {
@@ -767,6 +536,7 @@ export const handleJumpServerConnection = async (connectionInfo: {
       console.error(`[JumpServer ${connectionId}] Connection error, elapsed ${elapsed}ms:`, err)
       console.error(`[JumpServer ${connectionId}] Error details - code: ${err.code}, level: ${err.level}`)
 
+      // Send MFA verification failure event to frontend
       const { BrowserWindow } = require('electron')
       const mainWindow = BrowserWindow.getAllWindows()[0]
       if (mainWindow) {
@@ -787,16 +557,11 @@ export const handleJumpServerConnection = async (connectionInfo: {
   })
 }
 
+// JumpServer command execution
 export const jumpServerExec = async (sessionId: string, command: string): Promise<JumpServerExecResult> => {
-  const connectionData = jumpserverConnections.get(sessionId)
-  if (!connectionData) {
-    throw new Error(`No JumpServer connection for id=${sessionId}`)
-  }
-
-  // connectionData.conn is the actual SSH Client
-  const conn = connectionData.conn
+  const conn = jumpserverConnections.get(sessionId)
   if (!conn) {
-    throw new Error(`No SSH Client in JumpServer connection for id=${sessionId}`)
+    throw new Error(`No JumpServer connection for id=${sessionId}`)
   }
 
   return new Promise((resolve) => {
@@ -833,6 +598,7 @@ export const jumpServerExec = async (sessionId: string, command: string): Promis
   })
 }
 
+// JumpServer disconnect
 export const jumpServerDisconnect = async (sessionId: string): Promise<{ status: string; message: string }> => {
   const status = jumpserverConnectionStatus.get(sessionId) as { source?: string } | undefined
   const stream = jumpserverShellStreams.get(sessionId)
@@ -841,8 +607,8 @@ export const jumpServerDisconnect = async (sessionId: string): Promise<{ status:
   }
 
   const conn = jumpserverConnections.get(sessionId)
-  if (conn?.conn && status?.source !== 'shared') {
-    conn.conn.end()
+  if (conn && status?.source !== 'shared') {
+    conn.end()
   }
 
   jumpserverConnectionStatus.delete(sessionId)
@@ -855,6 +621,7 @@ export const jumpServerDisconnect = async (sessionId: string): Promise<{ status:
   return { status: 'warning', message: 'No active JumpServer connection' }
 }
 
+// Shell write
 export const jumpServerShellWrite = (sessionId: string, data: string, marker?: string): void => {
   const stream = jumpserverShellStreams.get(sessionId)
   if (stream) {
@@ -870,9 +637,6 @@ export const jumpServerShellWrite = (sessionId: string, data: string, marker?: s
         marker,
         output: '',
         completed: false,
-        rawChunks: [],
-        rawBytes: 0,
-        raw: [],
         lastActivity: Date.now(),
         idleTimer: null
       })
@@ -883,12 +647,17 @@ export const jumpServerShellWrite = (sessionId: string, data: string, marker?: s
   }
 }
 
+// Shell window resize
 export const jumpServerShellResize = (sessionId: string, cols: number, rows: number): { status: string; message: string } => {
   const stream = jumpserverShellStreams.get(sessionId)
   if (!stream) {
-    return { status: 'warning', message: 'No active JumpServer shell session' }
+    return { status: 'error', message: 'JumpServer Shell not found' }
   }
 
-  stream.setWindow(rows, cols, rows * 10, cols * 10)
-  return { status: 'success', message: 'Terminal window size adjusted' }
+  try {
+    stream.setWindow(rows, cols, 0, 0)
+    return { status: 'success', message: `JumpServer window size set to ${cols}x${rows}` }
+  } catch (error: unknown) {
+    return { status: 'error', message: error instanceof Error ? error.message : String(error) }
+  }
 }

@@ -1,51 +1,8 @@
-import {
-  hasPasswordPrompt,
-  hasPasswordError,
-  hasRetryablePasswordError,
-  detectDirectConnectionReason,
-  hasJumpServerInitialMenuPrompt,
-  resolveJumpServerShellProfile,
-  hasJumpServerMenuReturn,
-  getJumpServerListCommand,
-  hasUsernamePrompt,
-  hasNoAssetsPrompt,
-  createNoAssetsError,
-  getJumpServerAuthenticationTargetMismatch,
-  createAuthenticationTargetMismatchError
-} from './navigator'
-import { hasUserSelectionPrompt, resolveMingyuTargetSelection, normalizeMingyuLoginUser, MINGYU_ENTER_SELECTION_COMMAND } from './parser'
+import { hasPasswordPrompt, hasPasswordError, detectDirectConnectionReason } from './navigator'
+import { hasUserSelectionPrompt } from './parser'
 import { OutputParser } from './executor'
 import { jumpserverConnections, jumpserverExecStreams, deleteExecStreamPromise, getExecStreamPromise, setExecStreamPromise } from './state'
 import { JUMPSERVER_CONSTANTS, type JumpServerNavigationPath } from './constants'
-
-const MAX_TARGET_PASSWORD_RETRY_COUNT = 1
-
-const prioritizeCommands = (preferredCommand: string | undefined, commands: string[]): string[] => {
-  if (!preferredCommand) {
-    return commands
-  }
-
-  return [preferredCommand, ...commands.filter((command) => command !== preferredCommand)]
-}
-
-const hasTargetUsernameValue = (navigationPath: JumpServerNavigationPath): boolean => {
-  return typeof navigationPath.targetUsername === 'string' && navigationPath.targetUsername.trim().length > 0
-}
-
-const hasTargetPasswordValue = (navigationPath: JumpServerNavigationPath): boolean => {
-  return typeof navigationPath.targetPassword === 'string' && navigationPath.targetPassword.length > 0
-}
-
-const writeNavigationCommand = (stream: any, command: string) => {
-  // Use \n for :ssh commands to avoid \r being interpreted as carriage return (which moves cursor to line start without executing)
-  // For other commands and __ENTER__, use \r as before
-  if (command.startsWith(':ssh ')) {
-    stream.write(command + '\n')
-  } else {
-    const actualWrite = command === MINGYU_ENTER_SELECTION_COMMAND ? '\r' : command + '\r'
-    stream.write(actualWrite)
-  }
-}
 
 export async function navigateToJumpServerAsset(
   stream: any,
@@ -55,83 +12,13 @@ export async function navigateToJumpServerAsset(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     let outputBuffer = ''
-    let connectionPhase: 'connecting' | 'inputIp' | 'selectTarget' | 'selectUser' | 'inputUsername' | 'inputPassword' | 'connected' = 'connecting'
+    let connectionPhase = 'connecting'
     let connectionEstablished = false
-    let mingyuListRequested = false
-    let mingyuSelectionCommands: string[] = []
-    let mingyuSelectionCommandIndex = 0
-    let mingyuLastSelectionCommand: string | null = null
-    let targetPasswordRetryCount = 0
-    let noProgressTimer: NodeJS.Timeout | null = null
-
-    const clearNoProgressWatchdog = () => {
-      if (noProgressTimer) {
-        clearTimeout(noProgressTimer)
-        noProgressTimer = null
-      }
-    }
 
     const cleanup = () => {
-      clearNoProgressWatchdog()
       stream.removeListener('data', dataHandler)
       stream.removeListener('error', errorHandler)
       stream.removeListener('close', closeHandler)
-    }
-
-    const continueMingyuSelectionAfterStall = (context: string) => {
-      if (connectionEstablished) {
-        return
-      }
-
-      if (connectionPhase !== 'selectTarget' || navigationPath.profile !== 'mingyu') {
-        return
-      }
-
-      if (sendNextMingyuSelectionCommand(`${context}:no-progress-fallback`)) {
-        return
-      }
-
-      cleanup()
-      reject(new Error(`JumpServer exec stream: Mingyu target selection made no progress after ${mingyuLastSelectionCommand || 'no command'}`))
-    }
-
-    const rejectOnAuthenticationTargetMismatch = (): boolean => {
-      const mismatch = getJumpServerAuthenticationTargetMismatch(outputBuffer, targetIp, navigationPath.profile)
-      if (!mismatch) {
-        return false
-      }
-
-      cleanup()
-      reject(createAuthenticationTargetMismatchError(mismatch))
-      return true
-    }
-
-    const armNoProgressWatchdog = (context: string) => {
-      clearNoProgressWatchdog()
-      noProgressTimer = setTimeout(() => {
-        console.log(`JumpServer exec stream: Mingyu selection stalled after ${mingyuLastSelectionCommand || 'no command'}, trying fallback`)
-        continueMingyuSelectionAfterStall(context)
-      }, JUMPSERVER_CONSTANTS.DATA_SETTLE_DELAY + 2000)
-    }
-
-    const shouldTreatChunkAsSelectionProgress = (chunk: string): boolean => {
-      if (connectionPhase !== 'selectTarget' || navigationPath.profile !== 'mingyu') {
-        return chunk.length > 0
-      }
-
-      const trimmedChunk = chunk.trim()
-      if (!trimmedChunk) {
-        return false
-      }
-
-      return (
-        hasUsernamePrompt(outputBuffer) ||
-        hasPasswordPrompt(outputBuffer) ||
-        hasUserSelectionPrompt(outputBuffer) ||
-        hasNoAssetsPrompt(outputBuffer) ||
-        hasJumpServerMenuReturn(outputBuffer, 'mingyu') ||
-        Boolean(detectDirectConnectionReason(outputBuffer))
-      )
     }
 
     const handleNavigationSuccess = (reason: string) => {
@@ -139,103 +26,17 @@ export async function navigateToJumpServerAsset(
       connectionEstablished = true
       console.log(`JumpServer exec stream navigation successful (${jumpserverUuid}): ${reason}`)
       connectionPhase = 'connected'
-      targetPasswordRetryCount = 0
       outputBuffer = ''
       cleanup()
       resolve()
-    }
-
-    const sendNextMingyuSelectionCommand = (context: string): boolean => {
-      if (mingyuSelectionCommandIndex >= mingyuSelectionCommands.length) {
-        return false
-      }
-
-      const command = mingyuSelectionCommands[mingyuSelectionCommandIndex++]
-      mingyuLastSelectionCommand = command
-      navigationPath.mingyuSelectionCommand = command
-      outputBuffer = ''
-      console.log(`JumpServer exec stream: Mingyu selecting target (${context}) with ${command}`)
-      writeNavigationCommand(stream, command)
-      armNoProgressWatchdog(`write:${command === MINGYU_ENTER_SELECTION_COMMAND ? '<enter>' : command}`)
-      return true
-    }
-
-    const tryProgressMingyuSelection = (context: string): boolean => {
-      const selectionResult = resolveMingyuTargetSelection(outputBuffer, {
-        targetIp,
-        targetHostname: navigationPath.targetHostname,
-        targetAsset: navigationPath.targetAsset
-      })
-
-      if (mingyuSelectionCommands.length === 0) {
-        if (selectionResult.status === 'matched') {
-          navigationPath.mingyuSelector = selectionResult.match.entry.selector
-          const detectedLoginUser = normalizeMingyuLoginUser(selectionResult.match.entry.loginUser)
-          if (!hasTargetUsernameValue(navigationPath) && detectedLoginUser) {
-            navigationPath.targetUsername = detectedLoginUser
-          }
-          mingyuSelectionCommands = prioritizeCommands(navigationPath.mingyuSelectionCommand, selectionResult.match.selectionCommands)
-          mingyuSelectionCommandIndex = 0
-          return sendNextMingyuSelectionCommand(context)
-        }
-
-        if (selectionResult.entries.length > 0) {
-          cleanup()
-          reject(
-            new Error(
-              selectionResult.status === 'ambiguous'
-                ? `JumpServer exec stream: Mingyu target selection is ambiguous for ${targetIp}`
-                : `JumpServer exec stream: Mingyu target asset not found in current GateShell list for ${targetIp}`
-            )
-          )
-          return true
-        }
-
-        if (!mingyuListRequested && hasJumpServerInitialMenuPrompt(outputBuffer, 'mingyu')) {
-          mingyuListRequested = true
-          outputBuffer = ''
-          const listCommand = getJumpServerListCommand('mingyu')
-          console.log(`JumpServer exec stream: Mingyu menu detected without visible list, requesting assets via ${listCommand}`)
-          stream.write(listCommand + '\r')
-          return true
-        }
-
-        return false
-      }
-
-      if (hasJumpServerMenuReturn(outputBuffer, 'mingyu')) {
-        if (sendNextMingyuSelectionCommand(`${context}:retry`)) {
-          return true
-        }
-
-        cleanup()
-        reject(
-          new Error(`JumpServer exec stream: Mingyu target selection returned to GateShell menu (${mingyuLastSelectionCommand || 'no command'})`)
-        )
-        return true
-      }
-
-      return false
     }
 
     const dataHandler = (data: Buffer) => {
       const ansiRegex = /[\u001b\u009b][[()#;?]*.{0,2}(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nry=><]/g
       const chunk = data.toString().replace(ansiRegex, '')
       outputBuffer += chunk
-      navigationPath.profile = resolveJumpServerShellProfile(outputBuffer, navigationPath.profile ?? 'standard')
 
-      if (shouldTreatChunkAsSelectionProgress(chunk)) {
-        clearNoProgressWatchdog()
-      }
-
-      if (connectionPhase === 'connecting' && hasJumpServerInitialMenuPrompt(outputBuffer, navigationPath.profile)) {
-        if (navigationPath.profile === 'mingyu') {
-          console.log('JumpServer exec stream: Mingyu menu detected, preparing target selection')
-          connectionPhase = 'selectTarget'
-          tryProgressMingyuSelection('initial-menu')
-          return
-        }
-
+      if (connectionPhase === 'connecting' && outputBuffer.includes('Opt>')) {
         console.log(`JumpServer exec stream: Menu detected, entering IP ${targetIp}`)
         connectionPhase = 'inputIp'
         outputBuffer = ''
@@ -244,18 +45,12 @@ export async function navigateToJumpServerAsset(
       }
 
       if (connectionPhase === 'inputIp') {
-        if (hasNoAssetsPrompt(outputBuffer)) {
-          cleanup()
-          reject(createNoAssetsError())
-          return
-        }
-
         if (hasUserSelectionPrompt(outputBuffer)) {
           if (navigationPath.selectedUserId !== undefined) {
             console.log(`JumpServer exec stream: User selection prompt detected, auto-selecting userId=${navigationPath.selectedUserId}`)
             connectionPhase = 'selectUser'
             outputBuffer = ''
-            writeNavigationCommand(stream, navigationPath.selectedUserId.toString())
+            stream.write(navigationPath.selectedUserId.toString() + '\r')
           } else {
             cleanup()
             reject(new Error('JumpServer exec stream: Multiple user scenario detected but selectedUserId not provided'))
@@ -263,34 +58,22 @@ export async function navigateToJumpServerAsset(
           return
         }
 
-        if (hasUsernamePrompt(outputBuffer)) {
-          if (!hasTargetUsernameValue(navigationPath)) {
-            cleanup()
-            reject(new Error('JumpServer exec stream: Target username prompt detected but targetUsername not recorded'))
-            return
-          }
-          connectionPhase = 'inputUsername'
-          outputBuffer = ''
-          writeNavigationCommand(stream, navigationPath.targetUsername!)
-          return
-        }
-
         if (hasPasswordPrompt(outputBuffer)) {
-          if (rejectOnAuthenticationTargetMismatch()) {
-            return
-          }
-
-          if (hasTargetPasswordValue(navigationPath)) {
-            console.log('JumpServer exec stream: Password prompt detected, using saved target password')
+          if (navigationPath.password) {
+            console.log('JumpServer exec stream: Password prompt detected, using saved password')
             connectionPhase = 'inputPassword'
-            targetPasswordRetryCount = 0
             outputBuffer = ''
             setTimeout(() => {
-              stream.write(navigationPath.targetPassword + '\r')
+              stream.write(navigationPath.password + '\r')
             }, JUMPSERVER_CONSTANTS.PASSWORD_INPUT_DELAY)
           } else {
-            cleanup()
-            reject(new Error('JumpServer exec stream: Target password prompt detected but targetPassword not recorded'))
+            const reason = detectDirectConnectionReason(outputBuffer)
+            if (reason) {
+              console.log(`JumpServer exec stream: Password prompt detected but no password, attempting direct connection (${reason})`)
+              handleNavigationSuccess(`Direct connection without password - ${reason}`)
+            } else {
+              console.warn('JumpServer exec stream: Password required but main connection did not record password, waiting for further output...')
+            }
           }
           return
         }
@@ -302,99 +85,27 @@ export async function navigateToJumpServerAsset(
         return
       }
 
-      if (connectionPhase === 'selectTarget') {
-        if (hasNoAssetsPrompt(outputBuffer)) {
-          cleanup()
-          reject(createNoAssetsError())
-          return
-        }
-
-        if (hasUserSelectionPrompt(outputBuffer)) {
-          if (navigationPath.selectedUserId !== undefined) {
-            console.log(
-              `JumpServer exec stream: User selection prompt detected after Mingyu selection, auto-selecting userId=${navigationPath.selectedUserId}`
-            )
-            connectionPhase = 'selectUser'
-            outputBuffer = ''
-            writeNavigationCommand(stream, navigationPath.selectedUserId.toString())
-          } else {
-            cleanup()
-            reject(new Error('JumpServer exec stream: Multiple user scenario detected but selectedUserId not provided'))
-          }
-          return
-        }
-
-        if (hasUsernamePrompt(outputBuffer)) {
-          if (!hasTargetUsernameValue(navigationPath)) {
-            cleanup()
-            reject(new Error('JumpServer exec stream: Target username prompt detected after Mingyu selection but targetUsername not recorded'))
-            return
-          }
-          connectionPhase = 'inputUsername'
-          outputBuffer = ''
-          writeNavigationCommand(stream, navigationPath.targetUsername!)
-          return
-        }
-
-        if (hasPasswordPrompt(outputBuffer)) {
-          if (rejectOnAuthenticationTargetMismatch()) {
-            return
-          }
-
-          if (hasTargetPasswordValue(navigationPath)) {
-            console.log('JumpServer exec stream: Password prompt detected after Mingyu selection, using saved target password')
-            connectionPhase = 'inputPassword'
-            outputBuffer = ''
-            setTimeout(() => {
-              stream.write(navigationPath.targetPassword + '\r')
-            }, JUMPSERVER_CONSTANTS.PASSWORD_INPUT_DELAY)
-          } else {
-            cleanup()
-            reject(new Error('JumpServer exec stream: Target password prompt detected after Mingyu selection but targetPassword not recorded'))
-          }
-          return
-        }
-
-        const reason = detectDirectConnectionReason(outputBuffer)
-        if (reason) {
-          handleNavigationSuccess(`Mingyu target selection - ${reason}`)
-          return
-        }
-
-        if (navigationPath.profile === 'mingyu') {
-          tryProgressMingyuSelection('select-target')
-        }
-        return
-      }
-
       if (connectionPhase === 'selectUser') {
-        if (hasUsernamePrompt(outputBuffer)) {
-          if (!hasTargetUsernameValue(navigationPath)) {
-            cleanup()
-            reject(new Error('JumpServer exec stream: Target username prompt detected after user selection but targetUsername not recorded'))
-            return
-          }
-          connectionPhase = 'inputUsername'
-          outputBuffer = ''
-          writeNavigationCommand(stream, navigationPath.targetUsername!)
-          return
-        }
-
         if (hasPasswordPrompt(outputBuffer)) {
-          if (rejectOnAuthenticationTargetMismatch()) {
-            return
-          }
-
-          if (hasTargetPasswordValue(navigationPath)) {
-            console.log('JumpServer exec stream: Password prompt detected after user selection, using saved target password')
+          if (navigationPath.password) {
+            console.log('JumpServer exec stream: Password prompt detected after user selection, using saved password')
             connectionPhase = 'inputPassword'
             outputBuffer = ''
             setTimeout(() => {
-              stream.write(navigationPath.targetPassword + '\r')
+              stream.write(navigationPath.password + '\r')
             }, JUMPSERVER_CONSTANTS.PASSWORD_INPUT_DELAY)
           } else {
-            cleanup()
-            reject(new Error('JumpServer exec stream: Target password prompt detected after user selection but targetPassword not recorded'))
+            const reason = detectDirectConnectionReason(outputBuffer)
+            if (reason) {
+              console.log(
+                `JumpServer exec stream: Password prompt detected after user selection but no password, attempting direct connection (${reason})`
+              )
+              handleNavigationSuccess(`Direct connection without password after user selection - ${reason}`)
+            } else {
+              console.warn(
+                'JumpServer exec stream: Password required after user selection but main connection did not record password, waiting for further output...'
+              )
+            }
           }
           return
         }
@@ -402,94 +113,20 @@ export async function navigateToJumpServerAsset(
         const reason = detectDirectConnectionReason(outputBuffer)
         if (reason) {
           handleNavigationSuccess(`After user selection - ${reason}`)
-          return
-        }
-
-        if (navigationPath.profile === 'mingyu') {
-          tryProgressMingyuSelection('user-selection')
-        }
-        return
-      }
-
-      if (connectionPhase === 'inputUsername') {
-        if (hasPasswordPrompt(outputBuffer)) {
-          if (rejectOnAuthenticationTargetMismatch()) {
-            return
-          }
-
-          if (hasTargetPasswordValue(navigationPath)) {
-            connectionPhase = 'inputPassword'
-            outputBuffer = ''
-            setTimeout(() => {
-              stream.write(navigationPath.targetPassword + '\r')
-            }, JUMPSERVER_CONSTANTS.PASSWORD_INPUT_DELAY)
-          } else {
-            cleanup()
-            reject(new Error('JumpServer exec stream: Target password prompt detected after username input but targetPassword not recorded'))
-          }
-          return
-        }
-
-        const reason = detectDirectConnectionReason(outputBuffer)
-        if (reason) {
-          handleNavigationSuccess(`After username input - ${reason}`)
-          return
-        }
-
-        if (navigationPath.profile === 'mingyu' && hasJumpServerMenuReturn(outputBuffer, 'mingyu')) {
-          cleanup()
-          reject(new Error('JumpServer exec stream: Mingyu target selection returned to GateShell menu after username input'))
         }
         return
       }
 
       if (connectionPhase === 'inputPassword') {
-        if (hasRetryablePasswordError(outputBuffer)) {
-          cleanup()
-          reject(new Error('JumpServer exec stream: Password rejected and fresh input is required'))
-          return
-        }
-
-        if (hasPasswordError(outputBuffer, navigationPath.profile)) {
+        if (hasPasswordError(outputBuffer)) {
           cleanup()
           reject(new Error('JumpServer exec stream: Password authentication failed'))
-          return
-        }
-
-        if (hasPasswordPrompt(outputBuffer)) {
-          if (rejectOnAuthenticationTargetMismatch()) {
-            return
-          }
-
-          if (!hasTargetPasswordValue(navigationPath)) {
-            cleanup()
-            reject(new Error('JumpServer exec stream: Target password retry prompt detected but targetPassword not recorded'))
-            return
-          }
-
-          if (targetPasswordRetryCount >= MAX_TARGET_PASSWORD_RETRY_COUNT) {
-            cleanup()
-            reject(new Error('JumpServer exec stream: Password authentication failed after password retry'))
-            return
-          }
-
-          targetPasswordRetryCount += 1
-          outputBuffer = ''
-          setTimeout(() => {
-            stream.write(navigationPath.targetPassword + '\r')
-          }, JUMPSERVER_CONSTANTS.PASSWORD_INPUT_DELAY)
           return
         }
 
         const reason = detectDirectConnectionReason(outputBuffer)
         if (reason) {
           handleNavigationSuccess(`After password verification - ${reason}`)
-          return
-        }
-
-        if (navigationPath.profile === 'mingyu' && hasJumpServerMenuReturn(outputBuffer, 'mingyu')) {
-          cleanup()
-          reject(new Error('JumpServer exec stream: Mingyu target selection returned to GateShell menu after password input'))
         }
       }
     }
@@ -506,11 +143,7 @@ export async function navigateToJumpServerAsset(
       cleanup()
       if (connectionPhase !== 'connected') {
         clearTimeout(timeout)
-        reject(
-          navigationPath.profile === 'mingyu'
-            ? new Error(`JumpServer exec stream: Mingyu navigation closed before entering target host (phase: ${connectionPhase})`)
-            : new Error('exec stream closed before navigation completed')
-        )
+        reject(new Error('exec stream closed before navigation completed'))
       }
     }
 
@@ -573,11 +206,6 @@ export async function createJumpServerExecStream(connectionId: string): Promise<
         throw new Error(`JumpServer connection missing navigation path: ${connectionId}`)
       }
 
-      if (!jumpserverUuid) {
-        console.error(`[JumpServer] JumpServer UUID not recorded`)
-        throw new Error(`JumpServer connection missing jumpserverUuid: ${connectionId}`)
-      }
-
       const execStream: any = await new Promise((resolve, reject) => {
         conn.shell({ term: 'xterm-256color' }, (err: Error | undefined, stream: any) => {
           if (err) {
@@ -634,14 +262,14 @@ export async function executeCommandOnJumpServerExec(
       outputBuffer += chunk
 
       const hasMarker = outputBuffer.includes(marker)
-      const hasExitCode = new RegExp(`${exitCodeMarker}\d+`).test(outputBuffer)
+      const hasExitCode = new RegExp(`${exitCodeMarker}\\d+`).test(outputBuffer)
 
       if (hasMarker && hasExitCode) {
         setTimeout(() => {
           cleanup()
 
           try {
-            const markerPattern = new RegExp(`[\r\n]${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\r\n]`)
+            const markerPattern = new RegExp(`[\\r\\n]${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\r\\n]`)
             const markerMatch = outputBuffer.match(markerPattern)
 
             if (!markerMatch || markerMatch.index === undefined) {
@@ -691,9 +319,11 @@ export async function executeCommandOnJumpServerExec(
 
     execStream.on('data', dataHandler)
 
+    const fullCommand = `${cmd}; echo "${marker}"; echo "${exitCodeMarker}$?"\r`
+    execStream.write(fullCommand)
+
     setTimeout(() => {
       commandSent = true
-      execStream.write(`${cmd}\necho ${exitCodeMarker}$?\necho ${marker}\n`)
-    }, JUMPSERVER_CONSTANTS.DATA_SETTLE_DELAY)
+    }, JUMPSERVER_CONSTANTS.DATA_COLLECTION_DELAY)
   })
 }

@@ -10,32 +10,18 @@ export interface ProxyConfig {
   timeout?: number
 }
 
-export type JumpServerShellProfile = 'standard' | 'mingyu'
-
-export const MINGYU_ENTER_SELECTION_COMMAND = '__ENTER__'
-export const MINGYU_ARROW_DOWN_SELECTION_COMMAND = '__ARROW_DOWN__'
-export const MINGYU_ARROW_UP_SELECTION_COMMAND = '__ARROW_UP__'
-
 export interface JumpServerNavigationPath {
   selectedUserId?: number
   needsPassword: boolean
-  targetPassword?: string
-  profile?: JumpServerShellProfile
-  mingyuSelector?: string
-  mingyuSelectionCommand?: string
-  mingyuTargetOrdinal?: number
-  mingyuCurrentOrdinal?: number
-  targetHostname?: string
-  targetAsset?: string
-  targetUsername?: string
+  password?: string
 }
 
 export interface JumpServerConnectionData {
   conn: Client
-  stream?: any
-  jumpserverUuid?: string
-  targetIp?: string
-  navigationPath?: JumpServerNavigationPath
+  stream: any
+  jumpserverUuid: string
+  targetIp: string
+  navigationPath: JumpServerNavigationPath
 }
 
 export interface JumpServerMarkedCommand {
@@ -66,10 +52,6 @@ export interface JumpServerConnectionInfo {
   privateKey?: string
   passphrase?: string
   targetIp: string
-  targetHostname?: string
-  targetAsset?: string
-  targetUsername?: string
-  targetPassword?: string
   terminalType?: string
   needProxy: boolean
   connIdentToken: string
@@ -81,10 +63,7 @@ export const JUMPSERVER_CONSTANTS = {
   DATA_COLLECTION_DELAY: 50,
   COMMAND_EXEC_TIMEOUT: 30000,
   NAVIGATION_TIMEOUT: 60000,
-  DATA_SETTLE_DELAY: 100,
-  MINGYU_VISUAL_NAVIGATION_MAX_STEPS: 12,
-  MINGYU_VISUAL_NAVIGATION_MAX_WARMUP_STEPS: 4,
-  MINGYU_VISUAL_BUFFER_LIMIT: 12000
+  DATA_SETTLE_DELAY: 100
 } as const
 
 export const MAX_JUMPSERVER_MFA_ATTEMPTS = 3

@@ -35,20 +35,6 @@ try {
 }
 import { createProxySocket } from './proxy'
 import { buildErrorResponse } from './jumpserver/errorUtils'
-import { getJumpServerExitCommand, hasJumpServerCommandPrompt } from './jumpserver/navigator'
-
-// Shell prompt detection regex - matches shell prompts ending with $ or #
-// Supports formats like: [root@host ~]#, user@host:~$, root@host#, etc.
-const SHELL_PROMPT_REGEX = /[$#]\s*$/m
-import {
-  ensureDebugTranscriptSession,
-  recordDebugTranscriptEvent,
-  type DebugTranscriptActor,
-  type DebugTranscriptDirection,
-  type DebugTranscriptRedaction,
-  type DebugTranscriptSource,
-  type DebugTranscriptTransport
-} from './debugTranscript'
 
 import {
   jumpserverConnections,
@@ -60,10 +46,6 @@ import {
   jumpserverLastCommand,
   createJumpServerExecStream
 } from './jumpserverHandle'
-
-// Track which JumpServer connections have already sent connectedToTarget
-// Key: connectionId, Value: true
-const jumpserverConnectedToTargetSent = new Set<string>()
 import path from 'path'
 import fs from 'fs'
 import { SSHAgentManager } from './ssh-agent/ChatermSSHAgent'
@@ -135,863 +117,6 @@ const markedCommands = new Map()
 const KeyboardInteractiveAttempts = new Map()
 export const connectionStatus = new Map()
 
-type TranscriptPhase = 'connecting' | 'connected' | 'closed'
-
-const recordTranscriptEvent = (options: {
-  rootSessionId: string
-  transport: DebugTranscriptTransport
-  source: DebugTranscriptSource
-  actor: DebugTranscriptActor
-  event: string
-  phase?: TranscriptPhase
-  direction?: DebugTranscriptDirection
-  text?: string
-  bytes?: number
-  redacted?: DebugTranscriptRedaction
-  noise?: boolean
-  meta?: Record<string, unknown>
-  sessionId?: string
-}) => {
-  recordDebugTranscriptEvent({
-    rootSessionId: options.rootSessionId,
-    sessionId: options.sessionId,
-    transport: options.transport,
-    source: options.source,
-    actor: options.actor,
-    event: options.event,
-    phase: options.phase,
-    direction: options.direction,
-    text: options.text,
-    bytes: options.bytes,
-    redacted: options.redacted,
-    noise: options.noise,
-    meta: options.meta
-  })
-}
-
-const resolveTranscriptTransport = (sshType?: string): DebugTranscriptTransport => {
-  return sshType === 'jumpserver' ? 'jumpserver' : 'ssh'
-}
-
-const recordSecondaryTranscriptEvent = (
-  connectionInfo: Record<string, any>,
-  options: {
-    actor: DebugTranscriptActor
-    event: string
-    phase?: TranscriptPhase
-    direction?: DebugTranscriptDirection
-    text?: string
-    bytes?: number
-    redacted?: DebugTranscriptRedaction
-    meta?: Record<string, unknown>
-    sessionId?: string
-  }
-) => {
-  recordTranscriptEvent({
-    ...options,
-    rootSessionId: connectionInfo.id,
-    transport: resolveTranscriptTransport(connectionInfo.sshType),
-    source: 'secondary',
-    noise: true
-  })
-}
-
-const attachConnectionLifecycleLogging = (connectionId: string, transport: DebugTranscriptTransport, conn: Client) => {
-  conn.on('close', () => {
-    recordTranscriptEvent({
-      rootSessionId: connectionId,
-      transport,
-      source: 'connection',
-      actor: 'system',
-      event: 'connection_close',
-      phase: 'closed'
-    })
-  })
-
-  conn.on('error', (error: Error) => {
-    recordTranscriptEvent({
-      rootSessionId: connectionId,
-      transport,
-      source: 'connection',
-      actor: 'system',
-      event: 'connection_error',
-      phase: 'closed',
-      meta: { message: error.message }
-    })
-  })
-}
-
-const attachShellTranscriptLogging = (connectionId: string, transport: DebugTranscriptTransport, stream: any, source: DebugTranscriptSource) => {
-  stream.on('data', (data: Buffer) => {
-    recordTranscriptEvent({
-      rootSessionId: connectionId,
-      transport,
-      source,
-      actor: 'remote',
-      event: 'data',
-      phase: 'connected',
-      direction: 'in',
-      text: data.toString('utf8'),
-      bytes: data.length
-    })
-  })
-
-  stream.stderr?.on('data', (data: Buffer) => {
-    recordTranscriptEvent({
-      rootSessionId: connectionId,
-      transport,
-      source,
-      actor: 'remote',
-      event: 'stderr',
-      phase: 'connected',
-      direction: 'in',
-      text: data.toString('utf8'),
-      bytes: data.length,
-      meta: { stderr: true }
-    })
-  })
-
-  stream.on('close', () => {
-    recordTranscriptEvent({
-      rootSessionId: connectionId,
-      transport,
-      source,
-      actor: 'system',
-      event: 'shell_close',
-      phase: 'closed'
-    })
-  })
-
-  stream.on('error', (error: Error) => {
-    recordTranscriptEvent({
-      rootSessionId: connectionId,
-      transport,
-      source,
-      actor: 'system',
-      event: 'shell_error',
-      phase: 'closed',
-      meta: { message: error.message }
-    })
-  })
-}
-
-const getOutboundTranscriptPayload = (data: string, isBinary: boolean, lineCommand?: string) => {
-  if (isBinary) {
-    return {
-      text: undefined,
-      bytes: Buffer.byteLength(data, 'binary'),
-      meta: { isBinary: true }
-    }
-  }
-
-  return {
-    text: data,
-    bytes: Buffer.byteLength(data, 'utf8'),
-    meta: lineCommand ? { lineCommand } : undefined
-  }
-}
-
-const getMfaPromptText = (prompts: Array<{ prompt: string }>) => prompts.map((item) => item.prompt).join('\n')
-
-const getMfaResponseCount = (responses: unknown): number => {
-  return Array.isArray(responses) ? responses.length : 0
-}
-
-const getTranscriptAuthMethod = (connectionInfo: Record<string, any>): 'password' | 'privateKey' | 'unknown' => {
-  if (connectionInfo.privateKey) {
-    return 'privateKey'
-  }
-  if (connectionInfo.password) {
-    return 'password'
-  }
-  return 'unknown'
-}
-
-const recordConnectionReady = (connectionId: string, transport: DebugTranscriptTransport, meta?: Record<string, unknown>) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'connection',
-    actor: 'system',
-    event: 'connect_ready',
-    phase: 'connected',
-    meta
-  })
-}
-
-const recordMfaEvent = (options: {
-  rootSessionId: string
-  transport: DebugTranscriptTransport
-  event: string
-  text?: string
-  redacted?: DebugTranscriptRedaction
-  meta?: Record<string, unknown>
-}) => {
-  recordTranscriptEvent({
-    rootSessionId: options.rootSessionId,
-    transport: options.transport,
-    source: 'mfa',
-    actor: options.event === 'mfa_prompt' ? 'remote' : 'user',
-    event: options.event,
-    phase: 'connecting',
-    direction: options.event === 'mfa_prompt' ? 'in' : 'out',
-    text: options.text,
-    redacted: options.redacted,
-    meta: options.meta
-  })
-}
-
-const recordShellWrite = (
-  connectionId: string,
-  transport: DebugTranscriptTransport,
-  source: DebugTranscriptSource,
-  data: string,
-  isBinary: boolean,
-  lineCommand?: string
-) => {
-  const payload = getOutboundTranscriptPayload(data, isBinary, lineCommand)
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source,
-    actor: 'user',
-    event: 'write',
-    phase: 'connected',
-    direction: 'out',
-    text: payload.text,
-    bytes: payload.bytes,
-    meta: payload.meta
-  })
-}
-
-const isPasswordLikePrompt = (text?: string) => {
-  return typeof text === 'string' && /(password|passphrase|验证码|动态码|verification|otp|token)/i.test(text)
-}
-
-const getMfaTranscriptRedaction = (text?: string): DebugTranscriptRedaction => {
-  return isPasswordLikePrompt(text) ? 'mfa' : 'none'
-}
-
-const recordMfaPrompt = (
-  connectionId: string,
-  transport: DebugTranscriptTransport,
-  prompts: Array<{ prompt: string }>,
-  meta?: Record<string, unknown>
-) => {
-  const promptText = getMfaPromptText(prompts)
-  recordMfaEvent({
-    rootSessionId: connectionId,
-    transport,
-    event: 'mfa_prompt',
-    text: promptText,
-    redacted: getMfaTranscriptRedaction(promptText),
-    meta
-  })
-}
-
-const recordMfaResponse = (connectionId: string, transport: DebugTranscriptTransport, responses: unknown, meta?: Record<string, unknown>) => {
-  recordMfaEvent({
-    rootSessionId: connectionId,
-    transport,
-    event: 'mfa_response',
-    text: getMfaResponseCount(responses) > 0 ? '<redacted:mfa>' : '',
-    redacted: 'mfa',
-    meta: {
-      responseCount: getMfaResponseCount(responses),
-      ...meta
-    }
-  })
-}
-
-const recordMfaCancel = (connectionId: string, transport: DebugTranscriptTransport, meta?: Record<string, unknown>) => {
-  recordMfaEvent({
-    rootSessionId: connectionId,
-    transport,
-    event: 'mfa_cancel',
-    meta
-  })
-}
-
-const recordMfaTimeout = (connectionId: string, transport: DebugTranscriptTransport, meta?: Record<string, unknown>) => {
-  recordMfaEvent({
-    rootSessionId: connectionId,
-    transport,
-    event: 'mfa_timeout',
-    meta
-  })
-}
-
-const recordMfaResult = (connectionId: string, transport: DebugTranscriptTransport, status: 'success' | 'failed', meta?: Record<string, unknown>) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'mfa',
-    actor: 'system',
-    event: 'mfa_result',
-    phase: status === 'success' ? 'connected' : 'connecting',
-    meta: {
-      status,
-      ...meta
-    }
-  })
-}
-
-const recordDisconnectRequest = (connectionId: string, transport: DebugTranscriptTransport) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'connection',
-    actor: 'user',
-    event: 'disconnect_request',
-    phase: 'closed',
-    direction: 'out'
-  })
-}
-
-const recordSecondarySummary = (connectionInfo: Record<string, any>, event: string, meta?: Record<string, unknown>) => {
-  recordSecondaryTranscriptEvent(connectionInfo, {
-    actor: 'system',
-    event,
-    phase: 'connected',
-    meta
-  })
-}
-
-const recordSecondaryWrite = (
-  connectionInfo: Record<string, any>,
-  event: string,
-  text: string,
-  redacted?: DebugTranscriptRedaction,
-  meta?: Record<string, unknown>
-) => {
-  recordSecondaryTranscriptEvent(connectionInfo, {
-    actor: 'user',
-    event,
-    phase: 'connecting',
-    direction: 'out',
-    text,
-    redacted,
-    meta
-  })
-}
-
-const recordSecondaryError = (connectionInfo: Record<string, any>, event: string, message: string, meta?: Record<string, unknown>) => {
-  recordSecondaryTranscriptEvent(connectionInfo, {
-    actor: 'system',
-    event,
-    phase: 'closed',
-    meta: {
-      message,
-      ...meta
-    }
-  })
-}
-
-const recordSecondaryConnectionStart = (connectionInfo: Record<string, any>, ident: string) => {
-  recordSecondarySummary(connectionInfo, 'secondary_connect_start', {
-    host: connectionInfo.host,
-    port: connectionInfo.port || 22,
-    username: connectionInfo.username,
-    ident
-  })
-}
-
-const recordSecondaryConnectionReady = (connectionInfo: Record<string, any>) => {
-  recordSecondarySummary(connectionInfo, 'secondary_connect_ready')
-}
-
-const recordSecondaryConnectionClose = (connectionInfo: Record<string, any>) => {
-  recordSecondarySummary(connectionInfo, 'secondary_connect_close')
-}
-
-const recordSecondaryConnectionError = (connectionInfo: Record<string, any>, error: Error) => {
-  recordSecondaryError(connectionInfo, 'secondary_connect_error', error.message)
-}
-
-const recordSecondaryExecResult = (connectionInfo: Record<string, any>, event: string, meta?: Record<string, unknown>) => {
-  recordSecondarySummary(connectionInfo, event, meta)
-}
-
-const recordSecondaryKeyboardReuse = (connectionInfo: Record<string, any>) => {
-  recordSecondarySummary(connectionInfo, 'secondary_mfa_reuse')
-}
-
-const recordSecondaryMfaPrompt = (connectionInfo: Record<string, any>) => {
-  recordSecondaryWrite(connectionInfo, 'secondary_mfa_prompt_reuse', '<redacted:mfa>', 'mfa')
-}
-
-const recordSecondaryMfaResponse = (connectionInfo: Record<string, any>, count: number) => {
-  recordSecondaryWrite(connectionInfo, 'secondary_mfa_response_reuse', '<redacted:mfa>', 'mfa', { responseCount: count })
-}
-
-const recordSecondarySftpAvailability = (connectionInfo: Record<string, any>, available: boolean, error?: string) => {
-  recordSecondarySummary(connectionInfo, 'secondary_sftp_result', {
-    sftpAvailable: available,
-    error: error || ''
-  })
-}
-
-const recordSecondaryCommandList = (connectionInfo: Record<string, any>, count: number) => {
-  recordSecondaryExecResult(connectionInfo, 'secondary_command_list_result', { count })
-}
-
-const recordSecondarySudo = (connectionInfo: Record<string, any>, hasSudo: boolean) => {
-  recordSecondaryExecResult(connectionInfo, 'secondary_sudo_result', { hasSudo })
-}
-
-const recordSecondarySkip = (connectionInfo: Record<string, any>, reason: string) => {
-  recordSecondarySummary(connectionInfo, 'secondary_skip', { reason })
-}
-
-const recordSecondaryReadyData = (connectionInfo: Record<string, any>, meta?: Record<string, unknown>) => {
-  recordSecondarySummary(connectionInfo, 'secondary_ready_data_sent', meta)
-}
-
-const recordSshReusePool = (connectionId: string, poolKey: string) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport: 'ssh',
-    source: 'connection',
-    actor: 'system',
-    event: 'connection_pool_store',
-    phase: 'connected',
-    meta: { poolKey }
-  })
-}
-
-const recordSshReusePoolCleanup = (connectionId: string, poolKey: string, reason: 'close' | 'error', message?: string) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport: 'ssh',
-    source: 'connection',
-    actor: 'system',
-    event: 'connection_pool_cleanup',
-    phase: 'closed',
-    meta: {
-      poolKey,
-      reason,
-      message: message || ''
-    }
-  })
-}
-
-const recordShellBridgeClose = (connectionId: string, transport: DebugTranscriptTransport) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'main-shell',
-    actor: 'system',
-    event: 'shell_bridge_close',
-    phase: 'closed'
-  })
-}
-
-const recordShellBridgeStderr = (connectionId: string, transport: DebugTranscriptTransport, text: string) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'main-shell',
-    actor: 'remote',
-    event: 'stderr',
-    phase: 'connected',
-    direction: 'in',
-    text,
-    bytes: Buffer.byteLength(text, 'utf8'),
-    meta: { stderr: true }
-  })
-}
-
-const recordShellBridgeData = (connectionId: string, transport: DebugTranscriptTransport, data: Buffer) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'main-shell',
-    actor: 'remote',
-    event: 'data',
-    phase: 'connected',
-    direction: 'in',
-    text: data.toString('utf8'),
-    bytes: data.length
-  })
-}
-
-const recordShellStreamError = (connectionId: string, transport: DebugTranscriptTransport, error: Error) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'main-shell',
-    actor: 'system',
-    event: 'shell_error',
-    phase: 'closed',
-    meta: { message: error.message }
-  })
-}
-
-const recordShellReadyByTransport = (connectionId: string, transport: DebugTranscriptTransport, method?: 'shell' | 'exec') => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'main-shell',
-    actor: 'system',
-    event: 'shell_ready',
-    phase: 'connected',
-    meta: method ? { method } : undefined
-  })
-}
-
-const recordShellFallbackByTransport = (connectionId: string, transport: DebugTranscriptTransport, command: string, message: string) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'main-shell',
-    actor: 'system',
-    event: 'shell_fallback',
-    phase: 'connecting',
-    meta: {
-      command,
-      message
-    }
-  })
-}
-
-const recordShellErrorByTransport = (connectionId: string, transport: DebugTranscriptTransport, error: Error) => {
-  recordShellStreamError(connectionId, transport, error)
-}
-
-const recordShellWriteByTransport = (
-  connectionId: string,
-  transport: DebugTranscriptTransport,
-  data: string,
-  isBinary: boolean,
-  lineCommand?: string
-) => {
-  recordShellWrite(connectionId, transport, 'main-shell', data, isBinary, lineCommand)
-}
-
-const recordConnectReadyByTransport = (connectionId: string, transport: DebugTranscriptTransport, meta?: Record<string, unknown>) => {
-  recordConnectionReady(connectionId, transport, meta)
-}
-
-const recordConnectErrorByTransport = (connectionId: string, transport: DebugTranscriptTransport, error: Error) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'connection',
-    actor: 'system',
-    event: 'connect_error',
-    phase: 'closed',
-    meta: { message: error.message }
-  })
-}
-
-const recordConnectionReuseByTransport = (connectionId: string, transport: DebugTranscriptTransport, meta?: Record<string, unknown>) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'connection',
-    actor: 'system',
-    event: 'connection_reused',
-    phase: 'connected',
-    meta
-  })
-}
-
-const recordDisconnectRequestByTransport = (connectionId: string, transport: DebugTranscriptTransport) => {
-  recordDisconnectRequest(connectionId, transport)
-}
-
-const recordMfaPromptByTransport = (
-  connectionId: string,
-  transport: DebugTranscriptTransport,
-  prompts: Array<{ prompt: string }>,
-  meta?: Record<string, unknown>
-) => {
-  recordMfaPrompt(connectionId, transport, prompts, meta)
-}
-
-const recordMfaResponseByTransport = (
-  connectionId: string,
-  transport: DebugTranscriptTransport,
-  responses: unknown,
-  meta?: Record<string, unknown>
-) => {
-  recordMfaResponse(connectionId, transport, responses, meta)
-}
-
-const recordMfaResultByTransport = (
-  connectionId: string,
-  transport: DebugTranscriptTransport,
-  status: 'success' | 'failed',
-  meta?: Record<string, unknown>
-) => {
-  recordMfaResult(connectionId, transport, status, meta)
-}
-
-const recordMfaTimeoutByTransport = (connectionId: string, transport: DebugTranscriptTransport, meta?: Record<string, unknown>) => {
-  recordMfaTimeout(connectionId, transport, meta)
-}
-
-const recordMfaCancelByTransport = (connectionId: string, transport: DebugTranscriptTransport, meta?: Record<string, unknown>) => {
-  recordMfaCancel(connectionId, transport, meta)
-}
-
-const recordConnectRetryByTransport = (connectionId: string, transport: DebugTranscriptTransport, attempt: number) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'connection',
-    actor: 'system',
-    event: 'connect_retry',
-    phase: 'connecting',
-    meta: { attempt }
-  })
-}
-
-const recordTranscriptReadyByTransport = (connectionInfo: Record<string, any>, transport: DebugTranscriptTransport) => {
-  const filePath = ensureDebugTranscriptSession({
-    rootSessionId: connectionInfo.id,
-    transport,
-    source: 'connection',
-    meta: {
-      host: connectionInfo.host,
-      port: connectionInfo.port || 22,
-      username: connectionInfo.username,
-      assetType: connectionInfo.asset_type || '',
-      authMethod: getTranscriptAuthMethod(connectionInfo),
-      needProxy: !!connectionInfo.needProxy,
-      sshType: connectionInfo.sshType || 'ssh'
-    }
-  })
-  recordTranscriptEvent({
-    rootSessionId: connectionInfo.id,
-    transport,
-    source: 'connection',
-    actor: 'system',
-    event: 'transcript_ready',
-    phase: 'connecting',
-    meta: { filePath }
-  })
-}
-
-const recordTranscriptStartByTransport = (connectionInfo: Record<string, any>, transport: DebugTranscriptTransport) => {
-  recordTranscriptReadyByTransport(connectionInfo, transport)
-  recordTranscriptEvent({
-    rootSessionId: connectionInfo.id,
-    transport,
-    source: 'connection',
-    actor: 'system',
-    event: 'connect_start',
-    phase: 'connecting',
-    meta: {
-      host: connectionInfo.host,
-      port: connectionInfo.port || 22,
-      username: connectionInfo.username,
-      authMethod: getTranscriptAuthMethod(connectionInfo),
-      needProxy: !!connectionInfo.needProxy
-    }
-  })
-}
-
-const recordTranscriptStart = (connectionInfo: Record<string, any>) => {
-  const transport = resolveTranscriptTransport(connectionInfo.sshType)
-  recordTranscriptStartByTransport(connectionInfo, transport)
-}
-
-const recordConnectionReadyForInfo = (connectionInfo: Record<string, any>) => {
-  recordConnectReadyByTransport(connectionInfo.id, resolveTranscriptTransport(connectionInfo.sshType))
-}
-
-const recordConnectionReuseForInfo = (connectionInfo: Record<string, any>, meta?: Record<string, unknown>) => {
-  recordConnectionReuseByTransport(connectionInfo.id, resolveTranscriptTransport(connectionInfo.sshType), meta)
-}
-
-const recordConnectionErrorForInfo = (connectionInfo: Record<string, any>, error: Error) => {
-  recordConnectErrorByTransport(connectionInfo.id, resolveTranscriptTransport(connectionInfo.sshType), error)
-}
-
-const recordConnectionRetryForInfo = (connectionInfo: Record<string, any>, attempt: number) => {
-  recordConnectRetryByTransport(connectionInfo.id, resolveTranscriptTransport(connectionInfo.sshType), attempt)
-}
-
-const recordShellBridgeReadyForTransport = (connectionId: string, transport: DebugTranscriptTransport) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'main-shell',
-    actor: 'system',
-    event: 'shell_bridge_ready',
-    phase: 'connected'
-  })
-}
-
-const recordShellBridgeCloseForTransport = (connectionId: string, transport: DebugTranscriptTransport) => {
-  recordShellBridgeClose(connectionId, transport)
-}
-
-const recordShellBridgeStderrForTransport = (connectionId: string, transport: DebugTranscriptTransport, text: string) => {
-  recordShellBridgeStderr(connectionId, transport, text)
-}
-
-const recordShellBridgeDataForTransport = (connectionId: string, transport: DebugTranscriptTransport, data: Buffer) => {
-  recordShellBridgeData(connectionId, transport, data)
-}
-
-const recordConnectionLifecycleForTransport = (connectionId: string, transport: DebugTranscriptTransport, conn: Client) => {
-  attachConnectionLifecycleLogging(connectionId, transport, conn)
-}
-
-const recordShellTranscriptForTransport = (connectionId: string, transport: DebugTranscriptTransport, stream: any, source: DebugTranscriptSource) => {
-  attachShellTranscriptLogging(connectionId, transport, stream, source)
-}
-
-const recordShellBridgeOpen = (connectionId: string, transport: DebugTranscriptTransport) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'main-shell',
-    actor: 'system',
-    event: 'shell_bridge_open',
-    phase: 'connected'
-  })
-}
-
-const recordConnectionTranscriptOpen = (connectionId: string, transport: DebugTranscriptTransport) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'connection',
-    actor: 'system',
-    event: 'connection_open',
-    phase: 'connecting'
-  })
-}
-
-const recordShellSessionAttach = (connectionId: string, transport: DebugTranscriptTransport) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'main-shell',
-    actor: 'system',
-    event: 'shell_session_attach',
-    phase: 'connected'
-  })
-}
-
-const recordShellSessionDetach = (connectionId: string, transport: DebugTranscriptTransport) => {
-  recordTranscriptEvent({
-    rootSessionId: connectionId,
-    transport,
-    source: 'main-shell',
-    actor: 'system',
-    event: 'shell_session_detach',
-    phase: 'closed'
-  })
-}
-
-const recordShellSessionWrite = (
-  connectionId: string,
-  transport: DebugTranscriptTransport,
-  data: string,
-  isBinary: boolean,
-  lineCommand?: string
-) => {
-  recordShellWriteByTransport(connectionId, transport, data, isBinary, lineCommand)
-}
-
-const recordConnectPoolStore = (connectionId: string, poolKey: string) => {
-  recordSshReusePool(connectionId, poolKey)
-}
-
-const recordConnectPoolCleanup = (connectionId: string, poolKey: string, reason: 'close' | 'error', message?: string) => {
-  recordSshReusePoolCleanup(connectionId, poolKey, reason, message)
-}
-
-const recordSecondSummary = (connectionInfo: Record<string, any>, event: string, meta?: Record<string, unknown>) => {
-  recordSecondarySummary(connectionInfo, event, meta)
-}
-
-const recordSecondError = (connectionInfo: Record<string, any>, event: string, message: string, meta?: Record<string, unknown>) => {
-  recordSecondaryError(connectionInfo, event, message, meta)
-}
-
-const recordSecondSftp = (connectionInfo: Record<string, any>, available: boolean, error?: string) => {
-  recordSecondarySftpAvailability(connectionInfo, available, error)
-}
-
-const recordSecondStart = (connectionInfo: Record<string, any>, ident: string) => {
-  recordSecondaryConnectionStart(connectionInfo, ident)
-}
-
-const recordSecondReady = (connectionInfo: Record<string, any>) => {
-  recordSecondaryConnectionReady(connectionInfo)
-}
-
-const recordSecondClose = (connectionInfo: Record<string, any>) => {
-  recordSecondaryConnectionClose(connectionInfo)
-}
-
-const recordSecondConnError = (connectionInfo: Record<string, any>, error: Error) => {
-  recordSecondaryConnectionError(connectionInfo, error)
-}
-
-const recordSecondSkip = (connectionInfo: Record<string, any>, reason: string) => {
-  recordSecondarySkip(connectionInfo, reason)
-}
-
-const recordSecondReadyData = (connectionInfo: Record<string, any>, meta?: Record<string, unknown>) => {
-  recordSecondaryReadyData(connectionInfo, meta)
-}
-
-const recordSecondReuse = (connectionInfo: Record<string, any>) => {
-  recordSecondaryKeyboardReuse(connectionInfo)
-}
-
-const recordSecondPrompt = (connectionInfo: Record<string, any>) => {
-  recordSecondaryMfaPrompt(connectionInfo)
-}
-
-const recordSecondResponse = (connectionInfo: Record<string, any>, count: number) => {
-  recordSecondaryMfaResponse(connectionInfo, count)
-}
-
-const recordSecondCommandList = (connectionInfo: Record<string, any>, count: number) => {
-  recordSecondaryCommandList(connectionInfo, count)
-}
-
-const recordSecondSudo = (connectionInfo: Record<string, any>, hasSudo: boolean) => {
-  recordSecondarySudo(connectionInfo, hasSudo)
-}
-
-const promptMfaTranscript = (
-  connectionId: string,
-  transport: DebugTranscriptTransport,
-  prompts: Array<{ prompt: string }>,
-  meta?: Record<string, unknown>
-) => {
-  recordMfaPromptByTransport(connectionId, transport, prompts, meta)
-}
-
-const responseMfaTranscript = (connectionId: string, transport: DebugTranscriptTransport, responses: unknown, meta?: Record<string, unknown>) => {
-  recordMfaResponseByTransport(connectionId, transport, responses, meta)
-}
-
-const resultMfaTranscript = (
-  connectionId: string,
-  transport: DebugTranscriptTransport,
-  status: 'success' | 'failed',
-  meta?: Record<string, unknown>
-) => {
-  recordMfaResultByTransport(connectionId, transport, status, meta)
-}
-
-const cancelMfaTranscript = (connectionId: string, transport: DebugTranscriptTransport, meta?: Record<string, unknown>) => {
-  recordMfaCancelByTransport(connectionId, transport, meta)
-}
-
-const timeoutMfaTranscript = (connectionId: string, transport: DebugTranscriptTransport, meta?: Record<string, unknown>) => {
-  recordMfaTimeoutByTransport(connectionId, transport, meta)
-}
-
 // Set KeyboardInteractive authentication timeout (milliseconds)
 const KeyboardInteractiveTimeout = 300000 // 5 minutes timeout
 const MaxKeyboardInteractiveAttempts = 5 // Max KeyboardInteractive attempts
@@ -1037,18 +162,12 @@ export const releaseReusableSshSession = (poolKey: string, sessionId: string) =>
 
 export const handleRequestKeyboardInteractive = (event, id, prompts, finish) => {
   return new Promise((_resolve, reject) => {
-    const transport: DebugTranscriptTransport = 'ssh'
-
     // Get current retry count
     const attemptCount = KeyboardInteractiveAttempts.get(id) || 0
 
     // Check if maximum retry attempts exceeded
     if (attemptCount >= MaxKeyboardInteractiveAttempts) {
       KeyboardInteractiveAttempts.delete(id)
-      resultMfaTranscript(id, transport, 'failed', {
-        attempt: attemptCount,
-        reason: 'max_attempts_reached'
-      })
       // Send final failure event
       event.sender.send('ssh:keyboard-interactive-result', {
         id,
@@ -1062,9 +181,6 @@ export const handleRequestKeyboardInteractive = (event, id, prompts, finish) => 
 
     // Set retry count
     KeyboardInteractiveAttempts.set(id, attemptCount + 1)
-    promptMfaTranscript(id, transport, prompts, {
-      attempt: attemptCount + 1
-    })
 
     // Send MFA request to frontend
     event.sender.send('ssh:keyboard-interactive-request', {
@@ -1081,13 +197,6 @@ export const handleRequestKeyboardInteractive = (event, id, prompts, finish) => 
       // Cancel authentication
       finish([])
       KeyboardInteractiveAttempts.delete(id)
-      timeoutMfaTranscript(id, transport, {
-        attempt: attemptCount + 1
-      })
-      resultMfaTranscript(id, transport, 'failed', {
-        attempt: attemptCount + 1,
-        reason: 'timeout'
-      })
       event.sender.send('ssh:keyboard-interactive-timeout', { id })
       reject(new Error('Authentication timed out, please try connecting again'))
     }, KeyboardInteractiveTimeout)
@@ -1095,9 +204,6 @@ export const handleRequestKeyboardInteractive = (event, id, prompts, finish) => 
     // Listen for user response
     ipcMain.once(`ssh:keyboard-interactive-response:${id}`, (_evt, responses) => {
       clearTimeout(timeoutId) // Clear timeout timer
-      responseMfaTranscript(id, transport, responses, {
-        attempt: attemptCount + 1
-      })
       finish(responses)
 
       // Listen for connection status changes to determine verification result
@@ -1106,9 +212,6 @@ export const handleRequestKeyboardInteractive = (event, id, prompts, finish) => 
           // Verification successful
           keyboardInteractiveOpts.set(id, responses)
           KeyboardInteractiveAttempts.delete(id)
-          resultMfaTranscript(id, transport, 'success', {
-            attempt: attemptCount + 1
-          })
           event.sender.send('ssh:keyboard-interactive-result', {
             id,
             status: 'success'
@@ -1116,10 +219,6 @@ export const handleRequestKeyboardInteractive = (event, id, prompts, finish) => 
         } else {
           // Verification failed
           const currentAttempts = KeyboardInteractiveAttempts.get(id) || 0
-          resultMfaTranscript(id, transport, 'failed', {
-            attempt: currentAttempts,
-            reason: 'verification_failed'
-          })
           event.sender.send('ssh:keyboard-interactive-result', {
             id,
             attempts: currentAttempts,
@@ -1138,13 +237,6 @@ export const handleRequestKeyboardInteractive = (event, id, prompts, finish) => 
       KeyboardInteractiveAttempts.delete(id)
       clearTimeout(timeoutId)
       finish([])
-      cancelMfaTranscript(id, transport, {
-        attempt: attemptCount + 1
-      })
-      resultMfaTranscript(id, transport, 'failed', {
-        attempt: attemptCount + 1,
-        reason: 'cancelled'
-      })
       reject(new Error('Authentication cancelled'))
     })
   })
@@ -1153,27 +245,18 @@ export const handleRequestKeyboardInteractive = (event, id, prompts, finish) => 
 export const attemptSecondaryConnection = async (event, connectionInfo, ident) => {
   const { id, host, port, username, password, privateKey, passphrase, needProxy, proxyConfig, asset_type } = connectionInfo
 
-  recordSecondStart(connectionInfo, ident)
-
   // Check if this is a network switch connection
   const isSwitch = asset_type?.startsWith('person-switch-')
   const switchBrand = isSwitch ? (asset_type === 'person-switch-cisco' ? 'cisco' : 'huawei') : null
 
   // For switches, skip secondary connection logic and return minimal ready data
   if (isSwitch && switchBrand) {
-    recordSecondSkip(connectionInfo, 'switch-short-circuit')
     const readyResult = {
       isSwitch: true,
       switchBrand,
       hasSudo: false,
       commandList: []
     }
-    recordSecondReadyData(connectionInfo, {
-      isSwitch: true,
-      switchBrand,
-      hasSudo: false,
-      commandCount: 0
-    })
     event.sender.send(`ssh:connect:data:${id}`, readyResult)
     if (keyboardInteractiveOpts.has(id)) {
       keyboardInteractiveOpts.delete(id)
@@ -1217,12 +300,6 @@ export const attemptSecondaryConnection = async (event, connectionInfo, ident) =
   const sendReadyData = (stopCount) => {
     execCount++
     if (execCount === totalCounts || stopCount) {
-      recordSecondReadyData(connectionInfo, {
-        stopCount: !!stopCount,
-        hasSudo: readyResult.hasSudo ?? false,
-        commandCount: readyResult.commandList?.length ?? 0,
-        sftpAvailable: connectionStatus.get(id)?.sftpAvailable === true
-      })
       event.sender.send(`ssh:connect:data:${id}`, readyResult)
       if (hasOpt) {
         keyboardInteractiveOpts.delete(id)
@@ -1234,16 +311,12 @@ export const attemptSecondaryConnection = async (event, connectionInfo, ident) =
     connectConfig.tryKeyboard = true
     conn.on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
       const cached = keyboardInteractiveOpts.get(id)
-      recordSecondReuse(connectionInfo)
-      recordSecondPrompt(connectionInfo)
-      recordSecondResponse(connectionInfo, Array.isArray(cached) ? cached.length : 0)
       finish(cached || [])
     })
   }
 
   const sftpAsync = (conn) => {
     return new Promise<void>((resolve) => {
-      recordSecondSummary(connectionInfo, 'secondary_sftp_check_start')
       conn.sftp((err, sftp) => {
         if (err || !sftp) {
           console.log(`SFTPCheckError [${id}]`, err)
@@ -1252,7 +325,6 @@ export const attemptSecondaryConnection = async (event, connectionInfo, ident) =
             sftpError: err?.message || 'SFTP object is empty'
           })
           sftpConnections.set(id, { isSuccess: false, error: `sftp init error: "${err?.message || 'SFTP object is empty'}"` })
-          recordSecondSftp(connectionInfo, false, err?.message || 'SFTP object is empty')
           resolve()
         } else {
           console.log(`startSftp [${id}]`)
@@ -1263,13 +335,11 @@ export const attemptSecondaryConnection = async (event, connectionInfo, ident) =
                 sftpAvailable: false,
                 sftpError: readDirErr.message
               })
-              recordSecondSftp(connectionInfo, false, readDirErr.message)
               sftp.end()
             } else {
               console.log(`SFTPCheckSuccess [${id}]`)
               sftpConnections.set(id, { isSuccess: true, sftp: sftp })
               connectionStatus.set(id, { sftpAvailable: true })
-              recordSecondSftp(connectionInfo, true)
             }
             resolve()
           })
@@ -1280,7 +350,6 @@ export const attemptSecondaryConnection = async (event, connectionInfo, ident) =
 
   conn
     .on('ready', async () => {
-      recordSecondReady(connectionInfo)
       // Perform sftp check
       try {
         await sftpAsync(conn)
@@ -1289,20 +358,17 @@ export const attemptSecondaryConnection = async (event, connectionInfo, ident) =
           sftpAvailable: false,
           sftpError: 'SFTP connection failed'
         })
-        recordSecondSftp(connectionInfo, false, 'SFTP connection failed')
       }
 
       // Perform cmd check
       try {
         let stdout = ''
         let stderr = ''
-        recordSecondSummary(connectionInfo, 'secondary_command_list_start')
         conn.exec(
           'sh -c \'if command -v bash >/dev/null 2>&1; then bash -lc "compgen -A builtin; compgen -A command"; bash -ic "compgen -A alias" 2>/dev/null; else IFS=:; for d in $PATH; do [ -d "$d" ] || continue; for f in "$d"/*; do [ -x "$f" ] && printf "%s\\n" "${f##*/}"; done; done; fi\' | sort -u',
           (err, stream) => {
             if (err) {
               readyResult.commandList = []
-              recordSecondError(connectionInfo, 'secondary_command_list_error', err.message)
               sendReadyData(false)
             } else {
               stream
@@ -1315,11 +381,9 @@ export const attemptSecondaryConnection = async (event, connectionInfo, ident) =
                 .on('close', () => {
                   if (stderr) {
                     readyResult.commandList = []
-                    recordSecondError(connectionInfo, 'secondary_command_list_stderr', stderr.slice(-400))
                   } else {
                     readyResult.commandList = stdout.split('\n').filter(Boolean)
                   }
-                  recordSecondCommandList(connectionInfo, readyResult.commandList.length)
                   sendReadyData(false)
                 })
             }
@@ -1327,17 +391,14 @@ export const attemptSecondaryConnection = async (event, connectionInfo, ident) =
         )
       } catch (e) {
         readyResult.commandList = []
-        recordSecondError(connectionInfo, 'secondary_command_list_error', e instanceof Error ? e.message : String(e))
         sendReadyData(false)
       }
 
       // Perform sudo check
       try {
-        recordSecondSummary(connectionInfo, 'secondary_sudo_check_start')
         conn.exec('sudo -n true 2>/dev/null && echo true || echo false', (err, stream) => {
           if (err) {
             readyResult.hasSudo = false
-            recordSecondError(connectionInfo, 'secondary_sudo_check_error', err.message)
             sendReadyData(false)
           } else {
             stream
@@ -1349,22 +410,16 @@ export const attemptSecondaryConnection = async (event, connectionInfo, ident) =
                 readyResult.hasSudo = false
               })
               .on('close', () => {
-                recordSecondSudo(connectionInfo, !!readyResult.hasSudo)
                 sendReadyData(false)
               })
           }
         })
       } catch (e) {
         readyResult.hasSudo = false
-        recordSecondError(connectionInfo, 'secondary_sudo_check_error', e instanceof Error ? e.message : String(e))
         sendReadyData(false)
       }
     })
-    .on('close', () => {
-      recordSecondClose(connectionInfo)
-    })
     .on('error', (err) => {
-      recordSecondConnError(connectionInfo, err)
       sftpConnections.set(id, { isSuccess: false, error: `sftp connection error: "${err.message}"` })
       readyResult.hasSudo = false
       readyResult.commandList = []
@@ -1482,8 +537,6 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
   } = connectionInfo
   retryCount++
 
-  const transport = resolveTranscriptTransport(connectionInfo.sshType)
-
   connectionStatus.set(id, { isVerified: false }) // Update connection status
   const identToken = connIdentToken ? `_t=${connIdentToken}` : ''
   const ident = `${packageInfo.name}_${packageInfo.version}` + identToken
@@ -1502,8 +555,6 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
     sshConnections.set(id, conn)
     connectionStatus.set(id, { isVerified: true })
     reusableConn.sessions.add(id)
-    recordConnectionReuseForInfo(connectionInfo, { poolKey, reused: true })
-    recordConnectReadyByTransport(id, transport, { reused: true, poolKey })
 
     // Trigger connection success event
     connectionEvents.emit(`connection-status-changed:${id}`, { isVerified: true })
@@ -1517,14 +568,11 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
   }
 
   const conn = new Client()
-  recordConnectionTranscriptOpen(id, transport)
-  recordConnectionLifecycleForTransport(id, transport, conn)
 
   conn.on('ready', () => {
     sshConnections.set(id, conn) // Save connection object
     connectionStatus.set(id, { isVerified: true })
     connectionEvents.emit(`connection-status-changed:${id}`, { isVerified: true })
-    recordConnectionReadyForInfo(connectionInfo)
 
     // Check if keyboard-interactive authentication was used
     // Must check before attemptSecondaryConnection as it will clear keyboardInteractiveOpts
@@ -1543,18 +591,15 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
         username: username,
         hasMfaAuth: true
       })
-      recordConnectPoolStore(id, poolKey)
 
       // Listen for connection close event to clean up connection pool
       conn.on('close', () => {
         console.log(`[SSH Connection Pool] Connection closed, cleaning up reuse pool: ${poolKey}`)
-        recordConnectPoolCleanup(id, poolKey, 'close')
         sshConnectionPool.delete(poolKey)
       })
 
       conn.on('error', (err) => {
         console.error(`[SSH Connection Pool] Connection error, cleaning up reuse pool: ${poolKey}`, err.message)
-        recordConnectPoolCleanup(id, poolKey, 'error', err.message)
         sshConnectionPool.delete(poolKey)
       })
     }
@@ -1573,16 +618,12 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
       console.log('Authentication failed. Retrying...')
 
       if (retryCount < MaxKeyboardInteractiveAttempts) {
-        recordConnectionRetryForInfo(connectionInfo, retryCount)
         handleAttemptConnection(event, connectionInfo, resolve, reject, retryCount)
       } else {
-        const maxRetryError = new Error('Maximum retries reached, authentication failed')
-        recordConnectionErrorForInfo(connectionInfo, maxRetryError)
-        reject(maxRetryError)
+        reject(new Error('Maximum retries reached, authentication failed'))
       }
     } else {
       console.log('Connection error:', err)
-      recordConnectionErrorForInfo(connectionInfo, err)
       reject(new Error(err.message))
     }
   })
@@ -1636,9 +677,7 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
       // Authenticate with password
       connectConfig.password = password
     } else {
-      const authError = new Error('No valid authentication method provided')
-      recordConnectionErrorForInfo(connectionInfo, authError)
-      reject(authError)
+      reject(new Error('No valid authentication method provided'))
       return
     }
 
@@ -1652,16 +691,12 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
       }
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err)
-      const tunnelError = new Error(`Failed to establish a transport layer tunnel: ${errorMessage}`)
-      recordConnectionErrorForInfo(connectionInfo, tunnelError)
-      return reject(tunnelError)
+      return reject(new Error(`Failed to establish a transport layer tunnel: ${errorMessage}`))
     }
     conn.connect(connectConfig) // Attempt to connect
   } catch (err) {
     console.error('Connection configuration error:', err)
-    const configError = new Error(`Connection configuration error: ${err}`)
-    recordConnectionErrorForInfo(connectionInfo, configError)
-    reject(configError)
+    reject(new Error(`Connection configuration error: ${err}`))
   }
 }
 export const getUniqueRemoteName = async (sftp: SFTPWrapper, remoteDir: string, originalName: string, isDir: boolean): Promise<string> => {
@@ -1736,8 +771,6 @@ export const registerSSHHandlers = () => {
       return bastionResult
     }
 
-    recordTranscriptStart(connectionInfo)
-
     // Default to SSH connection when sshType is missing or explicitly 'ssh'
     const retryCount = 0
     return new Promise((resolve, reject) => {
@@ -1762,9 +795,6 @@ export const registerSSHHandlers = () => {
         return { status: 'error', message: 'JumpServer connection not found' }
       }
 
-      recordShellSessionAttach(id, 'jumpserver')
-      recordShellBridgeOpen(id, 'jumpserver')
-
       // Clear old listeners
       stream.removeAllListeners('data')
 
@@ -1780,27 +810,6 @@ export const registerSSHHandlers = () => {
 
         rawChunks = []
         rawBytes = 0
-        if (raw) {
-          recordShellBridgeDataForTransport(id, 'jumpserver', raw)
-        }
-
-        // Detect shell prompt for JumpServer connections that didn't send connectedToTarget
-        // This handles mingyu-type connections where the target shell prompt arrives via main-shell stream
-        if (!jumpserverConnectedToTargetSent.has(id) && SHELL_PROMPT_REGEX.test(chunk)) {
-          jumpserverConnectedToTargetSent.add(id)
-          const connData = jumpserverConnections.get(id)
-          const jumpserverUuid = connData?.jumpserverUuid
-          if (jumpserverUuid) {
-            event.sender.send('jumpserver:status-update', {
-              id: id,
-              message: 'Successfully connected to target server, you can start operating',
-              messageKey: 'ssh.jumpserver.connectedToTarget',
-              type: 'success',
-              timestamp: new Date().toLocaleTimeString()
-            })
-          }
-        }
-
         event.sender.send(`ssh:shell:data:${id}`, { data: chunk, raw, marker: '' })
         flushTimer = null
       }
@@ -1827,18 +836,14 @@ export const registerSSHHandlers = () => {
         const lastCommand = jumpserverLastCommand.get(id)
         const exitCommands = ['exit', 'logout', '\x04']
 
-        const connData = jumpserverConnections.get(id)
-        const shellProfile = connData?.navigationPath?.profile ?? 'standard'
-
         // JumpServer menu exit detection
-        if (lastCommand && exitCommands.includes(lastCommand) && hasJumpServerCommandPrompt(dataStr, shellProfile)) {
-          const exitCommand = getJumpServerExitCommand(shellProfile)
+        if (dataStr.includes('[Host]>') && lastCommand && exitCommands.includes(lastCommand)) {
           jumpserverLastCommand.delete(id)
-          recordShellSessionWrite(id, 'jumpserver', exitCommand + '\r', false, exitCommand)
-          stream.write(exitCommand + '\r', (err) => {
-            if (err) console.error(`[JumpServer ${id}] Failed to send "${exitCommand}":`, err)
-            else console.log(`[JumpServer ${id}] Sent "${exitCommand}" to terminate session.`)
+          stream.write('q\r', (err) => {
+            if (err) console.error(`[JumpServer ${id}] Failed to send "q":`, err)
+            else console.log(`[JumpServer ${id}] Sent "q" to terminate session.`)
             stream.end()
+            const connData = jumpserverConnections.get(id)
             connData?.conn?.end()
           })
           return
@@ -1847,7 +852,6 @@ export const registerSSHHandlers = () => {
         const markedCmd = jumpserverMarkedCommands.get(id)
         if (markedCmd !== undefined) {
           if (markedCmd.marker === 'Chaterm:command') {
-            recordShellBridgeDataForTransport(id, 'jumpserver', data)
             event.sender.send(`ssh:shell:data:${id}`, {
               data: dataStr,
               raw: data,
@@ -1864,9 +868,6 @@ export const registerSSHHandlers = () => {
             if (markedCmd && !markedCmd.completed) {
               markedCmd.completed = true
               const markedRaw = markedCmd.rawBytes ? Buffer.concat(markedCmd.rawChunks, markedCmd.rawBytes) : undefined
-              if (markedRaw) {
-                recordShellBridgeDataForTransport(id, 'jumpserver', markedRaw)
-              }
               event.sender.send(`ssh:shell:data:${id}`, {
                 data: markedCmd.output,
                 raw: markedRaw,
@@ -1885,18 +886,14 @@ export const registerSSHHandlers = () => {
       })
 
       stream.stderr.on('data', (data) => {
-        recordShellBridgeStderrForTransport(id, 'jumpserver', data.toString('utf8'))
         event.sender.send(`ssh:shell:stderr:${id}`, data.toString('utf8'))
       })
 
       stream.on('close', () => {
         flushBuffer()
-        recordShellBridgeCloseForTransport(id, 'jumpserver')
-        recordShellSessionDetach(id, 'jumpserver')
         console.log(`JumpServer shell stream closed for id=${id}`)
         event.sender.send(`ssh:shell:close:${id}`)
         jumpserverShellStreams.delete(id)
-        jumpserverConnectedToTargetSent.delete(id)
       })
 
       return { status: 'success', message: 'JumpServer Shell ready' }
@@ -1913,7 +910,6 @@ export const registerSSHHandlers = () => {
       return { status: 'error', message: 'Not connected to the server' }
     }
 
-    const transport: DebugTranscriptTransport = 'ssh'
     const termType = terminalType || 'vt100'
     const delayMs = 300
     const fallbackExecs = ['bash', 'sh']
@@ -1922,9 +918,6 @@ export const registerSSHHandlers = () => {
 
     const handleStream = (stream, method: 'shell' | 'exec') => {
       shellStreams.set(id, stream)
-      recordShellSessionAttach(id, transport)
-      recordShellReadyByTransport(id, transport, method)
-      recordShellTranscriptForTransport(id, transport, stream, 'main-shell')
 
       let buffer = ''
       let flushTimer: NodeJS.Timeout | null = null
@@ -1940,9 +933,6 @@ export const registerSSHHandlers = () => {
 
         rawChunks = []
         rawBytes = 0
-        if (raw) {
-          recordShellBridgeDataForTransport(id, transport, raw)
-        }
         event.sender.send(`ssh:shell:data:${id}`, { data: chunk, raw, marker: '' })
         flushTimer = null
       }
@@ -1978,9 +968,6 @@ export const registerSSHHandlers = () => {
             if (markedCmd && !markedCmd.completed) {
               markedCmd.completed = true
               const markedRaw = markedCmd.rawBytes ? Buffer.concat(markedCmd.rawChunks, markedCmd.rawBytes) : undefined
-              if (markedRaw) {
-                recordShellBridgeDataForTransport(id, transport, markedRaw)
-              }
               event.sender.send(`ssh:shell:data:${id}`, {
                 data: markedCmd.output,
                 raw: markedRaw,
@@ -1999,14 +986,11 @@ export const registerSSHHandlers = () => {
       })
 
       stream.stderr?.on('data', (data) => {
-        recordShellBridgeStderrForTransport(id, transport, data.toString('utf8'))
         event.sender.send(`ssh:shell:stderr:${id}`, data.toString('utf8'))
       })
 
       stream.on('close', () => {
         flushBuffer()
-        recordShellBridgeCloseForTransport(id, transport)
-        recordShellSessionDetach(id, transport)
         console.log(`Shell stream closed for id=${id} (${method})`)
         event.sender.send(`ssh:shell:close:${id}`)
         shellStreams.delete(id)
@@ -2016,16 +1000,12 @@ export const registerSSHHandlers = () => {
     const tryExecFallback = (execList: string[], resolve, reject) => {
       const [cmd, ...rest] = execList
       if (!cmd) {
-        const shellError = new Error('shell and exec run failed')
-        recordShellErrorByTransport(id, transport, shellError)
-        return reject(shellError)
+        return reject(new Error('shell and exec run failed'))
       }
 
-      recordShellFallbackByTransport(id, transport, cmd, 'shell start failed, trying exec fallback')
       conn.exec(cmd, { pty: true }, (execErr, execStream) => {
         if (execErr) {
           console.warn(`[${id}] exec(${cmd}) Failed: ${execErr.message}`)
-          recordShellErrorByTransport(id, transport, execErr)
           return tryExecFallback(rest, resolve, reject)
         }
 
@@ -2036,24 +1016,14 @@ export const registerSSHHandlers = () => {
     }
 
     return new Promise((resolve, reject) => {
-      if (!isConnected()) {
-        const disconnectedError = new Error('Connection disconnected, unable to start terminal')
-        recordShellErrorByTransport(id, transport, disconnectedError)
-        return reject(disconnectedError)
-      }
+      if (!isConnected()) return reject(new Error('Connection disconnected, unable to start terminal'))
 
       setTimeout(() => {
-        if (!isConnected()) {
-          const delayedDisconnectError = new Error('The connection has been disconnected after a delay')
-          recordShellErrorByTransport(id, transport, delayedDisconnectError)
-          return reject(delayedDisconnectError)
-        }
+        if (!isConnected()) return reject(new Error('The connection has been disconnected after a delay'))
 
-        recordShellBridgeReadyForTransport(id, transport)
         conn.shell({ term: termType }, (err, stream) => {
           if (err) {
             console.warn(`[${id}] shell() start error: ${err.message}`)
-            recordShellErrorByTransport(id, transport, err)
             return tryExecFallback(fallbackExecs, resolve, reject)
           }
 
@@ -2107,7 +1077,6 @@ export const registerSSHHandlers = () => {
     if (jumpserverConnections.has(id)) {
       const stream = jumpserverShellStreams.get(id)
       if (stream) {
-        recordShellWriteByTransport(id, 'jumpserver', data, !!isBinary, lineCommand)
         if (isBinary) {
           const buf = Buffer.from(data, 'binary')
           stream.write(buf)
@@ -2150,7 +1119,6 @@ export const registerSSHHandlers = () => {
     // Default SSH handling
     const stream = shellStreams.get(id)
     if (stream) {
-      recordShellWriteByTransport(id, 'ssh', data, !!isBinary, lineCommand)
       // console.log(`ssh:shell:write (default) raw data: "${data}"`)
       // For default SSH connections, don't detect exit commands, let terminal handle exit naturally
       if (markedCommands.has(id)) {
@@ -2395,18 +1363,8 @@ export const registerSSHHandlers = () => {
   ipcMain.handle('ssh:disconnect', async (_event, { id }) => {
     // Check if it's a JumpServer connection
     if (jumpserverConnections.has(id)) {
-      recordDisconnectRequestByTransport(id, 'jumpserver')
       const stream = jumpserverShellStreams.get(id)
       if (stream) {
-        // For bastion hosts (JumpServer), we need to send exit command first
-        // to properly notify the bastion that the session is closing.
-        // Without this, the bastion may keep the session alive and next
-        // connection will show "Reusing existing connection" message.
-        try {
-          stream.write('exit\r')
-        } catch (e) {
-          // Ignore write errors, proceed to close anyway
-        }
         stream.end()
         jumpserverShellStreams.delete(id)
       }
@@ -2454,7 +1412,6 @@ export const registerSSHHandlers = () => {
     }
 
     // Default SSH handling
-    recordDisconnectRequestByTransport(id, 'ssh')
     const stream = shellStreams.get(id)
     if (stream) {
       stream.end()
@@ -2482,7 +1439,6 @@ export const registerSSHHandlers = () => {
         // If no other sessions are using this connection, close connection and clean up pool
         if ((reusableConn as ReusableConnection).sessions.size === 0) {
           console.log(`[SSH Connection Pool] All sessions closed, releasing connection: ${poolKey}`)
-          recordConnectPoolCleanup(id, poolKey, 'close')
           conn.end()
           sshConnectionPool.delete(poolKey)
         }

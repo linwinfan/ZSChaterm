@@ -255,8 +255,6 @@ export async function refreshOrganizationAssetsLogic(
   keyboardInteractiveHandler?: any,
   authResultCallback?: any
 ): Promise<any> {
-  let debugLogPath: string | undefined
-
   try {
     console.log('Starting to refresh organization assets, organization UUID:', organizationUuid)
 
@@ -309,7 +307,6 @@ export async function refreshOrganizationAssetsLogic(
 
     // Route to different client based on asset type
     let assets: Array<{ name: string; address: string; description?: string }>
-    let shouldDeleteStaleAssets = true
     if (isPluginBased) {
       // Use plugin-based bastion asset refresh via capability registry
       const bastionCapability = capabilityRegistry.getBastion(bastionType)
@@ -365,30 +362,8 @@ export async function refreshOrganizationAssetsLogic(
       // Use JumpServer client
       console.log('Using JumpServer client...')
       const client = new JumpServerClient(finalConfig, keyboardInteractiveHandler, authResultCallback)
-      debugLogPath = client.getDebugLogPath()
-
-      let refreshResult
-      try {
-        refreshResult = await client.getAllAssets()
-      } finally {
-        client.close()
-      }
-
-      debugLogPath = refreshResult.debugLogPath ?? debugLogPath
-
-      if (!refreshResult.recognized) {
-        throw new Error('JumpServer asset output was not recognized, skip refreshing organization assets')
-      }
-
-      shouldDeleteStaleAssets = refreshResult.complete
-      assets = refreshResult.assets.map((asset) => ({
-        name: asset.name,
-        address: asset.address,
-        description: asset.comment
-      }))
-      console.log(
-        `JumpServer assets retrieved via built-in client: ${assets.length}, profile: ${refreshResult.profile}, complete: ${refreshResult.complete}`
-      )
+      assets = await client.getAllAssets()
+      client.close()
     }
 
     console.log('Assets retrieved, count:', assets.length)
@@ -458,27 +433,22 @@ export async function refreshOrganizationAssetsLogic(
     }
     console.log('Asset processing completed')
 
-    if (shouldDeleteStaleAssets) {
-      const deleteStmt = db.prepare(`
-        DELETE FROM t_organization_assets
-        WHERE organization_uuid = ? AND host = ?
-      `)
+    const deleteStmt = db.prepare(`
+      DELETE FROM t_organization_assets
+      WHERE organization_uuid = ? AND host = ?
+    `)
 
-      for (const existingAsset of existingAssets) {
-        if (!currentAssetHosts.has(existingAsset.host)) {
-          deleteStmt.run(organizationUuid, existingAsset.host)
-        }
+    for (const existingAsset of existingAssets) {
+      if (!currentAssetHosts.has(existingAsset.host)) {
+        deleteStmt.run(organizationUuid, existingAsset.host)
       }
-    } else {
-      console.log('Skip deleting stale organization assets because refresh result is incomplete')
     }
 
     console.log('Organization asset refresh completed, returning success result')
     return {
       data: {
         message: 'success',
-        totalAssets: assets.length,
-        debugLogPath
+        totalAssets: assets.length
       }
     }
   } catch (error) {
@@ -487,8 +457,7 @@ export async function refreshOrganizationAssetsLogic(
     return {
       data: {
         message: 'failed',
-        error: error instanceof Error ? error.message : String(error),
-        debugLogPath
+        error: error instanceof Error ? error.message : String(error)
       }
     }
   }

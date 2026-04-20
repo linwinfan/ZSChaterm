@@ -12,7 +12,6 @@ import { MAX_JUMPSERVER_MFA_ATTEMPTS } from './constants'
 import { setupJumpServerInteraction } from './interaction'
 import { handleJumpServerKeyboardInteractive } from './mfa'
 import { buildErrorResponse } from './errorUtils'
-import { ensureDebugTranscriptSession, recordDebugTranscriptEvent, type DebugTranscriptRedaction } from '../debugTranscript'
 import path from 'path'
 import fs from 'fs'
 
@@ -75,130 +74,11 @@ const sftpAsync = (conn, connectionId) => {
     })
   })
 }
-const getMfaPromptText = (prompts: Array<{ prompt: string }>) => prompts.map((item) => item.prompt).join('\n')
-
-const getMfaResponseCount = (responses: unknown): number => {
-  return Array.isArray(responses) ? responses.length : 0
-}
-
-const recordJumpServerConnectionEvent = (options: {
-  rootSessionId: string
-  event: string
-  actor?: 'user' | 'system' | 'remote'
-  phase?: 'connecting' | 'connected' | 'closed'
-  direction?: 'in' | 'out' | 'meta'
-  text?: string
-  bytes?: number
-  redacted?: DebugTranscriptRedaction
-  noise?: boolean
-  meta?: Record<string, unknown>
-  source?: 'connection' | 'secondary' | 'mfa'
-  sessionId?: string
-}) => {
-  recordDebugTranscriptEvent({
-    rootSessionId: options.rootSessionId,
-    sessionId: options.sessionId,
-    transport: 'jumpserver',
-    source: options.source ?? 'connection',
-    actor: options.actor ?? 'system',
-    event: options.event,
-    phase: options.phase,
-    direction: options.direction,
-    text: options.text,
-    bytes: options.bytes,
-    redacted: options.redacted,
-    noise: options.noise,
-    meta: options.meta
-  })
-}
-
-const recordJumpServerSecondaryNoise = (connectionInfo: JumpServerConnectionInfo, event: string, meta?: Record<string, unknown>) => {
-  recordJumpServerConnectionEvent({
-    rootSessionId: connectionInfo.id,
-    source: 'secondary',
-    event,
-    phase: 'connected',
-    noise: true,
-    meta
-  })
-}
-
 const attemptJumpServerConnection = async (
   connectionInfo: JumpServerConnectionInfo,
   event?: Electron.IpcMainInvokeEvent,
   attemptCount: number = 0
 ): Promise<{ status: string; message: string }> => {
-  const transcriptPath = ensureDebugTranscriptSession({
-    rootSessionId: connectionInfo.id,
-    transport: 'jumpserver',
-    source: 'connection',
-    meta: {
-      host: connectionInfo.host,
-      port: connectionInfo.port || 22,
-      username: connectionInfo.username,
-      targetIp: connectionInfo.targetIp,
-      targetHostname: connectionInfo.targetHostname || '',
-      targetAsset: connectionInfo.targetAsset || '',
-      authMethod: connectionInfo.privateKey ? 'privateKey' : connectionInfo.password ? 'password' : 'unknown',
-      needProxy: !!connectionInfo.needProxy
-    }
-  })
-
-  recordJumpServerConnectionEvent({
-    rootSessionId: connectionInfo.id,
-    event: 'transcript_ready',
-    phase: 'connecting',
-    meta: { filePath: transcriptPath }
-  })
-
-  recordJumpServerConnectionEvent({
-    rootSessionId: connectionInfo.id,
-    event: 'connect_start',
-    phase: 'connecting',
-    meta: {
-      host: connectionInfo.host,
-      port: connectionInfo.port || 22,
-      username: connectionInfo.username,
-      attempt: attemptCount + 1,
-      needProxy: !!connectionInfo.needProxy
-    }
-  })
-
-  if (attemptCount > 0) {
-    recordJumpServerConnectionEvent({
-      rootSessionId: connectionInfo.id,
-      event: 'connect_retry',
-      phase: 'connecting',
-      meta: { attempt: attemptCount + 1 }
-    })
-  }
-
-  const recordSecondaryAttempt = attemptSecondaryConnection
-
-  const attemptJumpServerSecondaryConnection = async (ident: string) => {
-    recordJumpServerSecondaryNoise(connectionInfo, 'secondary_connect_start', {
-      host: connectionInfo.host,
-      port: connectionInfo.port || 22,
-      username: connectionInfo.username,
-      ident
-    })
-
-    try {
-      await recordSecondaryAttempt(event, connectionInfo, ident)
-      recordJumpServerSecondaryNoise(connectionInfo, 'secondary_connect_complete')
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      recordJumpServerConnectionEvent({
-        rootSessionId: connectionInfo.id,
-        source: 'secondary',
-        event: 'secondary_connect_error',
-        phase: 'closed',
-        noise: true,
-        meta: { message }
-      })
-      throw error
-    }
-  }
   const connectionId = connectionInfo.id
 
   const sendStatusUpdate = (
@@ -232,19 +112,8 @@ const attemptJumpServerConnection = async (
 
     if (connectionInfo.assetUuid) {
       for (const [, existingData] of jumpserverConnections.entries()) {
-        // Skip reuse for mingyu profile - each target host needs independent auth context
-        if (existingData.jumpserverUuid === jumpserverUuid && existingData.navigationPath?.profile !== 'mingyu') {
+        if (existingData.jumpserverUuid === jumpserverUuid) {
           sendStatusUpdate('Reusing existing connection, creating new shell session...', 'info', 'ssh.jumpserver.reuseConnection')
-          recordJumpServerConnectionEvent({
-            rootSessionId: connectionId,
-            event: 'connection_reused',
-            phase: 'connected',
-            meta: {
-              jumpserverUuid,
-              targetIp: connectionInfo.targetIp,
-              reusedSessionId: existingData.jumpserverUuid
-            }
-          })
 
           const conn = existingData.conn
           conn.shell({ term: connectionInfo.terminalType || 'vt100' }, (err, newStream) => {
@@ -256,20 +125,11 @@ const attemptJumpServerConnection = async (
             // Establish SFTP connection
             // TODO: Reuse conn implementation for JumpServer, other bastion hosts may need new conn
             try {
-              recordJumpServerSecondaryNoise(connectionInfo, 'secondary_sftp_check_start')
               sftpAsync(conn, connectionId)
             } catch (e) {
               connectionStatus.set(connectionId, {
                 sftpAvailable: false,
                 sftpError: 'SFTP connection failed'
-              })
-              recordJumpServerConnectionEvent({
-                rootSessionId: connectionId,
-                source: 'secondary',
-                event: 'secondary_sftp_check_error',
-                phase: 'closed',
-                noise: true,
-                meta: { message: 'SFTP connection failed' }
               })
             }
             setupJumpServerInteraction(newStream, connectionInfo, connectionId, jumpserverUuid, conn, event, sendStatusUpdate, resolve, reject)
@@ -345,78 +205,9 @@ const attemptJumpServerConnection = async (
           )
         }
 
-        await handleJumpServerKeyboardInteractive(event, connectionId, prompts, finish, {
-          onPrompt: (promptList) => {
-            const text = getMfaPromptText(promptList)
-            recordJumpServerConnectionEvent({
-              rootSessionId: connectionId,
-              source: 'mfa',
-              actor: 'remote',
-              event: 'mfa_prompt',
-              phase: 'connecting',
-              direction: 'in',
-              text,
-              meta: {
-                promptCount: promptList.length,
-                attempt: attemptCount + 1
-              }
-            })
-          },
-          onResponse: (responses) => {
-            recordJumpServerConnectionEvent({
-              rootSessionId: connectionId,
-              source: 'mfa',
-              actor: 'user',
-              event: 'mfa_response',
-              phase: 'connecting',
-              direction: 'out',
-              text: '<redacted:mfa>',
-              redacted: 'mfa',
-              meta: {
-                responseCount: getMfaResponseCount(responses),
-                attempt: attemptCount + 1
-              }
-            })
-          },
-          onTimeout: () => {
-            recordJumpServerConnectionEvent({
-              rootSessionId: connectionId,
-              source: 'mfa',
-              actor: 'system',
-              event: 'mfa_timeout',
-              phase: 'closed',
-              meta: {
-                attempt: attemptCount + 1
-              }
-            })
-          },
-          onCancel: () => {
-            recordJumpServerConnectionEvent({
-              rootSessionId: connectionId,
-              source: 'mfa',
-              actor: 'user',
-              event: 'mfa_cancel',
-              phase: 'closed',
-              direction: 'out',
-              meta: {
-                attempt: attemptCount + 1
-              }
-            })
-          }
-        })
+        await handleJumpServerKeyboardInteractive(event, connectionId, prompts, finish)
       } catch (err) {
         sendStatusUpdate('Two-factor authentication failed', 'error', 'ssh.jumpserver.mfaFailed')
-        recordJumpServerConnectionEvent({
-          rootSessionId: connectionId,
-          source: 'mfa',
-          event: 'mfa_result',
-          phase: 'closed',
-          meta: {
-            status: 'failed',
-            attempt: attemptCount + 1,
-            message: err instanceof Error ? err.message : String(err)
-          }
-        })
         conn.end()
         reject(err as Error)
       }
@@ -425,29 +216,10 @@ const attemptJumpServerConnection = async (
     conn.on('ready', () => {
       console.log('JumpServer connection established, starting to create shell')
       sendStatusUpdate('Successfully connected to bastion host, please wait...', 'success', 'ssh.jumpserver.connectedToBastionHost')
-      recordJumpServerConnectionEvent({
-        rootSessionId: connectionId,
-        event: 'connect_ready',
-        phase: 'connected',
-        meta: {
-          jumpserverUuid,
-          attempt: attemptCount + 1
-        }
-      })
-      void attemptJumpServerSecondaryConnection(ident)
+      attemptSecondaryConnection(event, connectionInfo, ident)
 
       if (event && keyboardInteractiveOpts.has(connectionId)) {
         console.log('Sending MFA verification success event:', { connectionId, status: 'success' })
-        recordJumpServerConnectionEvent({
-          rootSessionId: connectionId,
-          source: 'mfa',
-          event: 'mfa_result',
-          phase: 'connected',
-          meta: {
-            status: 'success',
-            attempt: attemptCount + 1
-          }
-        })
         event.sender.send('ssh:keyboard-interactive-result', {
           id: connectionId,
           status: 'success'
@@ -456,12 +228,6 @@ const attemptJumpServerConnection = async (
 
       conn.shell({ term: connectionInfo.terminalType || 'vt100' }, (err, stream) => {
         if (err) {
-          recordJumpServerConnectionEvent({
-            rootSessionId: connectionId,
-            event: 'shell_create_error',
-            phase: 'closed',
-            meta: { message: err.message }
-          })
           reject(new Error(`Failed to create shell: ${err.message}`))
           return
         }
@@ -472,30 +238,9 @@ const attemptJumpServerConnection = async (
 
     conn.on('error', (err) => {
       console.error('JumpServer connection error:', err)
-      recordJumpServerConnectionEvent({
-        rootSessionId: connectionId,
-        event: 'connect_error',
-        phase: 'closed',
-        meta: {
-          message: err.message,
-          level: (err as any).level || ''
-        }
-      })
 
       if ((err as any).level === 'client-authentication') {
         console.log(`JumpServer MFA authentication failed, attempt count: ${attemptCount + 1}/${MAX_JUMPSERVER_MFA_ATTEMPTS}`)
-        recordJumpServerConnectionEvent({
-          rootSessionId: connectionId,
-          source: 'mfa',
-          event: 'mfa_result',
-          phase: 'connecting',
-          meta: {
-            status: 'failed',
-            attempt: attemptCount + 1,
-            final: attemptCount >= MAX_JUMPSERVER_MFA_ATTEMPTS - 1,
-            message: err.message
-          }
-        })
 
         if (event) {
           event.sender.send('ssh:keyboard-interactive-result', {
@@ -546,30 +291,12 @@ export const handleJumpServerConnection = async (
 
       if ((lastError as any).shouldRetry && attempt < MAX_JUMPSERVER_MFA_ATTEMPTS - 1) {
         console.log(`Will retry attempt ${attempt + 2}...`)
-        recordJumpServerConnectionEvent({
-          rootSessionId: connectionInfo.id,
-          event: 'connect_retry_scheduled',
-          phase: 'connecting',
-          meta: {
-            nextAttempt: attempt + 2,
-            message: lastError.message
-          }
-        })
         await new Promise((resolve) => setTimeout(resolve, 1000))
         continue
       }
       break
     }
   }
-
-  recordJumpServerConnectionEvent({
-    rootSessionId: connectionInfo.id,
-    event: 'connect_failed',
-    phase: 'closed',
-    meta: {
-      message: (lastError || new Error('JumpServer connection failed')).message
-    }
-  })
 
   if (event) {
     event.sender.send('ssh:keyboard-interactive-result', {

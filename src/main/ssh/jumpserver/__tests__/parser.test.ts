@@ -1,17 +1,17 @@
 import { describe, it, expect } from 'vitest'
-import { parseJumpserverOutput, parseJumpServerUsers, hasUserSelectionPrompt, parseMingyuAssetEntries, resolveMingyuTargetSelection } from '../parser'
+import { parseJumpserverOutput, parseJumpServerUsers, hasUserSelectionPrompt } from '../parser'
 
 describe('JumpServer Parser', () => {
   describe('parseJumpserverOutput', () => {
     describe('parse Chinese format', () => {
       const chineseOutput = `
-  ID | 名称                             | 地址        | 平台           | 组织            | 备注
+  ID | 名称                             | 地址        | 平台           | 组织            | 备注                          
 -----+----------------------------------+-------------+----------------+-----------------+-------------------------------
-  1  | demo-app-01                      | 192.0.2.10   | Linux          | ExampleOrg      | 示例资产A
-  2  | demo-db-01                       | 198.51.100.20| Linux          | ExampleOrg      | 数据库节点
-  3  | demo-cache-01                    | 203.0.113.30 | Linux          | ExampleOrg      |
-  4  | qa-proxy-01                      | 192.0.2.40   | Linux          | ExampleOrg      | 代理
-  5  | ops-bastion-01                   | 198.51.100.50| Linux          | ExampleOrg      | 跳板
+  1  | demo-app-01                      | 192.0.2.10   | Linux          | ExampleOrg      | 示例资产A                     
+  2  | demo-db-01                       | 198.51.100.20| Linux          | ExampleOrg      | 数据库节点                    
+  3  | demo-cache-01                    | 203.0.113.30 | Linux          | ExampleOrg      |                               
+  4  | qa-proxy-01                      | 192.0.2.40   | Linux          | ExampleOrg      | 代理                          
+  5  | ops-bastion-01                   | 198.51.100.50| Linux          | ExampleOrg      | 跳板                          
 页码：1，每页行数：15，总页数：6，总数量：88
 提示：输入资产ID直接登录，二级搜索使用 // + 字段，如：//192 上一页：b 下一页：n
 搜索：
@@ -21,8 +21,6 @@ describe('JumpServer Parser', () => {
         const result = parseJumpserverOutput(chineseOutput)
 
         expect(result.assets).toHaveLength(5)
-        expect(result.profile).toBeNull()
-        expect(result.recognized).toBe(true)
         expect(result.assets[0]).toEqual({
           id: 1,
           name: 'demo-app-01',
@@ -53,25 +51,23 @@ describe('JumpServer Parser', () => {
 
     describe('parse English format', () => {
       const englishOutput = `
-  ID | NAME                             | ADDRESS     | PLATFORM       | ORGANIZATION       | COMMENT
+  ID | NAME                             | ADDRESS     | PLATFORM       | ORGANIZATION       | COMMENT                    
 -----+----------------------------------+-------------+----------------+--------------------+----------------------------
-  1  | demo-app-01                      | 192.0.2.10   | Linux          | ExampleOrg      | sample asset A
-  2  | demo-db-01                       | 198.51.100.20| Linux          | ExampleOrg      | database node
-  3  | demo-cache-01                    | 203.0.113.30 | Linux          | ExampleOrg      | cache layer
-  4  | qa-proxy-01                      | 192.0.2.40   | Linux          | ExampleOrg      | proxy
-  5  | ops-bastion-01                   | 198.51.100.50| Linux          | ExampleOrg      | bastion host
-  6  | staging-worker-02                | 203.0.113.60 | Linux          | ExampleOrg      | autoscale node
+  1  | demo-app-01                      | 192.0.2.10   | Linux          | ExampleOrg      | sample asset A                
+  2  | demo-db-01                       | 198.51.100.20| Linux          | ExampleOrg      | database node                 
+  3  | demo-cache-01                    | 203.0.113.30 | Linux          | ExampleOrg      | cache layer                   
+  4  | qa-proxy-01                      | 192.0.2.40   | Linux          | ExampleOrg      | proxy                         
+  5  | ops-bastion-01                   | 198.51.100.50| Linux          | ExampleOrg      | bastion host                  
+  6  | staging-worker-02                | 203.0.113.60 | Linux          | ExampleOrg      | autoscale node                
 Page: 1, Count: 15, Total Page: 6, Total Count: 88
 Enter ID number directly login, multiple search use // + field, such as: //16 Page up: b        Page down: n
-Search:
+Search: 
 `
 
       it('should parse asset list with English headers', () => {
         const result = parseJumpserverOutput(englishOutput)
 
         expect(result.assets).toHaveLength(6)
-        expect(result.profile).toBeNull()
-        expect(result.recognized).toBe(true)
         expect(result.assets[0]).toEqual({
           id: 1,
           name: 'demo-app-01',
@@ -100,215 +96,18 @@ Search:
       })
     })
 
-    describe('parse Mingyu GateShell format', () => {
-      const mingyuOutput = `
-Quit: Use ":q<Enter>".
-Refresh: Use "r" to refresh lists.
-[GateShell]
-001: 172.21.9.107-L20   172.21.9.107:22    ssh   root
-002: oidc-test          10.192.1.123:22    ssh   [EMPTY]   所有云主机
-/2, name-asc
-`
-
-      const flattenedMingyuOutput = `ateShell\u0007ateShell\u0007==>Is getting the instances, please wait patiently ...                         " ============================================================================="     Quit: Use ":q<Enter>"."     Move: Use the cursor keys, or "j" to go down, "k" to go up, "u" to PageUp"   Search: Use "/{patten}<Enter>" and then "n"/"N" to next/privous searching r"     Jump: Use ":{number}<Enter>" to jump to line {number}."  Command: Use ":[ssh|telnet|rlogin] [-l user] {user}@{host}:{port} [-p port]<"           Use ":[ping|traceroute|connect] {host} [port ...]<Enter>" for check"  Refresh: Use "r" to refresh lists." Language: Use "e" to change language encoding between UTF-8 and GB2312."  Sorting: Use "ctrl+s" to change sorting mode between NAME, IP and GROUP, and" =============================================================================  [GateShell]  001: 172.21.9.107-L20   172.21.9.107:22    ssh   root                     002: oidc-test          10.192.1.123:22    ssh   [EMPTY]   所有云主机                                                                                  /2, name-asc" =============================================================================`
-
-      const ambiguousMingyuOutput = `
-[GateShell]
-001: app-a              10.0.0.8:22        ssh   root      team-a
-002: app-b              10.0.0.8:22        ssh   deploy    team-b
-003: app-c              10.0.0.9:22        ssh   [EMPTY]   team-c
-/3, name-asc
-`
-
-      it('should parse Mingyu asset list and profile', () => {
-        const result = parseJumpserverOutput(mingyuOutput)
-
-        expect(result.profile).toBe('mingyu')
-        expect(result.recognized).toBe(true)
-        expect(result.assets).toEqual([
-          {
-            id: 1,
-            name: '172.21.9.107-L20',
-            address: '172.21.9.107',
-            platform: 'ssh',
-            organization: '',
-            comment: ''
-          },
-          {
-            id: 2,
-            name: 'oidc-test',
-            address: '10.192.1.123',
-            platform: 'ssh',
-            organization: '',
-            comment: ''
-          }
-        ])
-      })
-
-      it('should parse flattened Mingyu GateShell output from real logs', () => {
-        const result = parseJumpserverOutput(flattenedMingyuOutput)
-
-        expect(result.profile).toBe('mingyu')
-        expect(result.recognized).toBe(true)
-        expect(result.assets).toEqual([
-          {
-            id: 1,
-            name: '172.21.9.107-L20',
-            address: '172.21.9.107',
-            platform: 'ssh',
-            organization: '',
-            comment: ''
-          },
-          {
-            id: 2,
-            name: 'oidc-test',
-            address: '10.192.1.123',
-            platform: 'ssh',
-            organization: '',
-            comment: ''
-          }
-        ])
-        expect(result.pagination).toEqual({
-          currentPage: 1,
-          totalPages: 2
-        })
-      })
-
-      it('should parse Mingyu entry metadata for selector commands', () => {
-        const entries = parseMingyuAssetEntries(mingyuOutput)
-
-        expect(entries).toEqual([
-          {
-            selector: '001',
-            id: 1,
-            name: '172.21.9.107-L20',
-            address: '172.21.9.107',
-            endpoint: '172.21.9.107:22',
-            platform: 'ssh',
-            protocol: 'ssh',
-            organization: '',
-            comment: '',
-            loginUser: 'root',
-            group: ''
-          },
-          {
-            selector: '002',
-            id: 2,
-            name: 'oidc-test',
-            address: '10.192.1.123',
-            endpoint: '10.192.1.123:22',
-            platform: 'ssh',
-            protocol: 'ssh',
-            organization: '',
-            comment: '',
-            loginUser: '[EMPTY]',
-            group: '所有云主机'
-          }
-        ])
-      })
-
-      it('should resolve Mingyu target by hostname when IP is ambiguous', () => {
-        const result = resolveMingyuTargetSelection(ambiguousMingyuOutput, {
-          targetIp: '10.0.0.8',
-          targetHostname: 'app-b'
-        })
-
-        expect(result).toEqual({
-          status: 'matched',
-          match: {
-            entry: {
-              selector: '002',
-              id: 2,
-              name: 'app-b',
-              address: '10.0.0.8',
-              endpoint: '10.0.0.8:22',
-              platform: 'ssh',
-              protocol: 'ssh',
-              organization: '',
-              comment: '',
-              loginUser: 'deploy',
-              group: 'team-b'
-            },
-            matchField: 'hostname',
-            selectionCommands: [':ssh deploy@10.0.0.8:22']
-          }
-        })
-      })
-
-      it('should resolve Mingyu target by asset metadata when hostname is unavailable', () => {
-        const result = resolveMingyuTargetSelection(ambiguousMingyuOutput, {
-          targetIp: '10.0.0.8',
-          targetAsset: 'team-a'
-        })
-
-        expect(result).toEqual({
-          status: 'matched',
-          match: {
-            entry: {
-              selector: '001',
-              id: 1,
-              name: 'app-a',
-              address: '10.0.0.8',
-              endpoint: '10.0.0.8:22',
-              platform: 'ssh',
-              protocol: 'ssh',
-              organization: '',
-              comment: '',
-              loginUser: 'root',
-              group: 'team-a'
-            },
-            matchField: 'asset',
-            selectionCommands: [':ssh root@10.0.0.8:22']
-          }
-        })
-      })
-
-      it('should keep ambiguous result when only IP matches multiple Mingyu assets', () => {
-        const result = resolveMingyuTargetSelection(ambiguousMingyuOutput, {
-          targetIp: '10.0.0.8'
-        })
-
-        expect(result.status).toBe('ambiguous')
-        if (result.status === 'ambiguous') {
-          expect(result.entries).toHaveLength(2)
-        }
-      })
-
-      it('should build selector commands without login user when Mingyu entry uses [EMPTY]', () => {
-        const result = resolveMingyuTargetSelection(mingyuOutput, {
-          targetIp: '10.192.1.123'
-        })
-
-        expect(result.status).toBe('matched')
-        if (result.status === 'matched') {
-          expect(result.match.selectionCommands).toEqual([':2', '__ENTER__', 'open 002'])
-        }
-      })
-
-      it('should parse Mingyu pagination info', () => {
-        const result = parseJumpserverOutput(mingyuOutput)
-
-        expect(result.pagination).toEqual({
-          currentPage: 1,
-          totalPages: 2
-        })
-      })
-    })
-
     describe('edge cases', () => {
       it('empty output should return empty assets and default pagination', () => {
         const result = parseJumpserverOutput('')
 
         expect(result.assets).toEqual([])
-        expect(result.profile).toBeNull()
-        expect(result.recognized).toBe(false)
         expect(result.pagination).toEqual({
           currentPage: 1,
           totalPages: 1
         })
       })
 
-      it('output without header should return empty assets and unrecognized state', () => {
+      it('output without header should return empty assets', () => {
         const noHeaderOutput = `
 Some random text
 Another line without table format
@@ -316,36 +115,27 @@ Another line without table format
         const result = parseJumpserverOutput(noHeaderOutput)
 
         expect(result.assets).toEqual([])
-        expect(result.recognized).toBe(false)
       })
 
-      it('separator only output should return empty assets and unrecognized state', () => {
+      it('separator only output should return empty assets', () => {
         const separatorOnlyOutput = `-----+----------------------------------+-------------+----------------+-----------------+-------------------------------`
         const result = parseJumpserverOutput(separatorOnlyOutput)
 
         expect(result.assets).toEqual([])
-        expect(result.recognized).toBe(false)
-      })
-
-      it('no assets prompt should still be recognized', () => {
-        const result = parseJumpserverOutput('No Assets')
-
-        expect(result.assets).toEqual([])
-        expect(result.recognized).toBe(true)
       })
     })
   })
 
   describe('parseJumpServerUsers', () => {
     const userSelectionOutput = `
-  ID | NAME          | USERNAME
+  ID | NAME          | USERNAME     
 -----+---------------+--------------
-  1  | admin         | admin
-  2  | developer     | dev_user
-  3  | operator      | ops_user
+  1  | admin         | admin        
+  2  | developer     | dev_user     
+  3  | operator      | ops_user     
 Tips: Input account ID to confirm
 Back: b
-ID>
+ID> 
 `
 
     it('should correctly parse user list', () => {
@@ -371,11 +161,11 @@ ID>
 
     it('should stop parsing when encountering Tips', () => {
       const outputWithTips = `
-  ID | NAME          | USERNAME
+  ID | NAME          | USERNAME     
 -----+---------------+--------------
-  1  | admin         | admin
+  1  | admin         | admin        
 Tips: Some tips here
-  2  | should_not_appear | hidden
+  2  | should_not_appear | hidden   
 `
       const users = parseJumpServerUsers(outputWithTips)
 
@@ -385,11 +175,11 @@ Tips: Some tips here
 
     it('should stop parsing when encountering Back prompt', () => {
       const outputWithBack = `
-  ID | NAME          | USERNAME
+  ID | NAME          | USERNAME     
 -----+---------------+--------------
-  1  | admin         | admin
+  1  | admin         | admin        
 Back: b
-  2  | should_not_appear | hidden
+  2  | should_not_appear | hidden   
 `
       const users = parseJumpServerUsers(outputWithBack)
 
@@ -398,11 +188,11 @@ Back: b
 
     it('should stop parsing when encountering ID prompt', () => {
       const outputWithIdPrompt = `
-  ID | NAME          | USERNAME
+  ID | NAME          | USERNAME     
 -----+---------------+--------------
-  1  | admin         | admin
-ID>
-  2  | should_not_appear | hidden
+  1  | admin         | admin        
+ID> 
+  2  | should_not_appear | hidden   
 `
       const users = parseJumpServerUsers(outputWithIdPrompt)
 
@@ -424,9 +214,9 @@ ID>
 
     it('should skip separator lines', () => {
       const outputWithSeparator = `
-  ID | NAME          | USERNAME
+  ID | NAME          | USERNAME     
 ---+---+---
-  1  | admin         | admin
+  1  | admin         | admin        
 `
       const users = parseJumpServerUsers(outputWithSeparator)
 
@@ -439,9 +229,9 @@ ID>
     it('should detect output containing user selection prompt', () => {
       const promptOutput = `
 Please select account ID to connect:
-  ID | NAME          | USERNAME
+  ID | NAME          | USERNAME     
 -----+---------------+--------------
-  1  | admin         | admin
+  1  | admin         | admin        
 `
       expect(hasUserSelectionPrompt(promptOutput)).toBe(true)
     })
@@ -449,19 +239,19 @@ Please select account ID to connect:
     it('should detect full user selection prompt', () => {
       const fullPromptOutput = `
 Select account ID to login:
-  ID | NAME          | USERNAME
+  ID | NAME          | USERNAME     
 -----+---------------+--------------
-  1  | admin         | admin
-  2  | developer     | dev_user
+  1  | admin         | admin        
+  2  | developer     | dev_user     
 `
       expect(hasUserSelectionPrompt(fullPromptOutput)).toBe(true)
     })
 
     it('should return false when account ID is missing', () => {
       const noAccountIdOutput = `
-  ID | NAME          | USERNAME
+  ID | NAME          | USERNAME     
 -----+---------------+--------------
-  1  | admin         | admin
+  1  | admin         | admin        
 `
       expect(hasUserSelectionPrompt(noAccountIdOutput)).toBe(false)
     })
@@ -479,7 +269,9 @@ Some other content
     })
 
     it('should return false when only partial keywords exist', () => {
+      // only account ID without header
       expect(hasUserSelectionPrompt('account ID')).toBe(false)
+      // only ID and NAME without account ID
       expect(hasUserSelectionPrompt('ID | NAME')).toBe(false)
     })
   })
