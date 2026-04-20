@@ -1,67 +1,75 @@
-# Mingyu Command模式重复执行问题修复计划
+# AI Chat 中断任务按钮问题修复计划
 
 ## 问题描述
-在command模式下点击执行按钮时，命令被执行了二次，同时在日志中出现以下错误：
-```
-[Mingyu-plugin] write: Setting up marker tracking for id=..., marker=Chaterm:command:...
-[Mingyu-plugin] write: Stack trace:...
-[Mingyu-plugin] write: Writing data="lscpu | grep..." to stream
-```
+
+在 AI Chat 中，当 AI 正在响应时，点击中断任务按钮（stop 图标）无法正常中断任务，而是提示"发送内容为空，请输入内容"。
 
 ## 问题分析
 
-### 调用流程
-1. UI调用`sendMarkedData`或`sendData` → `writeToShell` → IPC `ssh:shell:write`
-2. `sshHandle.ts:2146`调用`writeBastionSession`
-3. `bastionPlugin.ts`调用`capability.write()`
-4. `mingyu-plugin/index.ts`的`write`函数被调用
+### 调用流程图
+
+```mermaid
+sequenceDiagram
+    participant User as 用户点击停止
+    participant Code as handleSendClick 逻辑
+
+    Note over Code: 错误逻辑（修复前）
+    User->>Code: 点击停止（输入为空）
+    Code->>Code: 检查 isBusy && interruptAndSendIfBusy
+    Code->>Code: 检查 !content && !hasSendableContent()
+    Code->>Code: 输入为空 → return（提示"发送内容为空"）
+    Note over Code: 没有调用 handleInterrupt！
+
+    Note over Code: 正确逻辑（修复后）
+    User->>Code: 点击停止（输入为空）
+    Code->>Code: 检查 responseLoading
+    Code->>Code: responseLoading = true → handleInterrupt()
+    Note over Code: 正确中断！
+```
 
 ### 根本原因
-去重检查只比较`args.data`，但：
-- 第一次调用（无marker）发送 `data="cmd\n"`
-- 第二次调用（有marker）发送 `data="cmd\r"`
 
-因为 `cmd\n !== cmd\r`，去重检查失败，命令被发送两次。
-
-### 执行路径分析
-从日志看：
-- `[mingyu] Checking exec availability, exec=exists, getShellStream=exists` - exec可用
-- `[mingyu] Using direct exec for command execution` - 使用exec执行
-- `[Mingyu-plugin] write: Setting up marker tracking` - write也被调用了
+在 `handleSendClick` 中，当 `responseLoading = true`（AI 正在响应）时，`isBusy` 也为 true。原来的逻辑先检查 `isBusy && interruptAndSendIfBusy`，此时如果输入为空（没有 content 且没有可发送内容），就直接 return 并提示"发送内容为空"，根本没有机会调用 `handleInterrupt` 中断任务。
 
 ## 修复方案
 
-### 核心思路
-修改去重检查的key生成方式，使用命令文本（去除尾随空白字符）作为去重key，而不是完整的data。
-
-### 具体修改
-在 `mingyu-plugin/index.ts` 的 `write` 函数中：
+调整条件顺序，**优先检查 `responseLoading`**，确保 AI 正在响应时无论输入是否为空都先执行中断：
 
 ```typescript
-// 使用命令文本（去除尾随空白）作为去重key
-const commandKey = args.data.replace(/\s+$/, '')
-const lastCommand = mingyuLastCommand.get(args.id)
-const now = Date.now()
-const lastWriteTime = markedCmdLastWriteTime.get(args.id) || 0
-if (lastCommand === commandKey && now - lastWriteTime < 2000) {
-  console.log(`[Mingyu-plugin] write: Deduplicating duplicate command: "${commandKey.substring(0, 50)}..."`)
+// 优先处理 AI 响应中的中断：当 AI 正在响应时，无论输入是否为空都先中断
+if (responseLoading.value) {
+  await props.handleInterrupt()
   return
 }
-markedCmdLastWriteTime.set(args.id, now)
 ```
 
-### 实施步骤
-- [x] 1. 修改 `src/main/ssh/mingyu-plugin/index.ts` 的去重检查逻辑
-- [x] 2. 使用命令文本作为去重key
-- [ ] 3. 测试验证
+## 计划任务
 
-## Review总结
+- [x] 1. 调整 `handleSendClick` 中的条件顺序，优先检查 `responseLoading`
+- [x] 2. 运行测试验证修复
+
+## Review 总结
 
 ### 修改内容
-- 修改了 `src/main/ssh/mingyu-plugin/index.ts` 中的去重检查逻辑
-- 使用 `args.data.replace(/\s+$/, '')` 去除尾随空白后进行比较
-- 确保相同命令（无论是否有\r\n）只被执行一次
+
+修改了 `src/renderer/src/views/components/AiTab/components/InputSendContainer.vue` 的 `handleSendClick` 函数：
+
+1. 将 `responseLoading.value` 检查**提前**到最前面
+2. 添加了 `await` 关键字确保异步操作完成
 
 ### 关键修改位置
-- `src/main/ssh/mingyu-plugin/index.ts` 第226-236行：去重检查逻辑 - 使用 `commandKey` 去除尾随空白
-- `src/main/ssh/mingyu-plugin/index.ts` 第280行：`mingyuLastCommand.set` 使用 `commandKey`
+
+- `src/renderer/src/views/components/AiTab/components/InputSendContainer.vue` 第325-329行
+
+### 为什么这样修复
+
+当 AI 正在响应时（`responseLoading = true`），用户的本意是点击停止按钮中断任务。此时应该**立即**执行中断逻辑，而不是检查输入内容是否为空。原来的逻辑把 `isBusy` 检查放在前面，导致输入为空时直接 return。
+
+### 测试结果
+
+所有 19 个 useCommandInteraction 测试全部通过。
+
+## 相关文件
+
+- `src/renderer/src/views/components/AiTab/composables/useCommandInteraction.ts` - handleCancel 实现
+- `src/renderer/src/views/components/AiTab/components/InputSendContainer.vue` - 按钮调用处

@@ -322,6 +322,12 @@ const hasSendableContent = () => {
 const handleSendClick = async (type: string) => {
   const isBusy = responseLoading.value || props.interactionActive
 
+  // 优先处理 AI 响应中的中断：当 AI 正在响应时，无论输入是否为空都先中断
+  if (responseLoading.value) {
+    await props.handleInterrupt()
+    return
+  }
+
   if (props.mode !== 'edit' && isBusy && props.interruptAndSendIfBusy) {
     const content = extractPlainTextFromParts(inputParts.value).trim()
     if (!content && !hasSendableContent()) {
@@ -332,11 +338,6 @@ const handleSendClick = async (type: string) => {
       return
     }
     await props.interruptAndSendIfBusy(type)
-    return
-  }
-
-  if (responseLoading.value) {
-    props.handleInterrupt()
     return
   }
 
