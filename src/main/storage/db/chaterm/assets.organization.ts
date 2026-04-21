@@ -31,7 +31,7 @@ function isPluginBastion(assetType: string): boolean {
 export function connectAssetInfoLogic(db: Database.Database, uuid: string): any {
   try {
     const stmt = db.prepare(`
-        SELECT uuid, asset_ip, asset_type, auth_type, port, username, password, key_chain_id, need_proxy, proxy_name
+        SELECT uuid, asset_ip, asset_type, auth_type, port, username, password, key_chain_id, need_proxy, proxy_name, rdp_extra_args
         FROM t_assets
         WHERE uuid = ?
       `)
@@ -59,6 +59,10 @@ export function connectAssetInfoLogic(db: Database.Database, uuid: string): any 
       }
     } else {
       ;(result as any).host = (result as any).asset_ip
+      // Check if this is an RDP asset
+      if ((result as any).asset_type === 'person-rdp') {
+        sshType = 'rdp'
+      }
     }
 
     if (!result) {
@@ -82,6 +86,15 @@ export function connectAssetInfoLogic(db: Database.Database, uuid: string): any 
     ;(result as any).proxyName = (result as any).proxy_name
     const organizationUuid = (result as any).organization_uuid
     ;(result as any).assetUuid = organizationUuid || (result as any).uuid
+    // Convert rdp_extra_args to extraArgs for RDP connections
+    if ((result as any).asset_type === 'person-rdp' && (result as any).rdp_extra_args) {
+      try {
+        ;(result as any).extraArgs = JSON.parse((result as any).rdp_extra_args)
+      } catch {
+        // If parsing fails, treat as a string and split by whitespace
+        ;(result as any).extraArgs = ((result as any).rdp_extra_args as string).split(/\s+/).filter(Boolean)
+      }
+    }
     return result
   } catch (error) {
     console.error('Chaterm database get asset error:', error)
@@ -112,11 +125,11 @@ export function getUserHostsLogic(db: Database.Database, search: string, limit: 
     `)
     deleteOrphanedStmt.run(...orgTypes)
 
-    // Step 1: Query personal assets (asset_type='person' or switch types)
+    // Step 1: Query personal assets (asset_type='person' or switch types or rdp)
     const personalStmt = db.prepare(`
         SELECT asset_ip as host, uuid, asset_type
         FROM t_assets
-        WHERE asset_ip LIKE ? AND asset_type IN ('person', 'person-switch-cisco', 'person-switch-huawei')
+        WHERE asset_ip LIKE ? AND asset_type IN ('person', 'person-switch-cisco', 'person-switch-huawei', 'person-rdp')
         GROUP BY asset_ip, uuid, asset_type
       `)
     const personalResults = personalStmt.all(searchPattern) || []

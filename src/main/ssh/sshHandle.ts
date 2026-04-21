@@ -51,6 +51,7 @@ import fs from 'fs'
 import { SSHAgentManager } from './ssh-agent/ChatermSSHAgent'
 import { getAlgorithmsByAssetType } from './algorithms'
 import { connectBastionByType, shellBastionSession, resizeBastionSession, writeBastionSession, disconnectBastionSession } from './bastionPlugin'
+import { connectRdp } from './rdp'
 
 // Hybrid buffer strategy configuration
 const FLUSH_CONFIG = {
@@ -754,7 +755,22 @@ export const cleanSftpConnection = (id) => {
 export const registerSSHHandlers = () => {
   // Handle connection
   ipcMain.handle('ssh:connect', async (_event, connectionInfo) => {
-    const { sshType } = connectionInfo
+    const { sshType, asset_type } = connectionInfo
+    console.log('[ssh:connect] Received connection request:', { sshType, asset_type, host: connectionInfo.host })
+
+    // Handle RDP remote desktop connection
+    if (sshType === 'rdp' || asset_type === 'person-rdp') {
+      console.log('[ssh:connect] Routing to RDP handler')
+      const rdpResult = await connectRdp({
+        host: connectionInfo.host,
+        port: connectionInfo.port,
+        username: connectionInfo.username,
+        password: connectionInfo.password,
+        extraArgs: connectionInfo.extraArgs
+      })
+      console.log('[ssh:connect] RDP handler returned:', rdpResult)
+      return { status: 'connected', ...rdpResult }
+    }
 
     if (sshType === 'jumpserver') {
       // Route to JumpServer connection

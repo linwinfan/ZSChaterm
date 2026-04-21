@@ -1498,6 +1498,28 @@ const activeTabId = ref('')
 const currentClickServer = async (item) => {
   if (item.children) return
 
+  // Handle RDP assets directly without creating a tab
+  if (item.asset_type === 'person-rdp') {
+    try {
+      const assetInfo = await window.api.connectAssetInfo({ uuid: item.uuid })
+      if (assetInfo) {
+        const rdpResult = await window.api.connect({
+          host: assetInfo.host || assetInfo.asset_ip,
+          port: assetInfo.port || 3389,
+          username: assetInfo.username || '',
+          password: assetInfo.password || '',
+          sshType: 'rdp',
+          asset_type: 'person-rdp',
+          extraArgs: assetInfo.extraArgs || []
+        })
+        console.log('[RDP] Connection result:', rdpResult)
+      }
+    } catch (error) {
+      console.error('[RDP] Connection failed:', error)
+    }
+    return
+  }
+
   const id_ = uuidv4()
   const newTab = {
     id: id_,

@@ -1,4 +1,4 @@
-// Asset type definition: person (server), organization (jumpserver), organization-* (plugin bastions), person-switch-* (network switches)
+// Asset type definition: person (server), organization (jumpserver), organization-* (plugin bastions), person-switch-* (network switches), person-rdp (RDP)
 // Note: Plugin-based bastions use 'organization-${type}' pattern (e.g., 'organization-qizhi', 'organization-tencent')
 export type AssetType =
   | 'person' // Personal server
@@ -6,6 +6,7 @@ export type AssetType =
   | `organization-${string}` // Plugin-based bastion hosts (dynamic)
   | 'person-switch-cisco'
   | 'person-switch-huawei'
+  | 'person-rdp' // RDP remote desktop
 
 export type BastionAuthPolicy = 'password' | 'keyBased'
 
@@ -88,6 +89,11 @@ export function getSwitchBrand(assetType: string | undefined): 'cisco' | 'huawei
   return null
 }
 
+// Helper function to check if asset type is RDP remote desktop
+export function isRdpAsset(assetType: string | undefined): boolean {
+  return assetType === 'person-rdp'
+}
+
 export interface AssetNode {
   key: string
   title: string
@@ -103,6 +109,7 @@ export interface AssetNode {
   port?: number
   key_chain_id?: number
   organization_id?: string
+  rdp_extra_args?: string
   [key: string]: any
 }
 
@@ -118,6 +125,7 @@ export interface AssetFormData {
   asset_type: AssetType
   needProxy: boolean
   proxyName: string
+  rdpExtraArgs?: string
 }
 
 export interface sshProxyConfig {

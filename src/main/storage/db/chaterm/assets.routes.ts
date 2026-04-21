@@ -208,7 +208,7 @@ export async function getLocalAssetRouteLogic(db: Database, searchType: string, 
 
       for (const group of groups) {
         const assetsStmt = db.prepare(`
-          SELECT label, asset_ip, uuid, group_name, auth_type, port, username, password, key_chain_id, asset_type, favorite, need_proxy, proxy_name
+          SELECT label, asset_ip, uuid, group_name, auth_type, port, username, password, key_chain_id, asset_type, favorite, need_proxy, proxy_name, rdp_extra_args
           FROM t_assets
           WHERE group_name = ?
           ORDER BY created_at
@@ -233,6 +233,7 @@ export async function getLocalAssetRouteLogic(db: Database, searchType: string, 
               password: item.password || '',
               key_chain_id: item.key_chain_id || 0,
               asset_type: item.asset_type || 'person',
+              rdp_extra_args: item.rdp_extra_args || '',
               organizationId: isOrganizationType(item.asset_type) ? item.uuid : 'personal',
               needProxy: item.need_proxy === 1,
               proxyName: item.proxy_name
@@ -250,9 +251,9 @@ export async function getLocalAssetRouteLogic(db: Database, searchType: string, 
     if (assetType === 'person') {
       if (searchType !== 'assetConfig') {
         const favoritesStmt = db.prepare(`
-          SELECT label, asset_ip, uuid, group_name,label,auth_type,port,username,password,key_chain_id,asset_type
+          SELECT label, asset_ip, uuid, group_name, label, auth_type, port, username, password, key_chain_id, asset_type, rdp_extra_args
           FROM t_assets
-          WHERE favorite = 1 AND asset_type IN ('person', 'person-switch-cisco', 'person-switch-huawei')
+          WHERE favorite = 1 AND asset_type IN ('person', 'person-switch-cisco', 'person-switch-huawei', 'person-rdp')
           ORDER BY created_at
         `)
         const favorites = favoritesStmt.all() || []
@@ -275,6 +276,7 @@ export async function getLocalAssetRouteLogic(db: Database, searchType: string, 
               password: item.password || '',
               key_chain_id: item.key_chain_id || 0,
               asset_type: item.asset_type || 'person',
+              rdp_extra_args: item.rdp_extra_args || '',
               organizationId: 'personal',
               needProxy: item.need_proxy === 1,
               proxyName: item.proxy_name
@@ -286,16 +288,16 @@ export async function getLocalAssetRouteLogic(db: Database, searchType: string, 
       const groupsStmt = db.prepare(`
         SELECT DISTINCT group_name
         FROM t_assets
-        WHERE group_name IS NOT NULL AND asset_type IN ('person', 'person-switch-cisco', 'person-switch-huawei')
+        WHERE group_name IS NOT NULL AND asset_type IN ('person', 'person-switch-cisco', 'person-switch-huawei', 'person-rdp')
         ORDER BY group_name
       `)
       const groups = groupsStmt.all() || []
 
       for (const group of groups) {
         const assetsStmt = db.prepare(`
-          SELECT label, asset_ip, uuid, group_name,label,auth_type,port,username,password,key_chain_id,asset_type,favorite
+          SELECT label, asset_ip, uuid, group_name, label, auth_type, port, username, password, key_chain_id, asset_type, favorite, rdp_extra_args
           FROM t_assets
-          WHERE group_name = ? AND asset_type IN ('person', 'person-switch-cisco', 'person-switch-huawei')
+          WHERE group_name = ? AND asset_type IN ('person', 'person-switch-cisco', 'person-switch-huawei', 'person-rdp')
           ORDER BY created_at
         `)
         const assets = assetsStmt.all(group.group_name) || []
@@ -318,6 +320,7 @@ export async function getLocalAssetRouteLogic(db: Database, searchType: string, 
               password: item.password || '',
               key_chain_id: item.key_chain_id || 0,
               asset_type: item.asset_type || 'person',
+              rdp_extra_args: item.rdp_extra_args || '',
               organizationId: 'personal',
               needProxy: item.need_proxy === 1,
               proxyName: item.proxy_name

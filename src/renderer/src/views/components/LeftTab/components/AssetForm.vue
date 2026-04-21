@@ -277,6 +277,17 @@
               </a-select-option>
             </a-select>
           </a-form-item>
+
+          <!-- RDP extra arguments (only shown for RDP assets) -->
+          <a-form-item
+            v-if="formData.asset_type === 'person-rdp'"
+            :label="t('personal.rdpExtraArgs')"
+          >
+            <a-input
+              v-model:value="formData.rdpExtraArgs"
+              :placeholder="t('personal.rdpExtraArgsPlaceholder')"
+            />
+          </a-form-item>
         </div>
       </a-form>
     </div>
@@ -395,7 +406,8 @@ const deviceOptions = computed(() => [
     label: t('personal.deviceServer'),
     children: [
       { value: 'personal', label: t('personal.personalAsset') },
-      { value: 'bastion', label: t('personal.bastionHost') }
+      { value: 'bastion', label: t('personal.bastionHost') },
+      { value: 'rdp', label: t('personal.rdpAsset') }
     ]
   },
   {
@@ -407,7 +419,9 @@ const deviceOptions = computed(() => [
 
 // Initialize deviceTypePath based on initialData
 const initDeviceTypePath = () => {
-  if (props.initialData?.asset_type?.startsWith('person-switch-')) {
+  if (props.initialData?.asset_type === 'person-rdp') {
+    deviceTypePath.value = ['server', 'rdp']
+  } else if (props.initialData?.asset_type?.startsWith('person-switch-')) {
     deviceTypePath.value = ['network', 'switch']
   } else if (isOrganizationAsset(props.initialData?.asset_type)) {
     deviceTypePath.value = ['server', 'bastion']
@@ -440,11 +454,13 @@ const currentBastionSupportsKey = computed(() => {
   return bastionSupportsAuth(bastionType.value, 'keyBased')
 })
 
-// Show auth method selector: for personal assets, switches, or bastions with multiple auth options
+// Show auth method selector: for personal assets, switches, RDP, or bastions with multiple auth options
 const showAuthMethodSelector = computed(() => {
   const assetType = formData.asset_type
   // Personal server or switch - show selector
   if (assetType === 'person' || assetType?.startsWith('person-switch-')) return true
+  // RDP does not show auth method selector (always password-based)
+  if (assetType === 'person-rdp') return false
   // Organization asset - show selector only if both auth methods are supported
   if (isOrganizationAsset(assetType)) {
     return currentBastionSupportsPassword.value && currentBastionSupportsKey.value
@@ -464,6 +480,7 @@ const formData = reactive<AssetFormData>({
   asset_type: 'person',
   needProxy: false,
   proxyName: '',
+  rdpExtraArgs: '',
   ...props.initialData
 })
 
@@ -510,6 +527,11 @@ const handleDeviceTypeChange = (val: string[]) => {
     } else if (val[1] === 'bastion') {
       // Bastion host
       applyBastionType()
+    } else if (val[1] === 'rdp') {
+      // RDP remote desktop
+      formData.asset_type = 'person-rdp'
+      formData.auth_type = 'password'
+      formData.port = 3389
     }
   } else if (val[0] === 'network' && val[1] === 'switch') {
     // Switching to network switch
@@ -699,6 +721,7 @@ watch(
       asset_type: 'person',
       needProxy: false,
       proxyName: '',
+      rdpExtraArgs: '',
       ...newData
     })
     Object.assign(validationErrors, {

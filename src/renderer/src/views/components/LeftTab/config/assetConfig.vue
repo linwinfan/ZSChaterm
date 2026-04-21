@@ -179,7 +179,8 @@ const handleAssetEdit = (asset: AssetNode) => {
     port: asset.port || 22,
     asset_type: asset.asset_type || 'person',
     needProxy: asset.needProxy || false,
-    proxyName: asset.proxyName || ''
+    proxyName: asset.proxyName || '',
+    rdpExtraArgs: asset.rdp_extra_args || ''
   })
 
   getAssetGroup()
@@ -213,7 +214,8 @@ const handleAssetClone = (asset: AssetNode) => {
     port: asset.port || 22,
     asset_type: asset.asset_type || 'person',
     needProxy: asset.needProxy || false,
-    proxyName: asset.proxyName || ''
+    proxyName: asset.proxyName || '',
+    rdpExtraArgs: asset.rdp_extra_args || ''
   })
 
   getAssetGroup()
@@ -483,7 +485,8 @@ const handleExportAssets = () => {
               port: node.port || 22,
               asset_type: node.asset_type || 'person',
               needProxy: node.needProxy || false,
-              proxyName: node.proxyName || ''
+              proxyName: node.proxyName || '',
+              rdp_extra_args: node.rdp_extra_args || ''
             })
           }
         }
@@ -1234,7 +1237,8 @@ const handleCreateAsset = async (data: AssetFormData) => {
       port: data.port,
       asset_type: data.asset_type,
       needProxy: data.needProxy,
-      proxyName: data.proxyName
+      proxyName: data.proxyName,
+      rdp_extra_args: data.rdpExtraArgs || ''
     }
 
     const api = window.api as any
@@ -1279,7 +1283,8 @@ const handleSaveAsset = async (data: AssetFormData) => {
       port: data.port,
       asset_type: data.asset_type,
       needProxy: data.needProxy,
-      proxyName: data.proxyName
+      proxyName: data.proxyName,
+      rdp_extra_args: data.rdpExtraArgs || ''
     }
 
     const api = window.api as any

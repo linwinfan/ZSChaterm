@@ -9,6 +9,7 @@ import { upgradeContentPartsSupport } from './migrations/add-content-parts-suppo
 import { upgradeSkillsSupport } from './migrations/add-skills-support'
 import { upgradeMessageIndexSupport } from './migrations/add-message-index-support'
 import { upgradeBastionCommentSupport } from './migrations/add-bastion-comment-support'
+import { upgradeRdpExtraArgsSupport } from './migrations/add-rdp-extra-args-support'
 import { IndexDBMigrator } from './indexdb-migrator'
 import { getUserDataPath } from '../../config/edition'
 
@@ -315,6 +316,7 @@ async function applyAllMigrations(db: Database.Database): Promise<void> {
   upgradeSkillsSupport(db)
   await upgradeMessageIndexSupport(db)
   await upgradeBastionCommentSupport(db)
+  upgradeRdpExtraArgsSupport(db)
 }
 
 export async function initDatabase(userId?: number): Promise<Database.Database> {
