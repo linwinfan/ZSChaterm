@@ -55,6 +55,9 @@ extraResources:
     to: 'update-notes.json'
   - from: 'keyword-highlight.json'
     to: 'keyword-highlight.json'
+  - from: 'resources/skills/'
+    to: 'skills/'
+    filter: '**/*'
 asarUnpack:
   - resources/**
 icon: resources/icon.ico

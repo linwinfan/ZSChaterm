@@ -1,7 +1,8 @@
 //  Copyright (c) 2025-present, chaterm.ai  All rights reserved.
 //  This source code is licensed under the GPL-3.0
 
-import * as fs from 'fs/promises'
+import fs from 'fs'
+import * as fsPromises from 'fs/promises'
 import * as path from 'path'
 import { app } from 'electron'
 import AdmZip from 'adm-zip'
@@ -91,9 +92,14 @@ export class SkillsManager {
     const directories: SkillDirectory[] = []
 
     // Built-in skills directory (in app resources)
+    // Development: resources/skills (project root)
+    // Production: process.resourcesPath/skills
+    const devResourcesPath = path.join(__dirname, '..', '..', '..', '..', '..', 'resources', SKILLS_DIR_NAME)
     const builtinPath = app.isPackaged
       ? path.join(process.resourcesPath, SKILLS_DIR_NAME)
-      : path.join(__dirname, '../../../../resources', SKILLS_DIR_NAME)
+      : fs.existsSync(devResourcesPath)
+        ? devResourcesPath
+        : path.join(process.cwd(), 'resources', SKILLS_DIR_NAME)
 
     directories.push({
       path: builtinPath,
@@ -146,7 +152,7 @@ export class SkillsManager {
    */
   private async loadSkillsFromDirectory(dirPath: string): Promise<void> {
     try {
-      const entries = await fs.readdir(dirPath, { withFileTypes: true })
+      const entries = await fsPromises.readdir(dirPath, { withFileTypes: true })
 
       for (const entry of entries) {
         if (entry.isDirectory()) {
@@ -191,8 +197,8 @@ export class SkillsManager {
         return { success: false, error: `File not found: ${filePath}` }
       }
 
-      const content = await fs.readFile(filePath, 'utf-8')
-      const stat = await fs.stat(filePath)
+      const content = await fsPromises.readFile(filePath, 'utf-8')
+      const stat = await fsPromises.stat(filePath)
       const directory = path.dirname(filePath)
 
       // Parse frontmatter and content
@@ -235,7 +241,7 @@ export class SkillsManager {
     const resources: SkillResource[] = []
 
     try {
-      const entries = await fs.readdir(directory, { withFileTypes: true })
+      const entries = await fsPromises.readdir(directory, { withFileTypes: true })
 
       for (const entry of entries) {
         // Skip ignored files and directories
@@ -249,7 +255,7 @@ export class SkillsManager {
         }
 
         const filePath = path.join(directory, entry.name)
-        const stat = await fs.stat(filePath)
+        const stat = await fsPromises.stat(filePath)
         const ext = path.extname(entry.name).toLowerCase()
 
         // Determine resource type
@@ -265,7 +271,7 @@ export class SkillsManager {
         // Auto-load content for small text files
         if (stat.size <= MAX_RESOURCE_AUTO_LOAD_SIZE && this.isTextFile(ext)) {
           try {
-            resource.content = await fs.readFile(filePath, 'utf-8')
+            resource.content = await fsPromises.readFile(filePath, 'utf-8')
           } catch {
             // Ignore read errors, content will be undefined
           }
@@ -350,7 +356,7 @@ export class SkillsManager {
 
     // Load content on demand
     try {
-      const content = await fs.readFile(resource.path, 'utf-8')
+      const content = await fsPromises.readFile(resource.path, 'utf-8')
       resource.content = content
       return content
     } catch {
@@ -641,7 +647,7 @@ export class SkillsManager {
     const userSkillsPath = this.getUserSkillsPath()
 
     // Ensure user skills directory exists
-    await fs.mkdir(userSkillsPath, { recursive: true })
+    await fsPromises.mkdir(userSkillsPath, { recursive: true })
 
     // Generate directory name from skill name
     const skillDirName = metadata.name
@@ -649,14 +655,14 @@ export class SkillsManager {
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-|-$/g, '')
     const skillDir = path.join(userSkillsPath, skillDirName)
-    await fs.mkdir(skillDir, { recursive: true })
+    await fsPromises.mkdir(skillDir, { recursive: true })
 
     // Build SKILL.md content
     const skillContent = this.buildSkillFile(metadata, content)
 
     // Write SKILL.md file
     const skillPath = path.join(skillDir, SKILL_FILE_NAME)
-    await fs.writeFile(skillPath, skillContent, 'utf-8')
+    await fsPromises.writeFile(skillPath, skillContent, 'utf-8')
 
     // Reload skills
     await this.loadAllSkills()
@@ -686,7 +692,7 @@ export class SkillsManager {
 
     // Delete skill directory
     const skillDir = path.dirname(skill.path)
-    await fs.rm(skillDir, { recursive: true, force: true })
+    await fsPromises.rm(skillDir, { recursive: true, force: true })
 
     // Remove from memory
     this.skills.delete(name)
@@ -807,15 +813,15 @@ export class SkillsManager {
       }
       // Remove existing directory for overwrite
       console.log(`[SkillsManager] Overwriting existing skill: ${skillName}`)
-      await fs.rm(targetDir, { recursive: true, force: true })
+      await fsPromises.rm(targetDir, { recursive: true, force: true })
     }
 
     // Ensure user skills directory exists
-    await fs.mkdir(userSkillsPath, { recursive: true })
+    await fsPromises.mkdir(userSkillsPath, { recursive: true })
 
     try {
       // Create target directory
-      await fs.mkdir(targetDir, { recursive: true })
+      await fsPromises.mkdir(targetDir, { recursive: true })
 
       // Extract relevant files
       for (const entry of entries) {
@@ -851,11 +857,11 @@ export class SkillsManager {
         const targetParent = path.dirname(targetPath)
 
         // Ensure parent directory exists
-        await fs.mkdir(targetParent, { recursive: true })
+        await fsPromises.mkdir(targetParent, { recursive: true })
 
         // Write file
         const content = entry.getData()
-        await fs.writeFile(targetPath, content)
+        await fsPromises.writeFile(targetPath, content)
         console.log(`[SkillsManager] Extracted: ${relativePath}`)
       }
 
@@ -872,7 +878,7 @@ export class SkillsManager {
 
       // Cleanup on failure
       try {
-        await fs.rm(targetDir, { recursive: true, force: true })
+        await fsPromises.rm(targetDir, { recursive: true, force: true })
       } catch {
         // Ignore cleanup errors
       }
@@ -903,7 +909,7 @@ export class SkillsManager {
    */
   private async directoryExists(dirPath: string): Promise<boolean> {
     try {
-      const stat = await fs.stat(dirPath)
+      const stat = await fsPromises.stat(dirPath)
       return stat.isDirectory()
     } catch {
       return false
@@ -915,7 +921,7 @@ export class SkillsManager {
    */
   private async fileExists(filePath: string): Promise<boolean> {
     try {
-      await fs.access(filePath)
+      await fsPromises.access(filePath)
       return true
     } catch {
       return false

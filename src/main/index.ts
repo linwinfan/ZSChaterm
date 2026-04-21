@@ -1617,11 +1617,17 @@ ipcMain.handle('skills:delete', async (_event, skillId: string) => {
 
 ipcMain.handle('skills:open-folder', async () => {
   try {
+    const { mkdirSync } = await import('fs')
     const skillsPath = path.join(getUserDataPath(), 'skills')
-    await fs.mkdir(skillsPath, { recursive: true })
-    shell.openPath(skillsPath)
+    mkdirSync(skillsPath, { recursive: true })
+
+    // shell.openPath returns Promise on Linux, need to await it
+    const result = await shell.openPath(skillsPath)
+    console.log('[skills:open-folder] Result:', JSON.stringify(result))
+
+    return { success: true, path: skillsPath }
   } catch (error) {
-    console.error('Failed to open skills folder:', error)
+    console.error('[skills:open-folder] Error:', error)
     throw error
   }
 })

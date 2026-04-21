@@ -244,9 +244,11 @@ const reloadSkills = async () => {
 
 const openSkillsFolder = async () => {
   try {
-    await window.api.openSkillsFolder()
+    console.log('[Skills] openSkillsFolder called')
+    const result = await window.api.openSkillsFolder()
+    console.log('[Skills] openSkillsFolder result:', result)
   } catch (error) {
-    console.error('Failed to open skills folder:', error)
+    console.error('[Skills] Failed to open skills folder:', error)
     message.error(t('skills.openFolderError'))
   }
 }
