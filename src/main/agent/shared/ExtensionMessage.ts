@@ -7,6 +7,7 @@
 import { ApiConfiguration } from './api'
 import { AutoApprovalSettings } from './AutoApprovalSettings'
 import { ChatSettings } from './ChatSettings'
+import type { Host } from './WebviewMessage'
 export interface ExtensionMessage {
   type:
     | 'state'
@@ -14,10 +15,11 @@ export interface ExtensionMessage {
     | 'commandGenerationResponse'
     | 'explainCommandResponse'
     | 'todoUpdated'
-    | 'chatTitleGenerated'
+    | 'taskTitleUpdated'
+    | 'taskFavoriteUpdated'
+    | 'taskDeleted'
     | 'mcpServersUpdate'
     | 'notification'
-    | 'taskHistoryUpdated'
 
   text?: string
   state?: ExtensionState
@@ -35,8 +37,9 @@ export interface ExtensionMessage {
   taskId?: string
   changeType?: 'created' | 'updated' | 'completed' | 'progress'
   triggerReason?: 'agent_update' | 'user_request' | 'auto_progress'
-  // For chat title generation
-  chatTitle?: string
+  // For task title/favorite updates
+  title?: string
+  favorite?: boolean
   // For MCP servers update
   mcpServers?: any[]
   // For notifications
@@ -92,6 +95,7 @@ export interface ChatermMessage {
   hostId?: string
   hostName?: string
   colorTag?: string
+  hosts?: Host[]
 }
 
 // Shared host info payload for multi-host display
@@ -139,6 +143,9 @@ export type ChatermSay =
   | 'sshInfo'
   | 'search_result'
   | 'knowledge_summary'
+  | 'skill_summary'
+  | 'skill_activated'
+  | 'context_truncated'
 
 export interface ChatermSayTool {
   tool: 'readFile' | 'listFilesTopLevel' | 'listFilesRecursive' | 'searchFiles'
@@ -173,6 +180,7 @@ export interface ChatermApiReqInfo {
   cacheWrites?: number
   cacheReads?: number
   cost?: number
+  contextWindow?: number
   cancelReason?: ChatermApiReqCancelReason
   streamingFailedMessage?: string
   retryStatus?: {

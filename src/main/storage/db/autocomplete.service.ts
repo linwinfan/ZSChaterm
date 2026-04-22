@@ -1,6 +1,8 @@
 import Database from 'better-sqlite3'
 import { initDatabase, getCurrentUserId } from './connection'
 import { CommandResult, EvictConfig } from './types'
+import { isValidCommand } from './commandValidation'
+const logger = createLogger('db')
 
 export class autoCompleteDatabaseService {
   private static instances: Map<number, autoCompleteDatabaseService> = new Map()
@@ -57,7 +59,7 @@ export class autoCompleteDatabaseService {
     OR has not been used for more than one year
    */
   private async evictCommands(evictType: 'count' | 'time') {
-    console.log(`Starting command eviction by ${evictType}`)
+    logger.info(`Starting command eviction by ${evictType}`)
     this.db.transaction(() => {
       const secondMonthsAgo = Math.floor(Date.now() / 1000) - 60 * 24 * 60 * 60
       const oneYearAgo = Math.floor(Date.now() / 1000) - 365 * 24 * 60 * 60
@@ -88,7 +90,7 @@ export class autoCompleteDatabaseService {
 
       this.db.prepare('UPDATE linux_commands_evict SET evict_current_value = ? WHERE evict_type = ?').run(this.lastEvictTime, 'time')
 
-      console.log(`Evicted ${result.changes} commands. Current count: ${this.commandCount}`)
+      logger.info(`Evicted ${result.changes} commands. Current count: ${this.commandCount}`)
     })()
   }
 
@@ -107,12 +109,12 @@ export class autoCompleteDatabaseService {
     // Check if initialization is already in progress for this user
     const existingPromise = autoCompleteDatabaseService.initializingPromises.get(targetUserId)
     if (existingPromise) {
-      console.log(`Waiting for existing autoComplete initialization for user ${targetUserId}`)
+      logger.info(`Waiting for existing autoComplete initialization for user ${targetUserId}`)
       return existingPromise
     }
 
     // Start new initialization and store the promise
-    console.log(`Creating new autoCompleteDatabaseService instance for user ${targetUserId}`)
+    logger.info(`Creating new autoCompleteDatabaseService instance for user ${targetUserId}`)
     const initPromise = (async () => {
       try {
         const db = await initDatabase(targetUserId)
@@ -131,48 +133,6 @@ export class autoCompleteDatabaseService {
 
   public getUserId(): number {
     return this.userId
-  }
-
-  private isValidCommand(command: string): boolean {
-    // Remove leading/trailing spaces
-    command = command.trim()
-
-    // Empty command
-    if (!command) return false
-
-    // Command length limit (1-255 characters)
-    if (command.length < 1 || command.length > 255) return false
-
-    // Not allowed to start with these special characters, but ./ and ~/ are allowed
-    const invalidStartChars = /^[!@#$%^&*()+=\-[\]{};:'"\\|,<>?`]/
-    if (invalidStartChars.test(command)) return false
-
-    // Special handling for commands starting with .: only ./ is allowed, other cases starting with . are not allowed
-    if (command.startsWith('.') && !command.startsWith('./')) {
-      return false
-    }
-
-    // Not allowed to have three or more consecutive identical characters at the beginning
-    if (/^(.)\1{2,}/.test(command)) return false
-
-    // Not allowed to contain these dangerous character combinations
-    const dangerousPatterns = [
-      /rm\s+-rf\s+\//, // Delete root directory
-      />[>&]?\/dev\/sd[a-z]/, // Write to disk device
-      /mkfs\./, // Format command
-      /dd\s+if=.*of=\/dev\/sd[a-z]/, // DD write to disk
-      /:\(\)\{\s*:\|:&\s*\};:/ // Fork bomb
-    ]
-
-    if (dangerousPatterns.some((pattern) => pattern.test(command))) return false
-
-    // Allow common symbols like pipes, parallel execution, redirection | & > < ; + =
-    // Support URL/scp-like forms by allowing ':' and '@'
-    const validCommandFormat = /^(?:\.\/|~\/|[\p{L}_]|\p{N})[\p{L}\p{N}\s\-./:@|&><;+=_~`"'()[\]{}!#$%*?\\,^]*$/u
-
-    if (!validCommandFormat.test(command)) return false
-
-    return true
   }
 
   queryCommand(command: string, ip: string) {
@@ -226,7 +186,7 @@ export class autoCompleteDatabaseService {
   }
 
   insertCommand(command: string, ip: string) {
-    if (!this.isValidCommand(command)) {
+    if (!isValidCommand(command)) {
       return {}
     }
 

@@ -27,6 +27,7 @@ describe('useMessageOptions', () => {
     isExecutingCommand: false,
     lastStreamMessage: null,
     lastPartialMessage: null,
+    lastStateChatermMessages: null,
     shouldStickToBottom: true,
     isCancelled: false
   }
@@ -319,7 +320,7 @@ describe('useMessageOptions', () => {
 
       await handleOptionSubmit(message)
 
-      expect(consoleSpy).toHaveBeenCalledWith('Failed to send message to main process:', expect.any(Error))
+      expect(consoleSpy).toHaveBeenCalledWith('[ai.messageOptions] Failed to send message to main process', { error: expect.any(Error) })
       consoleSpy.mockRestore()
     })
 

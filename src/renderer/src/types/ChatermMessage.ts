@@ -1,4 +1,4 @@
-import type { ContentPart } from '@shared/WebviewMessage'
+import type { ContentPart, Host } from '@shared/WebviewMessage'
 
 export interface ChatermMessage {
   ts: number
@@ -20,6 +20,7 @@ export interface ChatermMessage {
   hostId?: string
   hostName?: string
   colorTag?: string
+  hosts?: Host[]
 }
 
 export type ChatermAsk =
@@ -60,6 +61,8 @@ export type ChatermSay =
   | 'sshInfo'
   | 'search_result'
   | 'knowledge_summary'
+  | 'skill_summary'
+  | 'context_truncated'
 
 export interface ChatermSayTool {
   tool: 'readFile' | 'listFilesTopLevel' | 'listFilesRecursive' | 'searchFiles'
@@ -94,6 +97,7 @@ export interface ChatermApiReqInfo {
   cacheWrites?: number
   cacheReads?: number
   cost?: number
+  contextWindow?: number
   cancelReason?: ChatermApiReqCancelReason
   streamingFailedMessage?: string
   retryStatus?: {

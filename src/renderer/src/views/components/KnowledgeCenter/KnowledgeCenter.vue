@@ -48,155 +48,175 @@
       </a-dropdown>
     </div>
 
-    <a-dropdown :trigger="['contextmenu']">
+    <a-dropdown
+      :trigger="['contextmenu']"
+      transition-name=""
+    >
       <div
         class="kb-tree-wrapper"
-        :class="{
-          'scrollbar-visible': isTreeScrolling,
-          'has-context-menu': isContextMenuOpen
-        }"
+        :class="{ 'has-context-menu': isContextMenuOpen }"
         @click="handleTreeBlankClick"
-        @scroll="handleTreeScroll"
         @contextmenu="handleWrapperContextMenu"
       >
-        <a-directory-tree
-          v-model:expanded-keys="expandedKeys"
-          v-model:selected-keys="selectedKeys"
-          multiple
-          class="kb-tree"
-          block-node
-          draggable
-          :tree-data="filteredTreeData"
-          @select="onSelect"
-          @drop="onDrop"
+        <div
+          class="kb-tree-scroll"
+          :class="{ 'scrollbar-visible': isTreeScrolling }"
+          @scroll="handleTreeScroll"
+          @drop.capture="handleTreeAreaDrop"
+          @dragover.prevent
         >
-          <template #title="{ dataRef }">
-            <a-dropdown
-              :trigger="['contextmenu']"
-              placement="bottomLeft"
-              @visible-change="
-                (visible) => {
-                  if (visible) {
-                    menuKey = dataRef.key
-                  } else if (menuKey === dataRef.key) {
-                    menuKey = null
+          <a-directory-tree
+            v-model:expanded-keys="expandedKeys"
+            v-model:selected-keys="selectedKeys"
+            multiple
+            class="kb-tree"
+            block-node
+            draggable
+            :tree-data="filteredTreeData"
+            @select="onSelect"
+            @drop="onDrop"
+          >
+            <template #title="{ dataRef }">
+              <a-dropdown
+                :trigger="['contextmenu']"
+                placement="bottomLeft"
+                transition-name=""
+                @visible-change="
+                  (visible) => {
+                    if (visible) {
+                      menuKey = dataRef.key
+                    } else if (menuKey === dataRef.key) {
+                      menuKey = null
+                    }
                   }
-                }
-              "
-            >
-              <div
-                class="kb-tree-title"
-                :class="{ 'context-menu-active': menuKey === dataRef.key }"
-                @contextmenu.stop
+                "
               >
-                <span
-                  v-if="editingKey !== dataRef.key"
-                  class="kb-title-text"
-                  >{{ dataRef.title }}</span
+                <div
+                  class="kb-tree-title"
+                  :class="{ 'context-menu-active': menuKey === dataRef.key }"
+                  @contextmenu.stop="(event) => handleNodeContextMenu(event, dataRef)"
                 >
-                <a-input
-                  v-else
-                  ref="inputRef"
-                  v-model:value="editingName"
-                  size="small"
-                  class="kb-rename-input"
-                  @keydown.enter="confirmRename"
-                  @keydown.esc="cancelRename"
-                  @keydown.stop
-                  @blur="handleBlur"
-                  @contextmenu.stop
-                />
+                  <span
+                    v-if="editingKey !== dataRef.key"
+                    class="kb-title-text"
+                    >{{ dataRef.title }}</span
+                  >
+                  <a-input
+                    v-else
+                    ref="inputRef"
+                    v-model:value="editingName"
+                    size="small"
+                    class="kb-rename-input"
+                    @keydown.enter="confirmRename"
+                    @keydown.esc="cancelRename"
+                    @keydown.stop
+                    @blur="handleBlur"
+                    @contextmenu.stop
+                  />
+                </div>
+                <template #overlay>
+                  <a-menu @click="({ key }) => onContextAction(String(key), dataRef)">
+                    <template v-if="selectedKeys.length > 1 && selectedKeys.includes(dataRef.relPath)">
+                      <a-menu-item
+                        v-if="hasSelectedFile"
+                        key="addToChat"
+                      >
+                        {{ $t('knowledgeCenter.addToChat') }}
+                      </a-menu-item>
+                      <a-menu-item
+                        v-if="hasSelectedFile"
+                        key="copyPath"
+                      >
+                        {{ $t('knowledgeCenter.copyPath') }}
+                      </a-menu-item>
+                      <a-menu-item
+                        key="copy"
+                        class="kb-menu-item-with-shortcut"
+                      >
+                        <span>{{ $t('common.copy') }}</span>
+                        <span class="shortcut-hint">{{ modifierKey }}C</span>
+                      </a-menu-item>
+                      <a-menu-item
+                        key="cut"
+                        class="kb-menu-item-with-shortcut"
+                      >
+                        <span>{{ $t('knowledgeCenter.cut') }}</span>
+                        <span class="shortcut-hint">{{ modifierKey }}X</span>
+                      </a-menu-item>
+                      <a-menu-item key="delete">{{ $t('common.delete') }}</a-menu-item>
+                    </template>
+                    <template v-else>
+                      <a-menu-item
+                        v-if="dataRef.type === 'file'"
+                        key="addToChat"
+                      >
+                        {{ $t('knowledgeCenter.addToChat') }}
+                      </a-menu-item>
+                      <a-menu-item
+                        v-if="dataRef.type === 'dir'"
+                        key="newFile"
+                      >
+                        {{ $t('knowledgeCenter.newFile') }}
+                      </a-menu-item>
+                      <a-menu-item
+                        v-if="dataRef.type === 'dir'"
+                        key="newFolder"
+                      >
+                        {{ $t('knowledgeCenter.newFolder') }}
+                      </a-menu-item>
+                      <a-menu-divider v-if="dataRef.type === 'dir'" />
+                      <a-menu-item key="rename">{{ $t('common.rename') }}</a-menu-item>
+                      <a-menu-item key="delete">{{ $t('common.delete') }}</a-menu-item>
+                      <a-menu-divider />
+                      <a-menu-item
+                        v-if="dataRef.type === 'file'"
+                        key="copyPath"
+                      >
+                        {{ $t('knowledgeCenter.copyPath') }}
+                      </a-menu-item>
+                      <a-menu-item
+                        key="copy"
+                        class="kb-menu-item-with-shortcut"
+                      >
+                        <span>{{ $t('common.copy') }}</span>
+                        <span class="shortcut-hint">{{ modifierKey }}C</span>
+                      </a-menu-item>
+                      <a-menu-item
+                        key="cut"
+                        class="kb-menu-item-with-shortcut"
+                      >
+                        <span>{{ $t('knowledgeCenter.cut') }}</span>
+                        <span class="shortcut-hint">{{ modifierKey }}X</span>
+                      </a-menu-item>
+                      <a-menu-item
+                        v-if="clipboard"
+                        key="paste"
+                        class="kb-menu-item-with-shortcut"
+                      >
+                        <span>{{ $t('common.paste') }}</span>
+                        <span class="shortcut-hint">{{ modifierKey }}V</span>
+                      </a-menu-item>
+                    </template>
+                  </a-menu>
+                </template>
+              </a-dropdown>
+            </template>
+          </a-directory-tree>
+        </div>
               </div>
-              <template #overlay>
-                <a-menu @click="({ key }) => onContextAction(String(key), dataRef)">
-                  <template v-if="selectedKeys.length > 1 && selectedKeys.includes(dataRef.relPath)">
-                    <a-menu-item
-                      v-if="hasSelectedFile"
-                      key="addToChat"
-                    >
-                      Add to Chat
-                    </a-menu-item>
-                    <a-menu-item
-                      key="copy"
-                      class="kb-menu-item-with-shortcut"
-                    >
-                      <span>Copy</span>
-                      <span class="shortcut-hint">{{ modifierKey }}C</span>
-                    </a-menu-item>
-                    <a-menu-item
-                      key="cut"
-                      class="kb-menu-item-with-shortcut"
-                    >
-                      <span>Cut</span>
-                      <span class="shortcut-hint">{{ modifierKey }}X</span>
-                    </a-menu-item>
-                    <a-menu-item key="delete">Delete</a-menu-item>
-                  </template>
-                  <template v-else>
-                    <a-menu-item
-                      v-if="dataRef.type === 'file'"
-                      key="addToChat"
-                    >
-                      Add to Chat
-                    </a-menu-item>
-                    <a-menu-item
-                      v-if="dataRef.type === 'dir'"
-                      key="newFile"
-                    >
-                      New File
-                    </a-menu-item>
-                    <a-menu-item
-                      v-if="dataRef.type === 'dir'"
-                      key="newFolder"
-                    >
-                      New Folder
-                    </a-menu-item>
-                    <a-menu-divider v-if="dataRef.type === 'dir'" />
-                    <a-menu-item key="rename">Rename</a-menu-item>
-                    <a-menu-item key="delete">Delete</a-menu-item>
-                    <a-menu-divider />
-                    <a-menu-item
-                      key="copy"
-                      class="kb-menu-item-with-shortcut"
-                    >
-                      <span>Copy</span>
-                      <span class="shortcut-hint">{{ modifierKey }}C</span>
-                    </a-menu-item>
-                    <a-menu-item
-                      key="cut"
-                      class="kb-menu-item-with-shortcut"
-                    >
-                      <span>Cut</span>
-                      <span class="shortcut-hint">{{ modifierKey }}X</span>
-                    </a-menu-item>
-                    <a-menu-item
-                      v-if="clipboard"
-                      key="paste"
-                      class="kb-menu-item-with-shortcut"
-                    >
-                      <span>Paste</span>
-                      <span class="shortcut-hint">{{ modifierKey }}V</span>
-                    </a-menu-item>
-                  </template>
-                </a-menu>
-              </template>
-            </a-dropdown>
-          </template>
-        </a-directory-tree>
-      </div>
       <template #overlay>
         <a-menu @click="({ key }) => onBlankContextAction(String(key))">
-          <a-menu-item key="newFile">New File</a-menu-item>
-          <a-menu-item key="newFolder">New Folder</a-menu-item>
+          <a-menu-item key="newFile">{{ $t('knowledgeCenter.newFile') }}</a-menu-item>
+          <a-menu-item key="newFolder">{{ $t('knowledgeCenter.newFolder') }}</a-menu-item>
           <a-menu-item
             key="paste"
             :disabled="!clipboard"
             class="kb-menu-item-with-shortcut"
           >
-            <span>Paste</span>
+            <span>{{ $t('common.paste') }}</span>
             <span class="shortcut-hint">{{ modifierKey }}V</span>
           </a-menu-item>
-          <a-menu-item key="refresh">Refresh</a-menu-item>
+          <a-menu-item key="refresh">{{ $t('knowledgeCenter.refresh') }}</a-menu-item>
         </a-menu>
       </template>
     </a-dropdown>
@@ -222,10 +242,20 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { message, Modal } from 'ant-design-vue'
 import eventBus from '@/utils/eventBus'
-import { CloudUploadOutlined, FileAddOutlined, FolderAddOutlined, PlusOutlined, RedoOutlined, SearchOutlined } from '@ant-design/icons-vue'
-import { getModifierSymbol, isShortcutEvent } from './utils/kbShortcuts'
+import { getUser } from '@/api/user/user'
+import {
+  CloudOutlined,
+  CloudUploadOutlined,
+  FileAddOutlined,
+  FolderAddOutlined,
+  PlusOutlined,
+  RedoOutlined,
+  SearchOutlined
+} from '@ant-design/icons-vue'
+import { getModifierSymbol, hasPreviewTextSelection, isShortcutEvent } from './utils/kbShortcuts'
 import { getImageMediaType, isImageFile } from '../AiTab/utils'
 
 type KbNodeType = 'file' | 'dir'
@@ -238,7 +268,30 @@ type TreeNode = {
   children?: TreeNode[]
 }
 
+const { t } = useI18n()
 const api = window.api
+
+const isDeletingCount = ref(0)
+
+async function loadUserSubscription(): Promise<void> {
+  if (localStorage.getItem('login-skipped') === 'true') {
+    subscription.value = undefined
+    return
+  }
+  try {
+    const res: any = await getUser({})
+    subscription.value = typeof res?.data?.subscription === 'string' ? res.data.subscription : undefined
+  } catch {
+    subscription.value = undefined
+  }
+}
+
+function importErrorMessage(err: unknown, forFolder: boolean): string {
+  const msg = err instanceof Error ? err.message : String(err)
+  if (msg.includes('File type not allowed')) return t('knowledgeCenter.importErrorFileTypeNotAllowed')
+  if (msg.includes('File too large')) return t('knowledgeCenter.importErrorFileTooLarge')
+  return forFolder ? t('knowledgeCenter.importErrorFolderFailed') : t('knowledgeCenter.importErrorFileFailed')
+}
 
 const expandedKeys = ref<string[]>([])
 const selectedKeys = ref<string[]>([])
@@ -434,6 +487,23 @@ const onSelect = async (keys: string[], info: TreeSelectInfo) => {
   }
 }
 
+const handleNodeContextMenu = (event: MouseEvent, node: TreeNode) => {
+  event.preventDefault()
+  const next = computeContextSelection(selectedKeys.value, node.relPath)
+  if (next !== selectedKeys.value) {
+    selectedKeys.value = next
+  }
+}
+
+function computeContextSelection(current: string[], target: string): string[] {
+  if (!target) return current
+  const isSelected = current.includes(target)
+  if (current.length <= 1) {
+    return isSelected ? current : [target]
+  }
+  return isSelected ? current : [target]
+}
+
 const handleTreeBlankClick = (event: MouseEvent) => {
   const target = event.target as HTMLElement | null
   if (!target) return
@@ -550,11 +620,13 @@ async function confirmRename() {
   }
 
   try {
-    await api.kbRename(key, newName)
+    const res = await api.kbRename(key, newName)
     editingKey.value = null
     editingName.value = ''
     editingOriginalName.value = ''
     await refreshDir(getDirOf(key))
+    // Notify tab system to update title and relPath
+    eventBus.emit('kbFileRenamed', { oldRelPath: key, newRelPath: res.relPath, newName })
   } catch (e: unknown) {
     const error = e as Error
     message.error(error?.message || String(e))
@@ -585,6 +657,7 @@ async function removeNode(node: TreeNode) {
     content: node.type === 'dir' ? 'Delete folder and its contents?' : 'Delete file?',
     okType: 'danger',
     onOk: async () => {
+      isDeletingCount.value += 1
       try {
         await api.kbDelete(node.relPath, node.type === 'dir')
         await refreshDir(getDirOf(node.relPath))
@@ -592,6 +665,9 @@ async function removeNode(node: TreeNode) {
       } catch (e: unknown) {
         const error = e as Error
         message.error(error?.message || String(e))
+      } finally {
+        isDeletingCount.value -= 1
+        void loadCloudStorage()
       }
     }
   })
@@ -804,6 +880,8 @@ function handleKeyDown(e: KeyboardEvent) {
   }
 
   if (isShortcutEvent(e, 'copy')) {
+    // Keep browser-native copy when user selects text in markdown preview.
+    if (hasPreviewTextSelection()) return
     handleCopy()
     e.preventDefault()
   } else if (isShortcutEvent(e, 'cut')) {
@@ -864,6 +942,18 @@ async function onContextAction(action: string, node: TreeNode) {
     case 'rename':
       await startRename(node)
       return
+    case 'copyPath': {
+      const fileTargets = targets.filter((target) => treeNodeType(target) === 'file')
+      if (fileTargets.length === 0) return
+      const content = fileTargets.join('\n')
+      try {
+        await navigator.clipboard.writeText(content)
+      } catch (e: unknown) {
+        const error = e as Error
+        message.error(error?.message || String(e))
+      }
+      return
+    }
     case 'delete':
       if (!isBatch) {
         await removeNode(node)
@@ -874,6 +964,7 @@ async function onContextAction(action: string, node: TreeNode) {
         content: `Delete ${targets.length} items?`,
         okType: 'danger',
         onOk: async () => {
+          isDeletingCount.value += 1
           try {
             // Delete deeper paths first to reduce parent/child conflicts
             const sortedTargets = targets.slice().sort((a, b) => b.split('/').filter(Boolean).length - a.split('/').filter(Boolean).length)
@@ -894,6 +985,9 @@ async function onContextAction(action: string, node: TreeNode) {
           } catch (e: unknown) {
             const error = e as Error
             message.error(error?.message || String(e))
+          } finally {
+            isDeletingCount.value -= 1
+            void loadCloudStorage()
           }
         }
       })
@@ -966,6 +1060,8 @@ const importJobList = computed(() => {
   }))
 })
 
+const isSyncing = computed(() => Object.keys(importJobs).length > 0 || isDeletingCount.value > 0)
+
 const unsubscribeProgress = ref<(() => void) | null>(null)
 
 async function importOneFile(srcAbsPath: string, dstRelDir: string) {
@@ -975,8 +1071,7 @@ async function importOneFile(srcAbsPath: string, dstRelDir: string) {
     await refreshDir(dstRelDir)
     openFileInMainPane(res.relPath)
   } catch (e: unknown) {
-    const error = e as Error
-    message.error(`Failed to import file: ${error?.message || String(e)}`)
+    message.error(importErrorMessage(e, false))
   }
 }
 async function importOneFolder(srcAbsPath: string, dstRelDir: string) {
@@ -985,8 +1080,7 @@ async function importOneFolder(srcAbsPath: string, dstRelDir: string) {
     importJobs[res.jobId] = { jobId: res.jobId, destRelPath: res.relPath, transferred: 0, total: 0 }
     await refreshDir(dstRelDir)
   } catch (e: unknown) {
-    const error = e as Error
-    message.error(`Failed to import folder: ${error?.message || String(e)}`)
+    message.error(importErrorMessage(e, true))
   }
 }
 
@@ -996,15 +1090,7 @@ async function pickAndImport() {
   const dstRelDir = t === 'dir' ? target : getDirOf(target)
 
   const result = await api.showOpenDialog({
-    properties: ['openFile', 'openDirectory', 'multiSelections'],
-    filters: [
-      {
-        name: 'All Supported',
-        extensions: ['txt', 'md', 'markdown', 'json', 'yaml', 'yml', 'log', 'csv', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg']
-      },
-      { name: 'Text', extensions: ['txt', 'md', 'markdown', 'json', 'yaml', 'yml', 'log', 'csv'] },
-      { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'] }
-    ]
+    properties: ['openFile', 'openDirectory', 'multiSelections']
   })
   if (result?.canceled) return
   const filePaths: string[] = result?.filePaths || []
@@ -1036,6 +1122,16 @@ function handleMenuClick({ key }: { key: string }) {
   }
 }
 
+function handleTreeAreaDrop(e: DragEvent) {
+  // Only intercept external file drops (from OS file manager),
+  // let internal tree node drags pass through to onDrop handler
+  if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+    e.stopPropagation()
+    e.preventDefault()
+    handleDropImport(e)
+  }
+}
+
 async function handleDropImport(e: DragEvent) {
   const files = e.dataTransfer?.files
   if (!files || files.length === 0) return
@@ -1043,7 +1139,7 @@ async function handleDropImport(e: DragEvent) {
   const t = treeNodeType(target)
   const dstRelDir = t === 'dir' ? target : getDirOf(target)
   for (const f of Array.from(files)) {
-    const p = (f as File & { path: string }).path
+    const p = api.getPathForFile(f) as string | undefined
     if (p) {
       const pathInfo = await api.kbCheckPath(p)
       if (pathInfo.isDirectory) {
@@ -1058,6 +1154,8 @@ async function handleDropImport(e: DragEvent) {
 onMounted(async () => {
   await api.kbEnsureRoot()
   await refreshDir('')
+  await loadCloudStorage()
+  await loadUserSubscription()
   eventBus.on('kbActiveFileChanged', handleActiveKbTab)
   eventBus.on('kbRefresh', handleRefresh)
   eventBus.on('kbRefreshAndOpen', handleRefreshAndOpen)
@@ -1068,6 +1166,7 @@ onMounted(async () => {
       importJobs[data.jobId] = { jobId: data.jobId, destRelPath: data.destRelPath, transferred: data.transferred, total: data.total }
       if (data.total === 0) {
         window.setTimeout(() => {
+          void loadCloudStorage()
           delete importJobs[data.jobId]
         }, 1500)
       }
@@ -1077,6 +1176,7 @@ onMounted(async () => {
     job.total = data.total
     if (data.total > 0 && data.transferred >= data.total) {
       window.setTimeout(() => {
+        void loadCloudStorage()
         delete importJobs[data.jobId]
       }, 1500)
     }
@@ -1183,10 +1283,17 @@ onBeforeUnmount(() => {
 
 .kb-tree-wrapper {
   flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin-top: 4px;
+}
+
+.kb-tree-scroll {
+  flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  margin-top: 4px;
-  padding-bottom: 25px;
+  padding-bottom: 8px;
 
   /* Scrollbar styles - align with Workspace */
   &::-webkit-scrollbar {
@@ -1219,6 +1326,74 @@ onBeforeUnmount(() => {
   &.scrollbar-visible {
     scrollbar-color: var(--border-color-light) transparent;
   }
+}
+
+.kb-capacity-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  margin: 0 8px 8px;
+  background: var(--hover-bg-color, rgba(0, 0, 0, 0.04));
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.kb-capacity-icon {
+  color: var(--text-color-secondary);
+  font-size: 18px;
+  margin-top: 2px;
+}
+
+@keyframes kb-cloud-sync {
+  0%,
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  50% {
+    transform: translateY(-3px);
+    opacity: 0.7;
+  }
+}
+
+.kb-capacity-icon-syncing {
+  animation: kb-cloud-sync 1.2s ease-in-out infinite;
+  color: @kb-primary-color;
+}
+
+.kb-capacity-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.kb-capacity-label {
+  font-size: 12px;
+  color: var(--text-color);
+  font-weight: 500;
+}
+
+.kb-capacity-value {
+  font-size: 12px;
+  color: var(--text-color-secondary);
+  margin-top: 2px;
+}
+
+.kb-capacity-detail-link {
+  font-size: 12px;
+  color: var(--kb-primary-color);
+  flex-shrink: 0;
+  &:hover {
+    color: var(--kb-primary-color);
+    opacity: 0.85;
+  }
+}
+
+.kb-capacity-total {
+  margin-top: 12px;
+  text-align: right;
+  font-size: 13px;
+  color: var(--text-color);
 }
 
 .kb-tree {
@@ -1370,5 +1545,48 @@ onBeforeUnmount(() => {
     font-size: 12px;
     flex-shrink: 0;
   }
+}
+</style>
+
+<style>
+/* AntD modal/table are teleported to body; keep this non-scoped. */
+.kb-capacity-detail-modal .ant-modal-content,
+.kb-capacity-detail-modal .ant-modal-header,
+.kb-capacity-detail-modal .ant-modal-body {
+  background-color: var(--bg-color-secondary) !important;
+  color: var(--text-color) !important;
+}
+
+.kb-capacity-detail-modal .ant-modal-header {
+  border-bottom: 1px solid var(--border-color-light) !important;
+}
+
+.kb-capacity-detail-modal .ant-modal-title,
+.kb-capacity-detail-modal .ant-modal-close,
+.kb-capacity-detail-modal .ant-modal-close-x {
+  color: var(--text-color) !important;
+}
+
+.kb-capacity-detail-modal .ant-table,
+.kb-capacity-detail-modal .ant-table-container,
+.kb-capacity-detail-modal .ant-table-content {
+  background: transparent !important;
+  color: var(--text-color) !important;
+}
+
+.kb-capacity-detail-modal .ant-table-thead > tr > th {
+  background-color: var(--bg-color-tertiary) !important;
+  color: var(--text-color) !important;
+  border-bottom: 1px solid var(--border-color-light) !important;
+}
+
+.kb-capacity-detail-modal .ant-table-tbody > tr > td {
+  background-color: transparent !important;
+  color: var(--text-color-secondary) !important;
+  border-bottom: 1px solid var(--border-color-light) !important;
+}
+
+.kb-capacity-detail-modal .ant-table-tbody > tr:hover > td {
+  background-color: var(--hover-bg-color) !important;
 }
 </style>

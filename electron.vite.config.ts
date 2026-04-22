@@ -53,7 +53,6 @@ const loadEditionConfig = (edition: Edition): EditionConfig => {
     const content = readFileSync(configPath, 'utf-8')
     return JSON.parse(content) as EditionConfig
   } catch (error) {
-    console.error(`Failed to load edition config from ${configPath}:`, error)
     throw new Error(`Edition config not found for: ${edition}`)
   }
 }
@@ -88,11 +87,23 @@ export default defineConfig(({ mode }) => {
   // Use environment variable if available, otherwise use edition config
   const proxyTarget = env.RENDERER_VUE_APP_API_BASEURL || editionConfig.api.baseUrl
 
+  // Sourcemap: enabled in dev, disabled in production by default (use ENABLE_SOURCEMAP=true to override)
+  const isDev = resolvedMode.startsWith('development')
+  const enableSourcemap = isDev || process.env.ENABLE_SOURCEMAP === 'true'
+
   return {
     main: {
       plugins: [
         externalizeDepsPlugin({
           exclude: ['p-wait-for', 'chrome-launcher', 'globby', 'execa', 'p-timeout', 'get-folder-size', 'serialize-error', 'os-name']
+        }),
+        AutoImport({
+          imports: [
+            {
+              '@logging/index': ['createLogger']
+            }
+          ],
+          dts: resolve('src/main/auto-imports.d.ts')
         })
       ],
       resolve: {
@@ -102,15 +113,24 @@ export default defineConfig(({ mode }) => {
           '@services': resolve('src/main/agent/services'),
           '@integrations': resolve('src/main/agent/integrations'),
           '@utils': resolve('src/main/agent/utils'),
-          '@api': resolve('src/main/agent/api')
+          '@api': resolve('src/main/agent/api'),
+          '@logging': resolve('src/main/services/logging'),
+          '@perf': resolve('src/main/services/perf')
         }
       },
       define: {
-        'process.env.APP_EDITION': JSON.stringify(edition)
+        'process.env.APP_EDITION': JSON.stringify(edition),
+        'process.env.LOG_LEVEL': JSON.stringify(resolvedMode.startsWith('development') ? 'debug' : 'info')
       },
       build: {
-        sourcemap: true,
+        sourcemap: enableSourcemap,
         rollupOptions: {
+          onwarn(warning, defaultHandler) {
+            if (warning.message?.includes('dynamically imported by') && warning.message?.includes('but also statically imported by')) {
+              return
+            }
+            defaultHandler(warning)
+          },
           external: [
             // Force externalize native modules to prevent bundling issues
             'chokidar',
@@ -122,7 +142,7 @@ export default defineConfig(({ mode }) => {
     preload: {
       plugins: [externalizeDepsPlugin()],
       build: {
-        sourcemap: true
+        sourcemap: enableSourcemap
       }
     },
     renderer: {
@@ -163,7 +183,17 @@ export default defineConfig(({ mode }) => {
         ]
       },
       build: {
-        sourcemap: true
+        sourcemap: enableSourcemap,
+        reportCompressedSize: false,
+        chunkSizeWarningLimit: 5000,
+        rollupOptions: {
+          onwarn(warning, defaultHandler) {
+            if (warning.message?.includes('dynamically imported by') && warning.message?.includes('but also statically imported by')) {
+              return
+            }
+            defaultHandler(warning)
+          }
+        }
       },
       plugins: [
         vue(),
@@ -175,6 +205,12 @@ export default defineConfig(({ mode }) => {
           ]
         }),
         AutoImport({
+          imports: [
+            {
+              '@/utils/logger': ['createRendererLogger']
+            }
+          ],
+          dts: resolve('src/renderer/auto-imports.d.ts'),
           resolvers: [AntDesignVueResolver()]
         })
       ],

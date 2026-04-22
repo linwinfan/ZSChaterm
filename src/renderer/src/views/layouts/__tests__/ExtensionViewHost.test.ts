@@ -25,6 +25,11 @@ vi.mock('@/utils/eventBus', () => ({
   }
 }))
 
+// Stub Ant Design Vue components not auto-resolved in test env
+const defaultMountOptions = {
+  global: { stubs: { 'a-empty': true } }
+}
+
 describe('ExtensionViewHost.vue', () => {
   let wrapper: VueWrapper<any>
 
@@ -46,6 +51,7 @@ describe('ExtensionViewHost.vue', () => {
 
   it('When mounting a component, metadata should be obtained and tree nodes should be loaded', async () => {
     wrapper = mount(ExtensionViewHost, {
+      ...defaultMountOptions,
       props: { viewId: 'testView' }
     })
 
@@ -59,24 +65,24 @@ describe('ExtensionViewHost.vue', () => {
   })
 
   it('When entering information into the search box, tree nodes should be filtered correctly', async () => {
+    mockApi.getTreeNodes.mockResolvedValue([
+      { title: 'Apple', key: '1', isLeaf: true },
+      { title: 'Banana', key: '2', isLeaf: true }
+    ])
+
     wrapper = mount(ExtensionViewHost, {
+      ...defaultMountOptions,
       props: { viewId: 'testView' }
     })
 
-    wrapper.vm.treeData = [
-      { title: 'Apple', key: '1', isLeaf: true },
-      { title: 'Banana', key: '2', isLeaf: true }
-    ]
+    await nextTick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    wrapper.vm.searchValue = 'App'
     await nextTick()
 
-    const input = wrapper.find('.ant-input')
-    if (input.exists()) {
-      await input.setValue('App')
-    } else {
-      wrapper.vm.searchValue = 'App'
-    }
-
     expect(wrapper.vm.filteredTreeData).toHaveLength(1)
+    expect(wrapper.vm.filteredTreeData[0].title).toBe('Apple')
   })
 
   it('Clicking a leaf node should trigger handleNodeClick and execute the command', async () => {
@@ -84,6 +90,7 @@ describe('ExtensionViewHost.vue', () => {
     mockApi.getTreeNodes.mockResolvedValue([nodeData])
 
     wrapper = mount(ExtensionViewHost, {
+      ...defaultMountOptions,
       props: { viewId: 'testView' }
     })
     await nextTick()
@@ -97,6 +104,7 @@ describe('ExtensionViewHost.vue', () => {
   it('Clicking on a non-leaf node should toggle its expanded/collapsed state', async () => {
     const folderData = { title: 'Folder', key: 'f1', isLeaf: false }
     wrapper = mount(ExtensionViewHost, {
+      ...defaultMountOptions,
       props: { viewId: 'testView' }
     })
 
@@ -117,7 +125,7 @@ describe('ExtensionViewHost.vue', () => {
       }
     })
 
-    wrapper = mount(ExtensionViewHost, { props: { viewId: 'test' } })
+    wrapper = mount(ExtensionViewHost, { ...defaultMountOptions, props: { viewId: 'test' } })
 
     await nextTick()
     await new Promise((resolve) => setTimeout(resolve, 50))
@@ -147,6 +155,7 @@ describe('ExtensionViewHost.vue', () => {
   it('The listener should be removed during uninstallation', () => {
     const removeSpy = vi.spyOn(window, 'removeEventListener')
     wrapper = mount(ExtensionViewHost, {
+      ...defaultMountOptions,
       props: { viewId: 'testView' }
     })
 

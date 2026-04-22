@@ -95,13 +95,25 @@
             </template>
             <div
               class="command-explain-content markdown-content"
-              v-html="marked(props.explanation, null)"
+              v-html="sanitizeHtml(marked(props.explanation, null))"
             />
           </a-collapse-panel>
         </a-collapse>
       </div>
     </div>
     <div v-else>
+      <!-- Skill activation notification -->
+      <div
+        v-if="props.say === 'skill_activated'"
+        class="skill-activated-notice"
+      >
+        <img
+          :src="skillsIconSvg"
+          alt=""
+          class="skill-activated-icon"
+        />
+        <span class="skill-activated-text">Activated Skill: {{ props.content }}</span>
+      </div>
       <!-- Code content of command_output uses markdown rendering -->
       <div
         v-if="props.say === 'command_output' && codeDetection.isCode"
@@ -144,7 +156,7 @@
         <div
           v-show="isCodeExpanded"
           class="code-content-body"
-          v-html="marked('```' + (codeDetection.language || '') + '\n' + props.content + '\n```')"
+          v-html="sanitizeHtml(marked('```' + (codeDetection.language || '') + '\n' + props.content + '\n```'))"
         ></div>
       </div>
       <TerminalOutputRenderer
@@ -203,7 +215,7 @@
             <span
               v-if="line.html"
               class="content"
-              v-html="line.html"
+              v-html="sanitizeHtml(line.html)"
             ></span>
             <span
               v-else
@@ -222,7 +234,7 @@
         >
           <div
             class="thinking-content markdown-content"
-            v-html="marked(getThinkingContent(thinkingContent), null)"
+            v-html="sanitizeHtml(marked(getThinkingContent(thinkingContent), null))"
           ></div>
         </div>
         <a-collapse
@@ -258,79 +270,105 @@
             </template>
             <div
               class="thinking-content markdown-content"
-              v-html="marked(getThinkingContent(thinkingContent), null)"
+              v-html="sanitizeHtml(marked(getThinkingContent(thinkingContent), null))"
             ></div>
           </a-collapse-panel>
         </a-collapse>
       </template>
 
-      <div v-else-if="normalContent || codeBlocks.length > 0">
-        <template
-          v-for="(part, index) in contentParts"
-          :key="index"
-        >
+      <div v-if="(normalContent || codeBlocks.length > 0 || kbSearchResults) && props.say !== 'skill_activated'">
+        <template v-if="kbSearchResults">
           <div
-            v-if="part.type === 'text'"
             class="markdown-content"
             :class="{ 'ssh-info-message': props.say === 'sshInfo' }"
             style="margin: 0 8px"
-            v-html="marked(part.content || '', null)"
-          ></div>
-          <div
-            v-else-if="part.type === 'code'"
-            class="command-editor-container"
           >
-            <a-collapse
-              :active-key="part.block.lines < 10 ? ['1'] : part.block.activeKey"
-              :default-active-key="['1']"
-              :class="{ 'collapse-expand-icon-hidden': part.block.lines < 10 }"
-              class="code-collapse"
-              expand-icon-position="start"
-              @update:active-key="
-                (keys) => {
-                  if (part.block.lines >= 10) part.block.activeKey = keys
-                }
-              "
-            >
-              <a-collapse-panel
-                key="1"
-                class="code-panel"
-              >
-                <template #header>
-                  <a-space @click.stop>
-                    <a-typography-text
-                      type="secondary"
-                      italic
-                    >
-                      {{ t('ai.codePreview', { lines: part.block.lines }) }}
-                    </a-typography-text>
-                    <a-button
-                      class="copy-button"
-                      type="text"
-                      size="small"
-                      @click.stop="part.blockIndex !== undefined && copyBlockContent(part.blockIndex)"
-                    >
-                      <img
-                        :src="copySvg"
-                        alt="copy"
-                        class="copy-icon"
-                      />
-                    </a-button>
-                  </a-space>
-                </template>
-                <div
-                  :ref="
-                    (el) => {
-                      if (el && typeof part.blockIndex === 'number') {
-                        codeEditors[part.blockIndex] = el as HTMLElement
-                      }
-                    }
-                  "
-                  class="monaco-container"
-                />
-              </a-collapse-panel>
-            </a-collapse>
+            {{ kbSearchResults.title }}
           </div>
+          <div
+            v-for="item in kbSearchResults.items"
+            :key="`${item.relPath}:${item.startLine}-${item.endLine}`"
+            class="markdown-content"
+            :class="{ 'ssh-info-message': props.say === 'sshInfo' }"
+            style="margin: 0 8px"
+          >
+            <button
+              type="button"
+              class="kb-search-result-link"
+              @click="openKbSearchResult(item)"
+            >
+              {{ item.displayText }}
+            </button>
+          </div>
+        </template>
+        <template v-else>
+          <template
+            v-for="(part, index) in contentParts"
+            :key="index"
+          >
+            <div
+              v-if="part.type === 'text'"
+              class="markdown-content"
+              :class="{ 'ssh-info-message': props.say === 'sshInfo' }"
+              style="margin: 0 8px"
+              v-html="sanitizeHtml(marked(part.content || '', null))"
+            ></div>
+            <div
+              v-else-if="part.type === 'code'"
+              class="command-editor-container"
+            >
+              <a-collapse
+                :active-key="part.block.lines < 10 ? ['1'] : part.block.activeKey"
+                :default-active-key="['1']"
+                :class="{ 'collapse-expand-icon-hidden': part.block.lines < 10 }"
+                class="code-collapse"
+                expand-icon-position="start"
+                @update:active-key="
+                  (keys) => {
+                    if (part.block.lines >= 10) part.block.activeKey = keys
+                  }
+                "
+              >
+                <a-collapse-panel
+                  key="1"
+                  class="code-panel"
+                >
+                  <template #header>
+                    <a-space @click.stop>
+                      <a-typography-text
+                        type="secondary"
+                        italic
+                      >
+                        {{ t('ai.codePreview', { lines: part.block.lines }) }}
+                      </a-typography-text>
+                      <a-button
+                        class="copy-button"
+                        type="text"
+                        size="small"
+                        @click.stop="part.blockIndex !== undefined && copyBlockContent(part.blockIndex)"
+                      >
+                        <img
+                          :src="copySvg"
+                          alt="copy"
+                          class="copy-icon"
+                        />
+                      </a-button>
+                    </a-space>
+                  </template>
+                  <div
+                    :ref="
+                      (el) => {
+                        if (el && typeof part.blockIndex === 'number') {
+                          codeEditors[part.blockIndex] = el as HTMLElement
+                        }
+                      }
+                    "
+                    class="monaco-container"
+                  />
+                </a-collapse-panel>
+              </a-collapse>
+            </div>
+          </template>
         </template>
       </div>
     </div>
@@ -340,6 +378,7 @@
 <script setup lang="ts">
 import { onMounted, ref, watch, onBeforeUnmount, nextTick, computed, h } from 'vue'
 import { marked } from 'marked'
+import { sanitizeHtml } from '@/utils/sanitize'
 import 'highlight.js/styles/atom-one-dark.css'
 import * as monaco from 'monaco-editor'
 import 'monaco-editor/esm/vs/editor/editor.all.js'
@@ -358,12 +397,17 @@ import 'monaco-editor/esm/vs/basic-languages/sql/sql.contribution'
 import { LoadingOutlined, CaretDownOutlined, CaretRightOutlined, CodeOutlined, QuestionCircleOutlined } from '@ant-design/icons-vue'
 import thinkingSvg from '@/assets/icons/thinking.svg'
 import copySvg from '@/assets/icons/copy.svg'
+import skillsIconSvg from '@/assets/icons/skills.svg'
 import { message } from 'ant-design-vue'
 import i18n from '@/locales'
 import { extractFinalOutput, cleanAnsiEscapeSequences } from '@/utils/terminalOutputExtractor'
 import { userConfigStore as userConfigStoreService } from '@/services/userConfigStoreService'
 import { getCustomTheme, isDarkTheme } from '@/utils/themeUtils'
+import eventBus from '@/utils/eventBus'
+import type { ContentPart, ContextDocRef } from '@shared/WebviewMessage'
 import TerminalOutputRenderer from '../format/terminalOutputRenderer.vue'
+
+const logger = createRendererLogger('ai.markdown')
 
 const { t } = i18n.global
 
@@ -380,7 +424,7 @@ const applySecretRedactionToMarkdown = (text: string, enabled: boolean = true): 
     { name: 'Slack App Token', pattern: /\bxapp-[0-9]+-[A-Za-z0-9_]+-[0-9]+-[a-f0-9]+\b/g },
     { name: 'Phone Number', pattern: /\b(\+\d{1,2}\s)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b/g },
     { name: 'AWS Access ID', pattern: /\b(AKIA|A3T|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{12,}\b/g },
-    { name: 'MAC Address', pattern: /\b((([a-zA-z0-9]{2}[-:]){5}([a-zA-z0-9]{2}))|(([a-zA-z0-9]{2}:){5}([a-zA-z0-9]{2})))\b/g },
+    { name: 'MAC Address', pattern: /\b((([a-zA-Z0-9]{2}[-:]){5}([a-zA-Z0-9]{2}))|(([a-zA-Z0-9]{2}:){5}([a-zA-Z0-9]{2})))\b/g },
     { name: 'Google API Key', pattern: /\bAIza[0-9A-Za-z-_]{35}\b/g },
     { name: 'Google OAuth ID', pattern: /\b[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com\b/g },
     { name: 'GitHub Classic Personal Access Token', pattern: /\bghp_[A-Za-z0-9_]{36}\b/g },
@@ -390,7 +434,7 @@ const applySecretRedactionToMarkdown = (text: string, enabled: boolean = true): 
     { name: 'GitHub Server to Server Token', pattern: /\bghs_[A-Za-z0-9_]{36}\b/g },
     { name: 'Stripe Key', pattern: /\b(?:r|s)k_(test|live)_[0-9a-zA-Z]{24}\b/g },
     { name: 'Firebase Auth Domain', pattern: /\b([a-z0-9-]){1,30}(\.firebaseapp\.com)\b/g },
-    { name: 'JSON Web Token', pattern: /\b(ey[a-zA-z0-9_\-=]{10,}\.){2}[a-zA-z0-9_\-=]{10,}\b/g },
+    { name: 'JSON Web Token', pattern: /\b(ey[a-zA-Z0-9_\-=]{10,}\.){2}[a-zA-Z0-9_\-=]{10,}\b/g },
     { name: 'OpenAI API Key', pattern: /\bsk-[a-zA-Z0-9]{48}\b/g },
     { name: 'Anthropic API Key', pattern: /\bsk-ant-api\d{0,2}-[a-zA-Z0-9\-]{80,120}\b/g },
     { name: 'Fireworks API Key', pattern: /\bfw_[a-zA-Z0-9]{24}\b/g }
@@ -413,7 +457,7 @@ const isMarkdownSecretRedactionEnabled = async (): Promise<boolean> => {
     const config = await userConfigStoreService.getConfig()
     return config?.secretRedaction === 'enabled'
   } catch (error) {
-    console.error('Failed to get secret redaction config for markdown:', error)
+    logger.error('Failed to get secret redaction config for markdown', { error: error })
     return false
   }
 }
@@ -498,6 +542,7 @@ const props = defineProps<{
   ask?: string
   say?: string
   partial?: boolean
+  messageContentParts?: ContentPart[]
   executedCommand?: string
   // Multi-host execution identification
   hostId?: string
@@ -548,6 +593,53 @@ const codeEditors = ref<Array<HTMLElement | null>>([])
 const isCodeExpanded = ref(false) // Code content default folded
 
 const contentStableTimeout = ref<NodeJS.Timeout | null>(null)
+
+type KbSearchResultItem = {
+  relPath: string
+  name: string
+  startLine: number
+  endLine: number
+  displayText: string
+}
+
+const isKbSearchDocPart = (part: ContentPart): part is Extract<ContentPart, { type: 'chip'; chipType: 'doc' }> => {
+  return (
+    part.type === 'chip' &&
+    part.chipType === 'doc' &&
+    typeof part.ref.relPath === 'string' &&
+    part.ref.relPath.length > 0 &&
+    typeof part.ref.startLine === 'number' &&
+    typeof part.ref.endLine === 'number'
+  )
+}
+
+const kbSearchResults = computed<null | { title: string; items: KbSearchResultItem[] }>(() => {
+  if (props.say !== 'text') return null
+
+  const parts = props.messageContentParts || []
+  const docParts = parts.filter(isKbSearchDocPart)
+  if (docParts.length === 0) return null
+
+  const titlePart = parts.find((part): part is Extract<ContentPart, { type: 'text' }> => part.type === 'text')
+  const items = docParts.map((part) => {
+    const ref = part.ref as ContextDocRef
+    const relPath = ref.relPath || ''
+    const startLine = ref.startLine || 1
+    const endLine = ref.endLine || startLine
+    return {
+      relPath,
+      name: ref.name || relPath.split('/').pop() || relPath,
+      startLine,
+      endLine,
+      displayText: `${relPath} L${startLine}-${endLine}`
+    }
+  })
+
+  return {
+    title: titlePart?.text || 'Knowledge base search:',
+    items
+  }
+})
 
 const detectLanguage = (content: string): string => {
   if (!content) return 'shell'
@@ -731,7 +823,7 @@ const initEditor = (content: string) => {
       }
     }, 2000)
   } catch (error) {
-    console.error('Error in initEditor:', error)
+    logger.error('Error in initEditor', { error: error })
   }
 }
 
@@ -1442,6 +1534,19 @@ const toggleCommandOutput = () => {
   } else {
     commandOutputActiveKey.value = ['1']
   }
+}
+
+const openKbSearchResult = (item: KbSearchResultItem) => {
+  eventBus.emit('openUserTab', {
+    key: 'KnowledgeCenterEditor',
+    title: item.name,
+    props: {
+      relPath: item.relPath,
+      startLine: item.startLine,
+      endLine: item.endLine,
+      jumpToken: `${Date.now()}-${Math.random()}`
+    }
+  })
 }
 
 // Expose method to parent component
@@ -2281,6 +2386,24 @@ body.has-custom-bg .monaco-editor .margin {
   cursor: pointer;
 }
 
+.kb-search-result-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #1677ff;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  line-height: inherit;
+  white-space: normal;
+  word-break: break-all;
+}
+
+.kb-search-result-link:hover {
+  color: #4096ff;
+  text-decoration: underline;
+}
+
 .command-output .error {
   color: #e06c75;
   font-weight: 500;
@@ -2767,6 +2890,53 @@ body.has-custom-bg .monaco-editor .margin {
 /* Dark theme adjustments for SSH info messages */
 .theme-dark .ssh-info-message {
   color: var(--text-color-tertiary);
+}
+
+.skill-activated-notice {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 8px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background-color: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  font-size: 12px;
+  line-height: 1.5;
+  color: #f59e0b;
+}
+
+.skill-activated-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  filter: brightness(0) saturate(100%) invert(67%) sepia(74%) saturate(1200%) hue-rotate(2deg) brightness(103%) contrast(97%);
+}
+
+.skill-activated-text {
+  font-weight: 500;
+}
+
+.kb-search-results {
+  margin: 4px 8px;
+}
+
+.kb-search-result-list {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 6px 8px 0;
+}
+
+.kb-search-result-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--ant-primary-color, #1677ff);
+  cursor: pointer;
+  text-decoration: underline;
+  font: inherit;
 }
 
 .command-output::-webkit-scrollbar-thumb {

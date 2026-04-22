@@ -6,7 +6,16 @@ import { pipeline } from 'stream/promises'
 import { randomUUID } from 'crypto'
 import { createHash } from 'crypto'
 import { getDefaultLanguage } from '../../config/edition'
+import { getUserConfig } from '../../agent/core/storage/state'
 import { KB_DEFAULT_SEEDS, KB_DEFAULT_SEEDS_VERSION } from './default-seeds'
+import type { KnowledgeBaseDefaultSeed } from './default-seeds'
+import { getKbCloudUsedBytes, KB_CLOUD_TOTAL_BYTES, getKbSyncLastResults } from './sync'
+import { KbSearchManager } from './search/index'
+import type { EmbeddingConfig } from './search/types'
+import { createLogger } from '../logging'
+
+const kbLogger = createLogger('kb-search')
+const KB_SEARCH_QUERY_MAX_LEN = 2000
 
 export interface KnowledgeBaseEntry {
   name: string
@@ -16,30 +25,75 @@ export interface KnowledgeBaseEntry {
   mtimeMs?: number
 }
 
-const ALLOWED_IMPORT_EXTS = new Set([
-  '.txt',
-  '.md',
-  '.markdown',
-  '.json',
-  '.yaml',
-  '.yml',
-  '.log',
-  '.csv',
-  '.png',
-  '.jpg',
-  '.jpeg',
-  '.gif',
-  '.webp',
-  '.bmp',
-  '.svg'
+// Blocklist: these extensions are rejected; all others are allowed (permit new text formats by default).
+const BLOCKED_IMPORT_EXTS = new Set([
+  '.exe',
+  '.dll',
+  '.so',
+  '.dylib',
+  '.bin',
+  '.o',
+  '.obj',
+  '.class',
+  '.pyc',
+  '.elc',
+  '.wasm',
+  '.node',
+  '.com',
+  '.bat',
+  '.cmd',
+  '.msi',
+  '.deb',
+  '.rpm',
+  '.dmg',
+  '.pkg',
+  '.zip',
+  '.tar',
+  '.gz',
+  '.tgz',
+  '.rar',
+  '.7z',
+  '.xz',
+  '.bz2',
+  '.z',
+  '.pdf',
+  '.doc',
+  '.docx',
+  '.xls',
+  '.xlsx',
+  '.ppt',
+  '.pptx',
+  '.odt',
+  '.ods',
+  '.odp',
+  '.mp3',
+  '.mp4',
+  '.webm',
+  '.mov',
+  '.avi',
+  '.wav',
+  '.flac',
+  '.ogg',
+  '.m4a',
+  '.wmv',
+  '.mkv',
+  '.m4v',
+  '.db',
+  '.sqlite',
+  '.sqlite3'
 ])
 
-// Image file extensions for binary handling
-const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'])
+// Image file extensions for binary handling (exported for sync encoding)
+export const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'])
 const MAX_IMPORT_BYTES = 10 * 1024 * 1024
 
 function getKbRoot(): string {
   return path.join(app.getPath('userData'), 'knowledgebase')
+}
+
+/** Exported for agent glob_search to resolve @knowledgebase/ paths. */
+export function getKnowledgeBaseRoot(): string {
+  return getKbRoot()
 }
 
 const KB_DEFAULT_SEEDS_META_FILE = '.kb-default-seeds-meta.json'
@@ -55,17 +109,70 @@ interface DefaultKbSeedsMeta {
   seeds: Record<string, DefaultSeedMetaEntry>
 }
 
+function isKbSearchRegion(value: unknown): value is 'cn' | 'global' {
+  return value === 'cn' || value === 'global'
+}
+
+function isValidBaseUrl(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  if (!value.trim()) return false
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function normalizeKbSearchOptions(opts?: { maxResults?: number; minScore?: number }): { maxResults: number; minScore?: number } {
+  const maxResultsRaw = opts?.maxResults
+  const maxResults = typeof maxResultsRaw === 'number' && Number.isFinite(maxResultsRaw) ? Math.floor(maxResultsRaw) : 5
+  const normalized: { maxResults: number; minScore?: number } = {
+    maxResults: Math.min(Math.max(maxResults, 1), 20)
+  }
+  const minScoreRaw = opts?.minScore
+  if (typeof minScoreRaw === 'number' && Number.isFinite(minScoreRaw)) {
+    normalized.minScore = Math.min(Math.max(minScoreRaw, 0), 1)
+  }
+  return normalized
+}
+
 function normalizeRelPath(relPath: string): string {
   const p = relPath.replace(/\\/g, '/')
   return p.startsWith('/') ? p.slice(1) : p
 }
 
-function sha256Hex(content: string): string {
+function getSeedDefaultRelPath(seed: KnowledgeBaseDefaultSeed, isChinese: boolean): string {
+  return typeof seed.getDefaultRelPath === 'function' ? seed.getDefaultRelPath(isChinese) : seed.defaultRelPath
+}
+
+function getSeedDefaultRelPathVariants(seed: KnowledgeBaseDefaultSeed): string[] {
+  if (typeof seed.getDefaultRelPath === 'function') {
+    return [seed.getDefaultRelPath(true), seed.getDefaultRelPath(false)]
+  }
+  return [seed.defaultRelPath]
+}
+
+function sha256Hex(content: string | Buffer): string {
+  if (Buffer.isBuffer(content)) {
+    return createHash('sha256').update(content).digest('hex')
+  }
   return createHash('sha256').update(content, 'utf-8').digest('hex')
 }
 
-function getIsChinese(): boolean {
-  const lang = getDefaultLanguage() || ''
+async function getIsChinese(): Promise<boolean> {
+  let lang = ''
+  try {
+    const userConfig = await getUserConfig()
+    if (userConfig && typeof userConfig.language === 'string') {
+      lang = userConfig.language
+    }
+  } catch {
+    // ignore and fallback to default language
+  }
+  if (!lang) {
+    lang = getDefaultLanguage() || ''
+  }
   return lang.toLowerCase().startsWith('zh')
 }
 
@@ -108,7 +215,9 @@ function findMetaIdByRelPath(meta: DefaultKbSeedsMeta, relPath: string): string 
 
 function findSeedIdByDefaultRelPath(relPath: string): string | null {
   for (const seed of KB_DEFAULT_SEEDS) {
-    if (normalizeRelPath(seed.defaultRelPath) === relPath) return seed.id
+    for (const candidate of getSeedDefaultRelPathVariants(seed)) {
+      if (normalizeRelPath(candidate) === relPath) return seed.id
+    }
   }
   return null
 }
@@ -151,7 +260,7 @@ async function initKbDefaultSeedFiles(): Promise<void> {
     return
   }
 
-  const isChinese = getIsChinese()
+  const isChinese = await getIsChinese()
 
   for (const seed of KB_DEFAULT_SEEDS) {
     const currentEntry = meta.seeds[seed.id]
@@ -159,10 +268,15 @@ async function initKbDefaultSeedFiles(): Promise<void> {
       continue
     }
 
-    const seedContent = seed.getContent(isChinese).trim()
-    const seedHash = sha256Hex(seedContent)
+    const isBinarySeed = typeof seed.getBinaryContent === 'function'
+    const seedContent = isBinarySeed ? '' : seed.getContent(isChinese).trim()
+    const seedBinary = isBinarySeed ? seed.getBinaryContent() : null
+    if (isBinarySeed && !seedBinary) {
+      continue
+    }
+    const seedHash = isBinarySeed && seedBinary ? sha256Hex(seedBinary) : sha256Hex(seedContent)
 
-    const targetRelPath = currentEntry?.relPath ? normalizeRelPath(currentEntry.relPath) : normalizeRelPath(seed.defaultRelPath)
+    const targetRelPath = currentEntry?.relPath ? normalizeRelPath(currentEntry.relPath) : normalizeRelPath(getSeedDefaultRelPath(seed, isChinese))
     const targetAbsPath = path.join(root, targetRelPath)
 
     const exists = await pathExists(targetAbsPath)
@@ -173,7 +287,11 @@ async function initKbDefaultSeedFiles(): Promise<void> {
       }
 
       await fs.mkdir(path.dirname(targetAbsPath), { recursive: true })
-      await fs.writeFile(targetAbsPath, seedContent, 'utf-8')
+      if (isBinarySeed && seedBinary) {
+        await fs.writeFile(targetAbsPath, seedBinary)
+      } else {
+        await fs.writeFile(targetAbsPath, seedContent, 'utf-8')
+      }
       meta.seeds[seed.id] = {
         relPath: targetRelPath,
         lastSeedHash: seedHash
@@ -183,7 +301,7 @@ async function initKbDefaultSeedFiles(): Promise<void> {
 
     // Existing file: only overwrite when file still matches last seed hash (i.e., user hasn't edited).
     try {
-      const fileContent = await fs.readFile(targetAbsPath, 'utf-8')
+      const fileContent = isBinarySeed ? await fs.readFile(targetAbsPath) : await fs.readFile(targetAbsPath, 'utf-8')
       const fileHash = sha256Hex(fileContent)
       const lastSeedHash = currentEntry?.lastSeedHash ?? ''
 
@@ -193,7 +311,11 @@ async function initKbDefaultSeedFiles(): Promise<void> {
       }
 
       // Safe to overwrite (either unmodified seed, or first-time meta missing hash but content matches).
-      await fs.writeFile(targetAbsPath, seedContent, 'utf-8')
+      if (isBinarySeed && seedBinary) {
+        await fs.writeFile(targetAbsPath, seedBinary)
+      } else {
+        await fs.writeFile(targetAbsPath, seedContent, 'utf-8')
+      }
       meta.seeds[seed.id] = {
         relPath: targetRelPath,
         lastSeedHash: seedHash
@@ -234,6 +356,16 @@ async function pathExists(absPath: string): Promise<boolean> {
     return true
   } catch {
     return false
+  }
+}
+
+async function caseSensitiveExists(dirAbs: string, name: string): Promise<boolean> {
+  try {
+    const entries = await fs.readdir(dirAbs, { withFileTypes: true })
+    return entries.some((entry) => entry.name === name)
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return false
+    throw e
   }
 }
 
@@ -321,7 +453,7 @@ async function copyFileWithProgress(srcAbs: string, destAbs: string, onProgress:
 // Check if file is allowed for import
 function isFileAllowedForImport(fileName: string, fileSize: number): boolean {
   const ext = path.extname(fileName).toLowerCase()
-  if (ext && !ALLOWED_IMPORT_EXTS.has(ext)) return false
+  if (ext && BLOCKED_IMPORT_EXTS.has(ext)) return false
   if (fileSize > MAX_IMPORT_BYTES) return false
   return true
 }
@@ -382,6 +514,13 @@ export function registerKnowledgeBaseHandlers(): void {
     await initKbDefaultSeedFiles()
     return { root }
   })
+
+  ipcMain.handle('kb:get-cloud-storage', async () => {
+    const usedBytes = await getKbCloudUsedBytes()
+    return { usedBytes, totalBytes: KB_CLOUD_TOTAL_BYTES }
+  })
+
+  ipcMain.handle('kb:sync-last-results', async () => getKbSyncLastResults())
 
   ipcMain.handle('kb:list-dir', async (_evt, payload: { relDir: string }) => {
     const relDir = payload?.relDir ?? ''
@@ -492,7 +631,7 @@ export function registerKnowledgeBaseHandlers(): void {
     }
 
     // Check if target already exists (different from source)
-    if (await pathExists(destAbs)) {
+    if (await caseSensitiveExists(parentAbs, newName)) {
       throw new Error('Target already exists')
     }
     await fs.rename(srcAbs, destAbs)
@@ -588,7 +727,7 @@ export function registerKnowledgeBaseHandlers(): void {
     if (srcStat.size > MAX_IMPORT_BYTES) throw new Error('File too large')
 
     const ext = path.extname(srcAbsPath).toLowerCase()
-    if (ext && !ALLOWED_IMPORT_EXTS.has(ext)) {
+    if (ext && BLOCKED_IMPORT_EXTS.has(ext)) {
       throw new Error('File type not allowed')
     }
 
@@ -657,4 +796,143 @@ export function registerKnowledgeBaseHandlers(): void {
 
     return { jobId, relPath: destFolderRel }
   })
+
+  // KB search IPC handlers
+  ipcMain.handle('kb:set-search-enabled', async (_evt, enabled: boolean) => {
+    try {
+      if (typeof enabled !== 'boolean') {
+        return { success: false, error: 'Invalid enabled flag' }
+      }
+      if (enabled) {
+        const { getCurrentUserId } = await import('../../storage/db/connection')
+        const { getEdition } = await import('../../config/edition')
+        const { getAllExtensionState } = await import('../../agent/core/storage/state')
+        const uid = getCurrentUserId()
+        if (!uid) return { success: false, error: 'User not logged in' }
+        const edition = getEdition()
+        const region = edition === 'cn' ? 'cn' : 'global'
+
+        // Get API credentials from user's model configuration
+        const state = await getAllExtensionState()
+        const apiConfig = state?.apiConfiguration
+        if (!apiConfig) return { success: false, error: 'No API configuration found' }
+
+        const mgr = await initKbSearchManager(uid.toString(), {
+          region,
+          apiKey: apiConfig.defaultApiKey ?? '',
+          baseUrl: apiConfig.defaultBaseUrl ?? ''
+        })
+        return { success: !!mgr }
+      } else {
+        closeKbSearchManager()
+        return { success: true }
+      }
+    } catch (err) {
+      kbLogger.error('kb:set-search-enabled failed', { error: err })
+      return { success: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('kb:init-search', async (_evt, config: EmbeddingConfig & { userId: string }) => {
+    try {
+      const userId = typeof config?.userId === 'string' ? config.userId.trim() : ''
+      if (!userId || userId.length > 128) {
+        return { success: false, error: 'Invalid userId' }
+      }
+      if (!isKbSearchRegion(config?.region)) {
+        return { success: false, error: 'Invalid region' }
+      }
+      const apiKey = typeof config?.apiKey === 'string' ? config.apiKey.trim() : ''
+      if (!apiKey) {
+        return { success: false, error: 'Invalid API key' }
+      }
+      const baseUrl = config?.baseUrl ?? ''
+      if (config.region === 'cn' && !isValidBaseUrl(baseUrl)) {
+        return { success: false, error: 'Invalid baseUrl for cn region' }
+      }
+
+      const mgr = await initKbSearchManager(userId, {
+        region: config.region,
+        apiKey,
+        baseUrl
+      })
+      return { success: !!mgr }
+    } catch (err) {
+      kbLogger.error('kb:init-search failed', { error: err })
+      return { success: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('kb:search', async (_evt, query: string, opts?: { maxResults?: number; minScore?: number }) => {
+    const mgr = getKbSearchManager()
+    if (!mgr) return []
+    if (typeof query !== 'string') return []
+    const normalizedQuery = query.trim()
+    if (!normalizedQuery) return []
+    if (normalizedQuery.length > KB_SEARCH_QUERY_MAX_LEN) return []
+    const normalizedOpts = normalizeKbSearchOptions(opts)
+    return mgr.search(normalizedQuery, normalizedOpts)
+  })
+
+  ipcMain.handle('kb:search-status', async () => {
+    const mgr = getKbSearchManager()
+    if (!mgr) return { totalFiles: 0, totalChunks: 0, model: '', provider: '' }
+    return mgr.status()
+  })
+
+  ipcMain.handle('kb:reindex', async () => {
+    const mgr = getKbSearchManager()
+    if (!mgr) return { files: 0, chunks: 0 }
+    return mgr.fullIndex()
+  })
+}
+
+// --- KbSearchManager singleton ---
+
+let kbSearchManagerInstance: KbSearchManager | null = null
+
+export function getKbSearchManager(): KbSearchManager | null {
+  return kbSearchManagerInstance
+}
+
+export async function initKbSearchManager(userId: string, embeddingConfig: EmbeddingConfig): Promise<KbSearchManager | null> {
+  // Close existing instance if any
+  if (kbSearchManagerInstance) {
+    kbSearchManagerInstance.close()
+    kbSearchManagerInstance = null
+  }
+
+  // Require an API key
+  if (!embeddingConfig.apiKey) {
+    kbLogger.info('KB search disabled: no API key available from user model configuration')
+    return null
+  }
+
+  try {
+    const kbRoot = getKbRoot()
+    const dbDir = path.join(app.getPath('userData'), 'chaterm_db')
+    kbSearchManagerInstance = KbSearchManager.create(userId, dbDir, kbRoot, embeddingConfig)
+
+    // Run full index in background (don't block startup)
+    kbSearchManagerInstance
+      .fullIndex()
+      .then((result) => {
+        kbLogger.info('KB search initial index complete', { files: result.files, chunks: result.chunks })
+      })
+      .catch((err) => {
+        kbLogger.error('KB search initial index failed', { error: err })
+      })
+
+    return kbSearchManagerInstance
+  } catch (err) {
+    kbLogger.error('Failed to initialize KB search manager', { error: err })
+    return null
+  }
+}
+
+export function closeKbSearchManager(): void {
+  if (kbSearchManagerInstance) {
+    kbSearchManagerInstance.close()
+    kbSearchManagerInstance = null
+  }
 }

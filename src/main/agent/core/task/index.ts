@@ -8,15 +8,18 @@ import { Anthropic } from '@anthropic-ai/sdk'
 import cloneDeep from 'clone-deep'
 import os from 'os'
 import path from 'path'
+import { createReadStream } from 'fs'
 import * as fs from 'fs/promises'
+import * as readline from 'node:readline/promises'
 import { telemetryService } from '@services/telemetry/TelemetryService'
+import { mark } from '@perf'
 import pWaitFor from 'p-wait-for'
 import { serializeError } from 'serialize-error'
 import { ApiHandler, buildApiHandler } from '@api/index'
 import { ApiStream, ApiStreamUsageChunk, ApiStreamReasoningChunk, ApiStreamTextChunk } from '@api/transform/stream'
 import { formatContentBlockToMarkdown } from '@integrations/misc/export-markdown'
 import { showSystemNotification } from '@integrations/notifications'
-import { ApiConfiguration } from '@shared/api'
+import { ApiConfiguration, ApiProvider } from '@shared/api'
 import { findLast, findLastIndex, parsePartialArrayString } from '@shared/array'
 import { AutoApprovalSettings } from '@shared/AutoApprovalSettings'
 import { combineApiRequests } from '@shared/combineApiRequests'
@@ -32,9 +35,7 @@ import {
   ExtensionMessage,
   HostInfo
 } from '@shared/ExtensionMessage'
-import { getApiMetrics } from '@shared/getApiMetrics'
-import { HistoryItem } from '@shared/HistoryItem'
-import { DEFAULT_LANGUAGE_SETTINGS } from '@shared/Languages'
+import { DEFAULT_LANGUAGE_SETTINGS, getKbSearchEnabledLabel } from '@shared/Languages'
 import { ChatermAskResponse } from '@shared/WebviewMessage'
 import { calculateApiCostAnthropic } from '@utils/cost'
 import { TodoWriteTool, TodoWriteParams } from './todo-tools/todo_write_tool'
@@ -47,6 +48,10 @@ import { globSearch } from '../../services/glob/list-files'
 import { regexSearchMatches as localGrepSearch } from '../../services/grep/index'
 import { buildRemoteGlobCommand, parseRemoteGlobOutput, buildRemoteGrepCommand, parseRemoteGrepOutput } from '../../services/search/remote'
 import { broadcastInteractionClosed } from '../../services/interaction-detector/ipc-handlers'
+import { getOffloadDir, shouldOffload, writeToolOutput } from '../offload'
+import { getKnowledgeBaseRoot, getKbSearchManager } from '../../../services/knowledgebase'
+import type { KbSearchResult } from '../../../services/knowledgebase/search/types'
+import { webFetch } from '../../services/web-fetch'
 
 interface StreamMetrics {
   didReceiveUsageChunk?: boolean
@@ -65,20 +70,31 @@ import { AssistantMessageContent, parseAssistantMessageV2, ToolParamName, ToolUs
 import { detectShellType, ShellType } from '../../../ssh/agentHandle'
 import { RemoteTerminalManager, ConnectionInfo, RemoteTerminalInfo, RemoteTerminalProcessResultPromise } from '../../integrations/remote-terminal'
 import { LocalTerminalManager, LocalCommandProcess } from '../../integrations/local-terminal'
+import { getK8sAgentManager } from '../../integrations/k8s'
+import { createExperienceManager } from '../../services/experience'
 import { createLlmCaller } from '../../services/interaction-detector/llm-caller'
 import type { InteractionResult } from '../../services/interaction-detector/types'
-import { formatResponse } from '@core/prompts/responses'
-import { addUserInstructions, SYSTEM_PROMPT, SYSTEM_PROMPT_CHAT, SYSTEM_PROMPT_CN, SYSTEM_PROMPT_CHAT_CN } from '@core/prompts/system'
+import { getFormatResponse } from '@core/prompts/responses'
+import { addUserInstructions, SYSTEM_PROMPT, SYSTEM_PROMPT_CN } from '@core/prompts/system'
 import { getSwitchPromptByAssetType } from '@core/prompts/switch-prompts'
-import { SLASH_COMMANDS, getSummaryToDocPrompt } from '@core/prompts/slash-commands'
+import { SLASH_COMMANDS, getSummaryToDocPrompt, getSummaryToSkillPrompt } from '@core/prompts/slash-commands'
 import { CommandSecurityManager } from '../security/CommandSecurityManager'
 import { getContextWindowInfo } from '@core/context/context-management/context-window-utils'
 import { ModelContextTracker } from '@core/context/context-tracking/ModelContextTracker'
 import { ContextManager } from '@core/context/context-management/ContextManager'
-import { getSavedApiConversationHistory, getChatermMessages, saveApiConversationHistory, saveChatermMessages } from '@core/storage/disk'
+import {
+  getSavedApiConversationHistory,
+  getChatermMessages,
+  getTaskMetadata,
+  saveApiConversationHistory,
+  saveChatermMessages,
+  saveTaskMetadata,
+  touchTaskUpdatedAt
+} from '@core/storage/disk'
 
 import { getGlobalState, getUserConfig } from '@core/storage/state'
 import { connectAssetInfo } from '../../../storage/database'
+import { findWakeupConnectionInfoByHost } from '../../../ssh/agentHandle'
 import { getMessages, formatMessage, Messages } from './messages'
 import { decodeHtmlEntities } from '@utils/decodeHtmlEntities'
 import { McpHub } from '@services/mcp/McpHub'
@@ -86,9 +102,11 @@ import { SkillsManager } from '@services/skills'
 import { ChatermDatabaseService } from '../../../storage/db/chaterm.service'
 import type { McpTool } from '@shared/mcp'
 
-import type { ContentPart, ContextDocRef, ContextPastChatRef, ContextRefs, Host } from '@shared/WebviewMessage'
+import type { ContentPart, ContextDocRef, ContextPastChatRef, ContextRefs, Host, ToolResultPayload } from '@shared/WebviewMessage'
+import type { ToolResult } from '@shared/ToolResult'
 import { ExternalAssetCache } from '../../../plugin/pluginIpc'
 import type { InteractionType } from '../../services/interaction-detector/types'
+const logger = createLogger('agent')
 
 type ToolResponse = string | Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>
 type UserContent = Array<Anthropic.ContentBlockParam>
@@ -97,7 +115,7 @@ type UserContent = Array<Anthropic.ContentBlockParam>
  * Check if a tool allows partial block execution
  */
 function isAllowPartialTool(toolName: string): boolean {
-  return toolName === 'summarize_to_knowledge' || toolName === 'attempt_completion'
+  return toolName === 'summarize_to_knowledge' || toolName === 'summarize_to_skill' || toolName === 'attempt_completion'
 }
 export interface CommandContext {
   /** Command identifier */
@@ -138,7 +156,11 @@ export class Task {
    */
   static registerCommandContext(context: CommandContext): void {
     Task.activeTasks.set(context.commandId, context)
-    console.log(`[Task] Registered command context: ${context.commandId} for task: ${context.taskId}`)
+    logger.debug('Registered command context', {
+      event: 'agent.task.command_context.register',
+      commandId: context.commandId,
+      taskId: context.taskId
+    })
   }
 
   /**
@@ -146,7 +168,10 @@ export class Task {
    */
   static unregisterCommandContext(commandId: string): void {
     Task.activeTasks.delete(commandId)
-    console.log(`[Task] Unregistered command context: ${commandId}`)
+    logger.debug('Unregistered command context', {
+      event: 'agent.task.command_context.unregister',
+      commandId
+    })
   }
 
   /**
@@ -160,39 +185,44 @@ export class Task {
    * Clear all command contexts for a specific task
    */
   static clearCommandContextsForTask(taskId: string): void {
-    console.log(`[Task] clearCommandContextsForTask called for task: ${taskId}, activeTasks count: ${Task.activeTasks.size}`)
+    logger.debug('Clearing command contexts for task', {
+      event: 'agent.task.command_context.clear.start',
+      taskId,
+      activeCount: Task.activeTasks.size
+    })
+    let clearedCount = 0
     for (const [commandId, context] of Task.activeTasks.entries()) {
-      console.log(`[Task] Checking command context: ${commandId}, taskId: ${context.taskId}`)
       if (context.taskId === taskId) {
         // Send Ctrl+C to cancel the command
         if (context.cancel) {
-          console.log(`[Task] Calling cancel for command: ${commandId}`)
           const result = context.cancel()
           if (result instanceof Promise) {
-            result.catch((e) => console.warn('[Task] Cancel failed:', e))
+            result.catch((e) => logger.warn('[Task] Cancel failed', { error: e }))
           }
         }
         // Force terminate the process to unblock awaiting code
         if (context.forceTerminate) {
-          console.log(`[Task] Calling forceTerminate for command: ${commandId}`)
           context.forceTerminate()
         }
         // Broadcast interaction closed event to notify renderer process to close UI
-        console.log(`[Task] Broadcasting interaction-closed for command: ${commandId}`)
         broadcastInteractionClosed(commandId)
         // Remove from registry
         Task.activeTasks.delete(commandId)
-        console.log(`[Task] Cleared command context: ${commandId} for task: ${taskId}`)
+        clearedCount++
       }
     }
-    console.log(`[Task] clearCommandContextsForTask completed, remaining activeTasks count: ${Task.activeTasks.size}`)
+    logger.debug('Cleared command contexts for task', {
+      event: 'agent.task.command_context.clear.complete',
+      taskId,
+      clearedCount,
+      remainingCount: Task.activeTasks.size
+    })
   }
 
   // ============================================================================
   // Instance members
   // ============================================================================
 
-  private updateTaskHistory: (historyItem: HistoryItem) => Promise<HistoryItem[]>
   private postStateToWebview: () => Promise<void>
   private postMessageToWebview: (message: ExtensionMessage) => Promise<void>
   private reinitExistingTaskFromId: (taskId: string) => Promise<void>
@@ -201,10 +231,11 @@ export class Task {
 
   readonly taskId: string
   hosts: Host[]
-  private taskIsFavorited?: boolean
   chatTitle?: string // Store the LLM-generated chat title
   api: ApiHandler
+  private apiProviderId?: ApiProvider | string
   contextManager: ContextManager
+  private responseFormatter: ReturnType<typeof getFormatResponse>
   private remoteTerminalManager: RemoteTerminalManager
   private localTerminalManager: LocalTerminalManager
   customInstructions?: string
@@ -212,7 +243,7 @@ export class Task {
   apiConversationHistory: Anthropic.MessageParam[] = []
   chatermMessages: ChatermMessage[] = []
   private commandSecurityManager: CommandSecurityManager
-  private askResponsePayload?: { response: ChatermAskResponse; text?: string; contentParts?: ContentPart[] }
+  private askResponsePayload?: { response: ChatermAskResponse; text?: string; contentParts?: ContentPart[]; toolResult?: ToolResultPayload }
   private nextUserInputContentParts?: ContentPart[]
   private lastMessageTs?: number
   private consecutiveAutoApprovedRequestsCount: number = 0
@@ -268,11 +299,15 @@ export class Task {
   private presentAssistantMessageHasPendingUpdates = false
   private userMessageContent: (Anthropic.TextBlockParam | Anthropic.ImageBlockParam)[] = []
   private userMessageContentReady = false
+  // Structured tool results produced during the last assistant turn.
+  // These are flushed into apiConversationHistory as dedicated tool_result
+  // messages before the next API request is prepared.
+  private pendingToolResults: ToolResult[] = []
   private didRejectTool = false
   private didAlreadyUseTool = false
   private didCompleteReadingStream = false
+  private experienceExtractionQueue: Promise<void> = Promise.resolve()
   // private didAutomaticallyRetryFailedApiRequest = false
-  private isInsideThinkingBlock = false
   private messages: Messages = getMessages(DEFAULT_LANGUAGE_SETTINGS)
 
   private setNextUserInputContentParts(parts?: ContentPart[]): void {
@@ -307,8 +342,18 @@ export class Task {
     }
   }
 
-  private async sayUserFeedback(text: string, contentParts?: ContentPart[]): Promise<void> {
-    await this.say('user_feedback', text, undefined, undefined, contentParts)
+  private async saveUserMessage(text: string, contentParts?: ContentPart[], say_type?: ChatermSay): Promise<void> {
+    const sayTs = Date.now()
+    this.lastMessageTs = sayTs
+    await this.addToChatermMessages({
+      ts: sayTs,
+      type: 'say',
+      say: say_type ?? 'user_feedback',
+      text,
+      contentParts,
+      hosts: this.hosts
+    })
+    await touchTaskUpdatedAt(this.taskId) // user sent a message = real activity
   }
 
   /**
@@ -336,40 +381,51 @@ export class Task {
       }
     }
 
-    // 2. Process command chips (built-in commands and knowledge base commands)
-    const cmdLines = await this.processSlashCommands(userContent, parts)
+    // 2. Process command chips
+    await this.processSlashCommands(userContent, parts)
 
-    // 3. Process doc and chat context refs
-    const refs = this.buildContextRefsFromContentParts(parts)
-    const docs = refs?.docs ?? []
-    const pastChats = refs?.pastChats ?? []
+    // 2.5. Process skill chips - activate skills and inject content
+    const skillChips = parts.filter((p) => p.type === 'chip' && p.chipType === 'skill')
+    const MAX_SKILLS = 5
+    for (const chip of skillChips.slice(0, MAX_SKILLS)) {
+      if (chip.type === 'chip' && chip.chipType === 'skill') {
+        const skillName = chip.ref.skillName
+        if (this.skillsManager) {
+          const skill = this.skillsManager.getSkill(skillName)
+          if (skill && skill.enabled) {
+            let skillText = `# Skill Activated: ${skill.metadata.name}\n\n`
+            skillText += `**Description:** ${skill.metadata.description}\n\n`
+            skillText += `## Instructions\n\n`
+            skillText += skill.content
+            skillText += '\n\n'
 
-    const hasContextData = docs.length > 0 || pastChats.length > 0 || cmdLines.length > 0
-    if (!hasContextData) return blocks
+            if (skill.resources && skill.resources.length > 0) {
+              const resourcesWithContent = skill.resources.filter((r) => r.content)
+              if (resourcesWithContent.length > 0) {
+                skillText += `## Available Resources\n\n`
+                for (const resource of resourcesWithContent) {
+                  skillText += `### ${resource.name} (${resource.type})\n\n`
+                  skillText += '```\n' + resource.content + '\n```\n\n'
+                }
+              }
+            }
 
-    const MAX_DOCS = 5
-    const MAX_DOC_BYTES = 256 * 1024
-    const MAX_PAST_CHATS = 2
-    const MAX_PAST_CHAT_CHARS = 24000
-
-    const docLines: string[] = []
-
-    const selectedDocs = docs.slice(0, MAX_DOCS).sort((a, b) => a.absPath.localeCompare(b.absPath))
-
-    for (const doc of selectedDocs) {
-      try {
-        if (doc.type === 'dir') {
-          docLines.push(`- DIR: ${doc.absPath}`)
-          continue
+            blocks.push({ type: 'text', text: skillText })
+            await this.say('skill_activated', skill.metadata.name, false)
+          }
         }
-        const { content, meta } = await this.readFile(doc.absPath, MAX_DOC_BYTES)
-        docLines.push(`- FILE: ${doc.absPath}${meta ? ` (mtimeMs=${meta.mtimeMs}, bytes=${meta.bytes}, truncated=${meta.truncated})` : ''}`)
-        docLines.push(content)
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e)
-        docLines.push(`- CONTEXT_READ_ERROR: ${doc.absPath}: ${msg}`)
       }
     }
+
+    // 3. Process chat context refs
+    const refs = this.buildContextRefsFromContentParts(parts)
+    const pastChats = refs?.pastChats ?? []
+
+    const hasContextData = pastChats.length > 0
+    if (!hasContextData) return blocks
+
+    const MAX_PAST_CHATS = 2
+    const MAX_PAST_CHAT_CHARS = 24000
 
     const chatLines: string[] = []
     const selectedChats = pastChats.slice(0, MAX_PAST_CHATS).sort((a, b) => a.taskId.localeCompare(b.taskId))
@@ -385,17 +441,19 @@ export class Task {
       }
     }
 
-    // 4. Build final context block
-    blocks.push({
-      type: 'text',
-      text: [
-        '<context-prefetch>',
-        docLines.length > 0 ? ['<docs>', ...docLines, '</docs>'].join('\n') : '<docs />',
-        chatLines.length > 0 ? ['<past-chats>', ...chatLines, '</past-chats>'].join('\n') : '<past-chats />',
-        cmdLines.length > 0 ? ['<commands>', ...cmdLines, '</commands>'].join('\n') : '<commands />',
-        '</context-prefetch>'
-      ].join('\n')
-    })
+    // 4. Build final context block (no <commands> tag - commands are expanded inline)
+    const innerTags: string[] = []
+
+    if (chatLines.length > 0) {
+      innerTags.push(['<past-chats>', ...chatLines, '</past-chats>'].join('\n'))
+    }
+
+    if (innerTags.length > 0) {
+      blocks.push({
+        type: 'text',
+        text: ['<context-prefetch>', ...innerTags, '</context-prefetch>'].join('\n')
+      })
+    }
 
     return blocks
   }
@@ -451,7 +509,6 @@ export class Task {
   }
 
   constructor(
-    updateTaskHistory: (historyItem: HistoryItem) => Promise<HistoryItem[]>,
     postStateToWebview: () => Promise<void>,
     postMessageToWebview: (message: ExtensionMessage) => Promise<void>,
     reinitExistingTaskFromId: (taskId: string) => Promise<void>,
@@ -462,12 +519,10 @@ export class Task {
     skillsManager?: SkillsManager,
     customInstructions?: string,
     task?: string,
-    historyItem?: HistoryItem,
     chatTitle?: string,
     taskId?: string,
     initialUserContentParts?: ContentPart[]
   ) {
-    this.updateTaskHistory = updateTaskHistory
     this.postStateToWebview = postStateToWebview
     this.postMessageToWebview = postMessageToWebview
     this.reinitExistingTaskFromId = reinitExistingTaskFromId
@@ -476,30 +531,32 @@ export class Task {
     this.remoteTerminalManager = new RemoteTerminalManager()
     this.localTerminalManager = LocalTerminalManager.getInstance()
     this.contextManager = new ContextManager()
+    this.responseFormatter = getFormatResponse(DEFAULT_LANGUAGE_SETTINGS)
     this.customInstructions = customInstructions
     this.autoApprovalSettings = autoApprovalSettings
-    console.log(`[Task Init] AutoApprovalSettings initialized:`, JSON.stringify(autoApprovalSettings, null, 2))
+    logger.debug('AutoApprovalSettings initialized', {
+      event: 'agent.task.auto_approval.init',
+      enabled: autoApprovalSettings.enabled
+    })
     this.hosts = hosts
     this.chatTitle = chatTitle
     this.updateMessagesLanguage()
 
-    // Set up MCP notification callback for real-time notifications
-    // this.mcpHub.setNotificationCallback(async (serverName: string, _level: string, message: string) => {
-    //   // Display notification in chat immediately
-    //   await this.say('mcp_notification', `[${serverName}] ${message}`)
-    // })
-
-    // Initialize taskId first
-    if (historyItem) {
-      this.taskId = historyItem.id
-      this.taskIsFavorited = historyItem.isFavorited
-      this.conversationHistoryDeletedRange = historyItem.conversationHistoryDeletedRange
-    } else if (task && taskId) {
+    // Initialize taskId
+    if (task && taskId) {
+      // New task
       this.taskId = taskId
-      console.log(`[Task Init] New task created with ID: ${this.taskId}`)
+      logger.info('New task created', { event: 'agent.task.created', taskId: this.taskId })
       this.setNextUserInputContentParts(initialUserContentParts)
+
+      // Note: ensureTaskMetadataExists is called by Controller.initTask()
+      // before constructing Task, to guarantee the metadata row exists
+      // before any message save path runs.
+    } else if (taskId) {
+      // Resume existing task (replaces old historyItem branch)
+      this.taskId = taskId
     } else {
-      throw new Error('Either historyItem or task/images must be provided')
+      throw new Error('Either task or taskId must be provided')
     }
 
     // Initialize file context tracker
@@ -509,26 +566,33 @@ export class Task {
       ...apiConfiguration,
       taskId: this.taskId
     })
+    this.apiProviderId = apiConfiguration.apiProvider
 
     // Initialize CommandSecurityManager for security
     this.commandSecurityManager = new CommandSecurityManager()
     this.commandSecurityManager.initialize()
 
     // Continue with task initialization
-    if (historyItem) {
-      this.resumeTaskFromHistory()
-    } else if (task) {
+    if (task) {
       this.startTask(task, initialUserContentParts)
+    } else {
+      // taskId-only = resume, same as the old historyItem path
+      this.resumeTaskFromHistory()
     }
 
     // initialize telemetry
-    if (historyItem) {
-      // Open task from history
-      telemetryService.captureTaskRestarted(this.taskId, apiConfiguration.apiProvider)
-    } else {
+    if (task) {
       // New task started
       telemetryService.captureTaskCreated(this.taskId, apiConfiguration.apiProvider)
+    } else {
+      // Open task from history
+      telemetryService.captureTaskRestarted(this.taskId, apiConfiguration.apiProvider)
     }
+  }
+
+  setApiProvider(providerId: ApiProvider | string | undefined): void {
+    if (!providerId) return
+    this.apiProviderId = providerId
   }
 
   private async updateMessagesLanguage(): Promise<void> {
@@ -536,9 +600,11 @@ export class Task {
       const userConfig = await getUserConfig()
       const userLanguage = userConfig?.language || DEFAULT_LANGUAGE_SETTINGS
       this.messages = getMessages(userLanguage)
+      this.responseFormatter = getFormatResponse(userLanguage)
     } catch (error) {
       // If error, use default language
       this.messages = getMessages(DEFAULT_LANGUAGE_SETTINGS)
+      this.responseFormatter = getFormatResponse(DEFAULT_LANGUAGE_SETTINGS)
     }
   }
 
@@ -549,9 +615,9 @@ export class Task {
   private createInteractionLlmCaller(): (command: string, output: string, locale: string) => Promise<InteractionResult> {
     return createLlmCaller(async (systemPrompt: string, userPrompt: string): Promise<string> => {
       if (process.env.CHATERM_INTERACTION_DEBUG === '1') {
-        const provider = (await getGlobalState('apiProvider')) as string
+        const provider = this.apiProviderId ?? ((await getGlobalState('apiProvider')) as string)
         const modelId = this.api.getModel().id
-        console.log('[InteractionDetector] LLM request meta', {
+        logger.debug('LLM request meta', {
           provider,
           modelId,
           systemLength: systemPrompt.length,
@@ -582,12 +648,314 @@ export class Task {
     }
   }
 
+  private createSingleTurnLlmCaller(): (systemPrompt: string, userPrompt: string) => Promise<string> {
+    return async (systemPrompt: string, userPrompt: string): Promise<string> => {
+      const stream = this.api.createMessage(systemPrompt, [{ role: 'user', content: userPrompt }])
+      let responseText = ''
+      for await (const chunk of stream) {
+        if (chunk.type === 'text') {
+          responseText += chunk.text
+        }
+      }
+      return responseText
+    }
+  }
+
+  private normalizeBooleanToolParam(value: string | undefined): boolean | null {
+    if (value === undefined || value === null) return null
+    const normalized = value.trim().toLowerCase()
+    if (normalized === 'true') return true
+    if (normalized === 'false' || normalized === '') return false
+    return false
+  }
+
+  private enqueueExperienceExtraction(): void {
+    const queue = this.experienceExtractionQueue ?? Promise.resolve()
+    this.experienceExtractionQueue = queue
+      .catch(() => undefined)
+      .then(async () => {
+        await this.triggerExperienceExtraction()
+      })
+  }
+
+  private async triggerExperienceExtraction(): Promise<void> {
+    const experienceExtractionEnabled = await getGlobalState('experienceExtractionEnabled')
+    if (experienceExtractionEnabled === false) {
+      logger.info('experience.extract.skipped', {
+        event: 'experience.extract.skipped',
+        taskId: this.taskId,
+        reason: 'disabled_by_user'
+      })
+      return
+    }
+
+    const manager = createExperienceManager({
+      completeWithLlm: this.createSingleTurnLlmCaller()
+    })
+
+    const metadata = await getTaskMetadata(this.taskId)
+    const outcome = await manager.extractFromCompletedTask({
+      taskId: this.taskId,
+      conversationHistory: cloneDeep(this.apiConversationHistory),
+      locale: await this.getUserLocale(),
+      taskExperienceLedger: cloneDeep(metadata.experience_ledger || []),
+      timestamp: new Date().toISOString()
+    })
+
+    if (JSON.stringify(outcome.taskExperienceLedger) !== JSON.stringify(metadata.experience_ledger || [])) {
+      metadata.experience_ledger = outcome.taskExperienceLedger
+      await saveTaskMetadata(this.taskId, metadata)
+    }
+  }
+
+  /**
+   * Flush all pending structured tool results into the API conversation history
+   * as dedicated tool_result messages. This keeps tool outputs separate from
+   * the natural-language user content while still making them available for
+   * context management and provider transforms.
+   */
+  private async flushPendingToolResults(): Promise<void> {
+    if (this.pendingToolResults.length === 0) return
+
+    for (const result of this.pendingToolResults) {
+      const isError = result.isError ?? false
+
+      const toolResultBlock: Anthropic.ToolResultBlockParam = {
+        type: 'tool_result',
+        tool_use_id: `${result.taskId}`,
+        // Directly store the structured ToolResult payload in content.
+        // Downstream provider adapters will see only text because
+        // normalizeToolResultsForApi() flattens these blocks before sending.
+        content: JSON.stringify(result),
+        is_error: isError
+      }
+
+      await this.addToApiConversationHistory({
+        role: 'user',
+        content: [toolResultBlock]
+      })
+    }
+
+    this.pendingToolResults = []
+  }
+
+  /**
+   * Parse a tool_result.content payload (JSON string or plain object)
+   * into a single ToolResult object.
+   */
+  private parseToolResultContent(raw: string): ToolResult | null {
+    if (raw === undefined || raw === null) {
+      return null
+    }
+    let value: ToolResult
+    try {
+      value = JSON.parse(raw)
+    } catch (error) {
+      logger.warn('[parseToolResultContent] Failed to parse tool_result content as JSON', { error })
+      return null
+    }
+
+    return value
+  }
+
+  private normalizeToolResultsForApi(conversationHistory: Anthropic.MessageParam[]): Anthropic.MessageParam[] {
+    return conversationHistory.map((message) => {
+      if (!Array.isArray(message.content)) {
+        return message
+      }
+
+      const transformedContent = message.content.map((block) => {
+        // New V2: tool_result blocks contain structured ToolResult payloads.
+        // Before sending to the provider, we flatten these into plain text so
+        // that downstream adapters only see supported block types.
+        if (block.type === 'tool_result') {
+          const lines: string[] = []
+
+          const addFromToolResult = (tr: ToolResult) => {
+            const segments: string[] = []
+            const header = tr.toolDescription || tr.toolName
+
+            if (header) {
+              segments.push(`Tool ${header}`)
+            }
+            if (tr.ip) {
+              segments.push(`on ${tr.ip}`)
+            }
+            if (typeof tr.size === 'number') {
+              segments.push(`(~${tr.size} bytes)`)
+            }
+            if (typeof tr.lineCount === 'number') {
+              segments.push(`(~${tr.lineCount} lines)`)
+            }
+            if (typeof tr.isError === 'boolean') {
+              segments.push(tr.isError ? 'ended with error' : 'completed successfully')
+            }
+            if (typeof tr.errorMessage === 'string' && tr.errorMessage.length > 0) {
+              segments.push(`error: ${tr.errorMessage}`)
+            }
+            if (typeof tr.result === 'string' && tr.result.length > 0) {
+              segments.push(`result: ${tr.result}`)
+            }
+
+            if (segments.length > 0) {
+              lines.push(segments.join(', '))
+            }
+          }
+
+          if (typeof block.content === 'string') {
+            const toolResult = this.parseToolResultContent(block.content)
+            if (toolResult) {
+              addFromToolResult(toolResult)
+            }
+          }
+
+          return {
+            type: 'text',
+            text: lines.join('\n')
+          } as Anthropic.TextBlockParam
+        }
+
+        return block
+      })
+
+      return {
+        ...message,
+        content: transformedContent
+      }
+    })
+  }
+
   /**
    * Check if the given IP is a local host
    */
   private isLocalHost(ip?: string): boolean {
     if (!ip) return false
     return ip === '127.0.0.1' || ip === 'localhost' || ip === '::1'
+  }
+
+  /**
+   * Check if the given IP belongs to a K8S cluster host
+   * K8S hosts are identified by assetType 'k8s' or uuid starting with 'k8s-'
+   * Also checks if the IP matches the current K8S Agent cluster server URL
+   */
+  private isK8sHost(ip?: string): boolean {
+    if (!ip) return false
+
+    // First check if it's in the hosts list with K8S type
+    if (this.hosts) {
+      const targetHost = this.hosts.find((host) => host.host === ip)
+      if (targetHost) {
+        // Check if assetType is 'k8s' or uuid starts with 'k8s-'
+        if (targetHost.assetType === 'k8s' || targetHost.uuid?.startsWith('k8s-')) {
+          return true
+        }
+      }
+    }
+
+    // Also check if IP matches the current K8S Agent cluster server URL
+    const k8sAgentManager = getK8sAgentManager()
+    const currentCluster = k8sAgentManager.getCurrentCluster()
+    if (currentCluster.contextName) {
+      // IP might be a full URL like "https://cls-xxx.ccs.tencent-cloud.com"
+      // or just a hostname/IP
+      try {
+        // Validate URL format
+        const urlToCheck = ip.startsWith('http') ? ip : `https://${ip}`
+        new URL(urlToCheck) // Just validate, don't need the result
+
+        // Check if this hostname looks like a K8S API server URL
+        // Common patterns: .ccs.tencent-cloud.com, .eks.amazonaws.com, .azmk8s.io, etc.
+        const k8sApiPatterns = [
+          '.ccs.tencent-cloud.com',
+          '.eks.amazonaws.com',
+          '.azmk8s.io',
+          '.gke.io',
+          'kubernetes',
+          'k8s',
+          ':6443' // Common K8S API port
+        ]
+
+        for (const pattern of k8sApiPatterns) {
+          if (ip.includes(pattern)) {
+            return true
+          }
+        }
+      } catch {
+        // Not a valid URL, continue with other checks
+      }
+    }
+
+    return false
+  }
+
+  /**
+   * Get K8S host info for a given IP
+   * Returns a pseudo Host object if the IP matches the current K8S Agent cluster
+   */
+  private getK8sHostInfo(ip?: string): Host | undefined {
+    if (!ip) return undefined
+
+    // First check if it's in the hosts list with K8S type
+    if (this.hosts) {
+      const targetHost = this.hosts.find((host) => host.host === ip && (host.assetType === 'k8s' || host.uuid?.startsWith('k8s-')))
+      if (targetHost) {
+        return targetHost
+      }
+    }
+
+    // If isK8sHost returns true but no host found, create a pseudo host
+    if (this.isK8sHost(ip)) {
+      const k8sAgentManager = getK8sAgentManager()
+      const currentCluster = k8sAgentManager.getCurrentCluster()
+      // Return a minimal object that executeK8sCommandTool can use
+      // Using 'as unknown as Host' to bypass strict type checking since we only need a few fields
+      return {
+        host: ip,
+        uuid: `k8s-${currentCluster.clusterId || 'unknown'}`,
+        label: currentCluster.contextName || ip,
+        assetType: 'k8s',
+        connection: {} // Placeholder to satisfy Host type
+      } as unknown as Host
+    }
+
+    return undefined
+  }
+
+  /**
+   * Execute command in K8S cluster using K8sAgentManager
+   */
+  private async executeK8sCommandTool(command: string, ip: string): Promise<ToolResponse> {
+    const k8sHost = this.getK8sHostInfo(ip)
+    if (!k8sHost) {
+      return `Error: K8S host not found for ${ip}`
+    }
+
+    const k8sAgentManager = getK8sAgentManager()
+    const currentCluster = k8sAgentManager.getCurrentCluster()
+
+    // Check if agent is configured with a cluster
+    if (!currentCluster.clusterId || !currentCluster.contextName) {
+      return `Error: No K8S cluster configured for Agent. Please connect to a cluster first.`
+    }
+
+    try {
+      // Execute the kubectl command
+      const result = await k8sAgentManager.executeKubectl(command)
+
+      const output = result.success
+        ? result.output || 'Command executed successfully (no output)'
+        : `Error: ${result.error || 'K8S command execution failed'}\n\nOutput:\n${result.output || '(no output)'}`
+
+      // Push output to frontend (mirrors SSH executeCommandTool behavior:
+      // first partial=true to create the message, then partial=false to finalize)
+      await this.say('command_output', output, true)
+      await this.say('command_output', output, false)
+
+      return output
+    } catch (error) {
+      logger.error('K8S command execution error', { error })
+      return `Error: ${error instanceof Error ? error.message : String(error)}`
+    }
   }
 
   /**
@@ -651,6 +1019,11 @@ export class Task {
         })
 
         process.on('error', (error) => {
+          logger.error('executeCommandInRemoteServer error', {
+            event: 'agent.task.exec_remote.error',
+            ip,
+            error: error.message
+          })
           reject(new Error(`Command execution failed: ${error.message}`))
           clearTimeout(timeout)
           if (!isCompleted) {
@@ -716,13 +1089,13 @@ export class Task {
 
   private async connectTerminal(ip?: string) {
     if (!this.hosts) {
-      console.log('Terminal UUID is not set')
+      logger.debug('Terminal UUID is not set', { event: 'agent.task.terminal.uuid.missing' })
       return
     }
     let terminalInfo: RemoteTerminalInfo | null = null
     const targetHost = ip ? this.hosts.find((host) => host.host === ip) : this.hosts[0]
     if (!targetHost || !targetHost.uuid) {
-      console.log('Terminal UUID is not set')
+      logger.debug('Terminal UUID is not set', { event: 'agent.task.terminal.uuid.missing' })
       return
     }
     const terminalUuid = targetHost.uuid
@@ -731,11 +1104,38 @@ export class Task {
       if (!connectionInfo) {
         connectionInfo = ExternalAssetCache.get(terminalUuid)
       }
+      // Wakeup fallback: wakeup-created tabs have temporary UUIDs (xshell-xxx)
+      // that don't exist in the asset database or ExternalAssetCache.
+      // The underlying SSH connection is already in sshConnectionPool (saved by
+      // sshHandle.ts when wakeupSource is detected on conn.ready).
+      // We build a minimal ConnectionInfo from the pool entry so remoteSshConnect()
+      // can match it via getReusableSshConnection(host, port, username).
+      // See sshHandle.ts and agentHandle.ts for the full wakeup technical route.
+      if (!connectionInfo && targetHost.host) {
+        const wakeupTabId = targetHost.uuid?.startsWith('xshell-') ? targetHost.uuid : undefined
+        const wakeupInfo = findWakeupConnectionInfoByHost(targetHost.host, { wakeupTabId })
+        if (wakeupInfo) {
+          connectionInfo = {
+            host: wakeupInfo.host,
+            port: wakeupInfo.port,
+            username: wakeupInfo.username,
+            wakeupTabId: wakeupInfo.wakeupTabId || wakeupTabId,
+            password: 'WAKEUP_REUSE',
+            needProxy: false
+          } as any
+          logger.info('Using wakeup connection info from MFA pool', {
+            event: 'agent.task.wakeup.fallback',
+            host: wakeupInfo.host,
+            username: wakeupInfo.username,
+            hasWakeupTabId: !!(wakeupInfo.wakeupTabId || wakeupTabId)
+          })
+        }
+      }
       this.remoteTerminalManager.setConnectionInfo(connectionInfo)
 
       const hostLabel = connectionInfo?.host || targetHost.host || ip || 'unknown'
       // Create a unique connection identifier
-      const currentConnectionId = `${connectionInfo.host}:${connectionInfo.port}:${connectionInfo.username}`
+      const currentConnectionId = `${connectionInfo?.host || targetHost.host}:${connectionInfo?.port || 22}:${connectionInfo?.username || ''}`
       const isNewConnection = !this.connectedHosts.has(currentConnectionId)
 
       // Check if this is an agent mode + local connection scenario that will fail
@@ -845,7 +1245,7 @@ export class Task {
    * Messages with ts >= the given timestamp will be removed.
    */
   private async truncateHistoryAtTimestamp(ts: number): Promise<void> {
-    // console.log('Truncating history at timestamp', ts)
+    // logger.info('Truncating history at timestamp', { value: ts })
     const msgIndex = this.chatermMessages.findIndex((m) => m.ts >= ts)
     if (msgIndex <= 0) return
 
@@ -860,35 +1260,15 @@ export class Task {
     }
 
     await this.saveChatermMessagesAndUpdateHistory()
+    await touchTaskUpdatedAt(this.taskId) // truncation = user-initiated change
     await this.postStateToWebview()
   }
 
   private async saveChatermMessagesAndUpdateHistory() {
     try {
       await saveChatermMessages(this.taskId, this.chatermMessages)
-
-      // combined as they are in ChatView
-      const apiMetrics = getApiMetrics(combineApiRequests(combineCommandSequences(this.chatermMessages.slice(1))))
-      const taskMessage = this.chatermMessages[0] // first message is always the task say
-      const lastRelevantMessage = this.chatermMessages.at(-1)
-      if (!lastRelevantMessage) return
-
-      await this.updateTaskHistory({
-        id: this.taskId,
-        ts: lastRelevantMessage.ts,
-        task: taskMessage.text ?? '',
-        chatTitle: this.chatTitle,
-        tokensIn: apiMetrics.totalTokensIn,
-        tokensOut: apiMetrics.totalTokensOut,
-        cacheWrites: apiMetrics.totalCacheWrites,
-        cacheReads: apiMetrics.totalCacheReads,
-        totalCost: apiMetrics.totalCost,
-        size: 0, // TODO: temporarily set to 0, consider changing or removing later
-        conversationHistoryDeletedRange: this.conversationHistoryDeletedRange,
-        isFavorited: this.taskIsFavorited
-      })
     } catch (error) {
-      console.error('Failed to save chaterm messages:', error)
+      logger.error('Failed to save chaterm messages', { error: error })
     }
   }
 
@@ -896,12 +1276,12 @@ export class Task {
     const messageIndex = findLastIndex(this.chatermMessages, (m) => m.say === 'completion_result')
     const message = this.chatermMessages[messageIndex]
     if (!message) {
-      console.error('Completion message not found')
+      logger.error('Completion message not found')
       return false
     }
     const hash = message.lastCheckpointHash
     if (!hash) {
-      console.error('No checkpoint hash found')
+      logger.error('No checkpoint hash found')
       return false
     }
 
@@ -913,7 +1293,7 @@ export class Task {
       const lastTaskCompletedMessageCheckpointHash = lastTaskCompletedMessage?.lastCheckpointHash // ask is only used to relinquish control, its the last say we care about
       // if undefined, then we get diff from beginning of git
       // if (!lastTaskCompletedMessage) {
-      // 	console.error("No previous task completion message found")
+      // 	logger.error("No previous task completion message found")
       // 	return
       // }
       // This value *should* always exist
@@ -925,7 +1305,7 @@ export class Task {
         return false
       }
     } catch (error) {
-      console.error('Failed to get diff set:', error)
+      logger.error('Failed to get diff set', { error: error })
       return false
     }
 
@@ -943,6 +1323,7 @@ export class Task {
     response: ChatermAskResponse
     text?: string
     contentParts?: ContentPart[]
+    toolResult?: ToolResultPayload
   }> {
     if (this.abort) {
       throw new Error('Chaterm instance aborted')
@@ -1071,8 +1452,18 @@ export class Task {
     }
   }
 
-  async handleWebviewAskResponse(askResponse: ChatermAskResponse, text?: string, truncateAtMessageTs?: number, contentParts?: ContentPart[]) {
-    console.log(`[Task] handleWebviewAskResponse called with askResponse: ${askResponse}, taskId: ${this.taskId}`)
+  async handleWebviewAskResponse(
+    askResponse: ChatermAskResponse,
+    text?: string,
+    truncateAtMessageTs?: number,
+    contentParts?: ContentPart[],
+    toolResult?: ToolResultPayload
+  ) {
+    logger.debug('Handling webview ask response', {
+      event: 'agent.task.ask_response.received',
+      askResponse,
+      taskId: this.taskId
+    })
     if (truncateAtMessageTs !== undefined) {
       await this.truncateHistoryAtTimestamp(truncateAtMessageTs)
     }
@@ -1082,7 +1473,8 @@ export class Task {
     this.askResponsePayload = {
       response: askResponse,
       text,
-      contentParts
+      contentParts,
+      toolResult
     }
   }
 
@@ -1092,12 +1484,12 @@ export class Task {
     }
     const hasContentParts = (contentParts?.length ?? 0) > 0
     if ((text === undefined || text === '') && !hasContentParts) {
-      // console.warn('Chaterm say called with empty text, ignoring')
+      // logger.warn('Chaterm say called with empty text, ignoring')
       return
     }
 
     if (partial !== undefined) {
-      await this.handleSayPartialMessage(type, text, partial, hostInfo)
+      await this.handleSayPartialMessage(type, text, partial, hostInfo, contentParts)
     } else {
       // this is a new non-partial message, so add it like normal
       const sayTs = Date.now()
@@ -1114,7 +1506,13 @@ export class Task {
     }
   }
 
-  private async handleSayPartialMessage(type: ChatermSay, text?: string, partial?: boolean, hostInfo?: HostInfo): Promise<void> {
+  private async handleSayPartialMessage(
+    type: ChatermSay,
+    text?: string,
+    partial?: boolean,
+    hostInfo?: HostInfo,
+    contentParts?: ContentPart[]
+  ): Promise<void> {
     const lastMessage = this.chatermMessages.at(-1)
     // Check if updating previous partial message with same type AND same host
     const isUpdatingPreviousPartial =
@@ -1123,6 +1521,7 @@ export class Task {
       if (isUpdatingPreviousPartial) {
         lastMessage.text = text
         lastMessage.partial = partial
+        lastMessage.contentParts = contentParts ?? lastMessage.contentParts
         await this.postMessageToWebview({
           type: 'partialMessage',
           partialMessage: lastMessage
@@ -1136,11 +1535,12 @@ export class Task {
           type: 'say',
           say: type,
           text,
+          contentParts,
           partial,
           ...(hostInfo ?? {})
         })
         await this.postStateToWebview()
-        if (type === 'command_output') {
+        if (type === 'command_output' || type === 'context_truncated') {
           const newMsg = this.chatermMessages.at(-1)!
           await this.postMessageToWebview({
             type: 'partialMessage',
@@ -1155,6 +1555,7 @@ export class Task {
         this.lastMessageTs = lastMessage.ts
         lastMessage.text = text
         lastMessage.partial = false
+        lastMessage.contentParts = contentParts ?? lastMessage.contentParts
 
         // instead of streaming partialMessage events, we do a save and post like normal to persist to disk
         await this.saveChatermMessagesAndUpdateHistory()
@@ -1171,6 +1572,7 @@ export class Task {
           type: 'say',
           say: type,
           text,
+          contentParts,
           ...(hostInfo ?? {})
         }
         await this.addToChatermMessages(newMessage)
@@ -1189,7 +1591,7 @@ export class Task {
         relPath ? ` for '${relPath.toPosix()}'` : ''
       } without value for required parameter '${paramName}'. Retrying...`
     )
-    return formatResponse.toolError(formatResponse.missingToolParameterError(paramName))
+    return this.responseFormatter.toolError(this.responseFormatter.missingToolParameterError(paramName))
   }
 
   async removeLastPartialMessageIfExistsWithType(type: 'ask' | 'say', askOrSay: ChatermAsk | ChatermSay) {
@@ -1203,14 +1605,15 @@ export class Task {
 
   // Task lifecycle
 
-  private async startTask(task?: string, initialUserContentParts?: ContentPart[]): Promise<void> {
+  private async startTask(task: string, initialUserContentParts?: ContentPart[]): Promise<void> {
     this.chatermMessages = []
     this.apiConversationHistory = []
     this.connectedHosts.clear()
 
     await this.postStateToWebview()
 
-    await this.say('text', task, undefined, undefined, initialUserContentParts)
+    // await this.say('text', task, undefined, undefined, initialUserContentParts)
+    await this.saveUserMessage(task, initialUserContentParts, 'text')
 
     this.isInitialized = true
 
@@ -1250,7 +1653,7 @@ export class Task {
       }
     }
 
-    // let imageBlocks: Anthropic.ImageBlockParam[] = formatResponse.imageBlocks(images)
+    // let imageBlocks: Anthropic.ImageBlockParam[] = this.responseFormatter.imageBlocks(images)
     await this.initiateTaskLoop(initialUserContent)
   }
 
@@ -1270,7 +1673,17 @@ export class Task {
     await this.overwriteChatermMessages(modifiedChatermMessages)
     this.chatermMessages = await getChatermMessages(this.taskId)
     this.apiConversationHistory = await getSavedApiConversationHistory(this.taskId)
+    await this.clearEphemeralToolResults()
     await this.contextManager.initializeContextHistory(this.taskId)
+
+    // Restore conversationHistoryDeletedRange from the latest message that carries it.
+    // Previously injected via historyItem; now recovered from persisted UI messages.
+    for (let i = this.chatermMessages.length - 1; i >= 0; i--) {
+      if (this.chatermMessages[i].conversationHistoryDeletedRange) {
+        this.conversationHistoryDeletedRange = this.chatermMessages[i].conversationHistoryDeletedRange
+        break
+      }
+    }
 
     this.isInitialized = true
 
@@ -1279,7 +1692,7 @@ export class Task {
 
     // TODO:support only chip or image input
     if (text) {
-      await this.sayUserFeedback(text, contentParts)
+      await this.saveUserMessage(text, contentParts)
 
       // If last API message is user, remove it (API requires user/assistant alternation)
       let userContent: UserContent = [{ type: 'text', text }]
@@ -1290,10 +1703,8 @@ export class Task {
 
   private async initiateTaskLoop(userContent: UserContent): Promise<void> {
     let nextUserContent = userContent
-    let includeHostDetails = true
     while (!this.abort) {
-      const didEndLoop = await this.recursivelyMakeChatermRequests(nextUserContent, includeHostDetails)
-      includeHostDetails = false // we only need file details the first time
+      const didEndLoop = await this.recursivelyMakeChatermRequests(nextUserContent)
 
       //const totalCost = this.calculateApiCost(totalInputTokens, totalOutputTokens)
       if (didEndLoop) {
@@ -1304,7 +1715,7 @@ export class Task {
         nextUserContent = [
           {
             type: 'text',
-            text: formatResponse.noToolsUsed()
+            text: this.responseFormatter.noToolsUsed()
           }
         ]
         this.consecutiveMistakeCount++
@@ -1424,7 +1835,7 @@ export class Task {
           // Include host info for multi-host identification
           await this.say('command_output', result, true, hostInfo)
         } catch (error) {
-          console.error('Error while saying for command output:', error) // Log error
+          logger.error('Error while saying for command output', { error: error }) // Log error
         } finally {
           chunkEnroute = false
           // If more output accumulated while chunkEnroute, flush again
@@ -1503,17 +1914,15 @@ export class Task {
         await this.say('command_output', lastMessage.text, false, hostInfo)
       }
 
-      const truncatedResult = this.truncateCommandOutput(result)
-
       if (completed) {
-        return `${this.messages.commandExecutedOutput}${truncatedResult.length > 0 ? `\nOutput:\n${truncatedResult}` : ''}`
+        return `${this.messages.commandExecutedOutput}${result.length > 0 ? `\nOutput:\n${result}` : ''}`
       } else {
         return `${this.messages.commandStillRunning}${
-          truncatedResult.length > 0 ? `${this.messages.commandHereIsOutput}${truncatedResult}` : ''
+          result.length > 0 ? `${this.messages.commandHereIsOutput}${result}` : ''
         }${this.messages.commandUpdateFuture}`
       }
     } catch (error) {
-      console.error('Error executing local command:', error)
+      logger.error('Error executing local command', { error: error })
       this.currentRunningProcess = null
       return `Local command execution failed: ${error instanceof Error ? error.message : String(error)}`
     }
@@ -1523,6 +1932,11 @@ export class Task {
     // If it's local host, use local execution
     if (this.isLocalHost(ip)) {
       return this.executeLocalCommandTool(command)
+    }
+
+    // If it's K8S host, use K8S agent execution
+    if (this.isK8sHost(ip)) {
+      return this.executeK8sCommandTool(command, ip)
     }
 
     let result = ''
@@ -1576,7 +1990,7 @@ export class Task {
           // Include host info for multi-host identification
           await this.say('command_output', result, true, hostInfo)
         } catch (error) {
-          console.error('Error while saying for command output:', error) // Log error
+          logger.error('Error while saying for command output', { error: error }) // Log error
         } finally {
           chunkEnroute = false
           // If more output accumulated while chunkEnroute, flush again
@@ -1627,9 +2041,15 @@ export class Task {
         await this.say('shell_integration_warning')
       })
 
-      console.log(`[Task] executeCommandTool: waiting for process to complete, taskId: ${this.taskId}`)
+      logger.debug('Waiting for command process completion', {
+        event: 'agent.task.execute_command.wait',
+        taskId: this.taskId
+      })
       await process
-      console.log(`[Task] executeCommandTool: process completed, taskId: ${this.taskId}`)
+      logger.debug('Command process completed', {
+        event: 'agent.task.execute_command.complete',
+        taskId: this.taskId
+      })
 
       // Wait for a short delay to ensure all messages are sent to the webview
       // This delay allows time for non-awaited promises to be created and
@@ -1643,13 +2063,11 @@ export class Task {
       }
       result = result.trim()
 
-      const truncatedResult = this.truncateCommandOutput(result)
-
       if (completed) {
-        return `${this.messages.commandExecutedOutput}${truncatedResult.length > 0 ? `\nOutput:\n${truncatedResult}` : ''}`
+        return `${this.messages.commandExecutedOutput}${result.length > 0 ? `\nOutput:\n${result}` : ''}`
       } else {
         return `${this.messages.commandStillRunning}${
-          truncatedResult.length > 0 ? `${this.messages.commandHereIsOutput}${truncatedResult}` : ''
+          result.length > 0 ? `${this.messages.commandHereIsOutput}${result}` : ''
         }${this.messages.commandUpdateFuture}`
       }
     } catch (err) {
@@ -1664,8 +2082,7 @@ export class Task {
 
       // Check if this is a graceful cancel with partial output
       if (this.gracefulCancel && result && result.trim()) {
-        const truncatedResult = this.truncateCommandOutput(result)
-        return `Command was gracefully cancelled with partial output.${truncatedResult.length > 0 ? `\nPartial Output:\n${truncatedResult}` : ''}`
+        return `Command was gracefully cancelled with partial output.${result.length > 0 ? `\nPartial Output:\n${result}` : ''}`
       }
 
       // Original error handling logic
@@ -1683,11 +2100,11 @@ export class Task {
         case 'execute_command':
           return [this.autoApprovalSettings.actions.executeSafeCommands ?? false, this.autoApprovalSettings.actions.executeAllCommands ?? false]
         default:
-          console.log(`[AutoApproval] Tool ${toolName} not in auto-approval list, returning false`)
+          logger.debug(`[AutoApproval] Tool ${toolName} not in auto-approval list, returning false`)
           break
       }
     } else {
-      console.log(`[AutoApproval] Auto-approval disabled, returning false`)
+      logger.debug(`[AutoApproval] Auto-approval disabled, returning false`)
     }
     return false
   }
@@ -1695,7 +2112,13 @@ export class Task {
   private formatErrorWithStatusCode(error: unknown): string {
     const errorObj = error as { status?: number; statusCode?: number; response?: { status?: number }; message?: string }
     const statusCode = errorObj?.status || errorObj?.statusCode || (errorObj?.response && errorObj.response.status)
-    const message = errorObj?.message ?? JSON.stringify(serializeError(error), null, 2)
+    let message = errorObj?.message ?? JSON.stringify(serializeError(error), null, 2)
+
+    // Sanitize credentials that may appear in API error messages (e.g. "apikey: xxx")
+    message = message.replace(
+      /\b(api[-_]?key|token|password|secret|authorization|bearer)(?::?\s+)([^\s"',]{8,})/gi,
+      (_m, label: string, value: string) => `${label}: ${value.slice(0, 4)}***${value.slice(-4)}`
+    )
 
     // Only prepend the statusCode if it's not already part of the message
     return statusCode && !message.includes(statusCode.toString()) ? `${statusCode} - ${message}` : message
@@ -1704,6 +2127,14 @@ export class Task {
   async *attemptApiRequest(previousApiReqIndex: number): ApiStream {
     // Build system prompt
     let systemPrompt = await this.buildSystemPrompt()
+    const userLocale = await this.getUserLocale()
+    this.contextManager.setLanguage(userLocale)
+
+    // Notify the user before the potentially slow truncation + summarization process.
+    const needsContextTruncation = this.contextManager.needsTruncation(this.chatermMessages, this.api, previousApiReqIndex)
+    if (needsContextTruncation) {
+      await this.say('context_truncated', JSON.stringify({ status: 'compressing', contextWindow: this.api.getModel().info.contextWindow }), true)
+    }
 
     const contextManagementMetadata = await this.contextManager.getNewContextMessagesAndMetadata(
       this.apiConversationHistory,
@@ -1717,6 +2148,15 @@ export class Task {
     if (contextManagementMetadata.updatedConversationHistoryDeletedRange) {
       this.conversationHistoryDeletedRange = contextManagementMetadata.conversationHistoryDeletedRange
       await this.saveChatermMessagesAndUpdateHistory() // saves task history item which we use to keep track of conversation history deleted range
+      logger.info('Context window truncated', {
+        event: 'context.truncated',
+        taskId: this.taskId,
+        deletedRange: contextManagementMetadata.conversationHistoryDeletedRange
+      })
+    }
+
+    if (needsContextTruncation) {
+      await this.say('context_truncated', JSON.stringify({ status: 'completed', contextWindow: this.api.getModel().info.contextWindow }), false)
     }
 
     // Apply summarizeUpToTs filter if specified
@@ -1726,6 +2166,11 @@ export class Task {
       this.summarizeUpToTs = undefined
     }
 
+    // Normalize tool_result and legacy file_ref blocks into text-only content
+    // so that downstream provider adapters see only supported block types.
+    conversationHistory = this.normalizeToolResultsForApi(conversationHistory)
+
+    mark('chaterm/agent/willCallAPI')
     let stream = this.api.createMessage(systemPrompt, conversationHistory)
 
     const iterator = stream[Symbol.asyncIterator]()
@@ -1734,6 +2179,7 @@ export class Task {
       // awaiting first chunk to see if it will throw an error
       this.isWaitingForFirstChunk = true
       const firstChunk = await iterator.next()
+      mark('chaterm/agent/firstToken')
       yield firstChunk.value
       this.isWaitingForFirstChunk = false
     } catch (error) {
@@ -1809,10 +2255,15 @@ export class Task {
     }
   }
 
-  async recursivelyMakeChatermRequests(userContent: UserContent, includeHostDetails: boolean = false): Promise<boolean> {
+  async recursivelyMakeChatermRequests(userContent: UserContent): Promise<boolean> {
     if (this.abort) {
       throw new Error('Chaterm instance aborted')
     }
+
+    // Before starting a new API request, flush any structured tool results
+    // that were accumulated during the previous assistant turn into the
+    // API conversation history as dedicated tool_result messages.
+    await this.flushPendingToolResults()
 
     // Check if user input needs todo creation (for subsequent conversations)
     await this.checkUserContentForTodo(userContent)
@@ -1821,10 +2272,15 @@ export class Task {
     await this.handleConsecutiveMistakes(userContent)
     await this.handleAutoApprovalLimits()
 
-    await this.prepareApiRequest(userContent, includeHostDetails)
+    // Capture the index of the PREVIOUS (completed) api_req_started message
+    // BEFORE prepareApiRequest creates a new one. The previous request carries
+    // token usage data needed by ContextManager to decide whether to truncate.
+    const previousApiReqIndex = findLastIndex(this.chatermMessages, (m) => m.say === 'api_req_started')
+
+    await this.prepareApiRequest(userContent)
 
     try {
-      return await this.processApiStreamAndResponse()
+      return await this.processApiStreamAndResponse(previousApiReqIndex)
     } catch (error) {
       // this should never happen since the only thing that can throw an error is the attemptApiRequest,
       // which is wrapped in a try catch that sends an ask where if noButtonClicked, will clear current task and destroy this instance.
@@ -1834,7 +2290,7 @@ export class Task {
   }
 
   private async recordModelUsage(): Promise<void> {
-    const currentProviderId = (await getGlobalState('apiProvider')) as string
+    const currentProviderId = this.apiProviderId ?? ((await getGlobalState('apiProvider')) as string)
     if (currentProviderId && this.api.getModel().id) {
       try {
         const chatSettings = await getGlobalState('chatSettings')
@@ -1860,10 +2316,10 @@ export class Task {
     const { response, text, contentParts } = await this.ask('mistake_limit_reached', errorMessage)
 
     if (response === 'messageResponse') {
-      await this.sayUserFeedback(text ?? '', contentParts)
+      await this.saveUserMessage(text ?? '', contentParts)
       userContent.push({
         type: 'text',
-        text: formatResponse.tooManyMistakes(text)
+        text: this.responseFormatter.tooManyMistakes(text)
       } as Anthropic.Messages.TextBlockParam)
     }
 
@@ -1890,7 +2346,7 @@ export class Task {
     this.consecutiveAutoApprovedRequestsCount = 0
   }
 
-  private async prepareApiRequest(userContent: UserContent, includeHostDetails: boolean): Promise<void> {
+  private async prepareApiRequest(userContent: UserContent): Promise<void> {
     const userInputParts = this.consumeNextUserInputContentParts()
 
     // Process all content parts: images, docs, chats, and command chips
@@ -1902,15 +2358,21 @@ export class Task {
     await this.say(
       'api_req_started',
       JSON.stringify({
-        request: userContent.map((block) => formatContentBlockToMarkdown(block)).join('\n\n') + '\n\nLoading...'
+        request: userContent.map((block) => formatContentBlockToMarkdown(block)).join('\n\n') + '\n\nLoading...',
+        contextWindow: this.api.getModel().info.contextWindow
       })
     )
 
     await this.handleFirstRequestCheckpoint()
 
-    const [parsedUserContent, environmentDetails] = await this.loadContext(userContent, includeHostDetails)
-    userContent.length = 0
-    userContent.push(...parsedUserContent)
+    if (this.apiConversationHistory.length === 0) {
+      const kbContext = await this.performKbSearch(userContent)
+      if (kbContext) {
+        userContent.push({ type: 'text', text: kbContext })
+      }
+    }
+
+    const environmentDetails = await this.loadContext()
     userContent.push({ type: 'text', text: environmentDetails })
 
     await this.addToApiConversationHistory({
@@ -1918,7 +2380,13 @@ export class Task {
       content: userContent
     })
     const chatSettings = await getGlobalState('chatSettings')
-    telemetryService.captureApiRequestEvent(this.taskId, await getGlobalState('apiProvider'), this.api.getModel().id, 'user', chatSettings?.mode)
+    telemetryService.captureApiRequestEvent(
+      this.taskId,
+      this.apiProviderId ?? (await getGlobalState('apiProvider')),
+      this.api.getModel().id,
+      'user',
+      chatSettings?.mode
+    )
     // Update API request message
     await this.updateApiRequestMessage(userContent)
   }
@@ -1928,15 +2396,14 @@ export class Task {
    * Handles both built-in commands (e.g., /summary-to-doc) and knowledge base commands.
    * Returns cmdLines for knowledge base command content.
    */
-  private async processSlashCommands(userContent: UserContent, contentParts?: ContentPart[]): Promise<string[]> {
+  private async processSlashCommands(userContent: UserContent, contentParts?: ContentPart[]): Promise<void> {
     const MAX_COMMANDS = 5
-    const cmdLines: string[] = []
-    if (!contentParts) return cmdLines
+    if (!contentParts) return
 
     this.summarizeUpToTs = undefined
 
     const commandChips = contentParts.filter((p) => p.type === 'chip' && p.chipType === 'command').slice(0, MAX_COMMANDS)
-    if (commandChips.length === 0) return cmdLines
+    if (commandChips.length === 0) return
 
     try {
       const userConfig = await getUserConfig()
@@ -1946,36 +2413,43 @@ export class Task {
 
       for (const chip of commandChips) {
         const { command, path, summarizeUpToTs } = chip.ref
+        let expandedContent = ''
 
         if (path) {
           try {
             const { content } = await this.readFile(path, MAX_DOC_BYTES)
-            cmdLines.push(content)
+            expandedContent = content
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
-            cmdLines.push(`- COMMAND_READ_ERROR: ${command}: ${msg}`)
-            console.error(`[Task] Failed to read command file for "${command}":`, msg)
+            logger.error(`[Task] Failed to read command file for "${command}"`, { error: msg })
+            expandedContent = `[Error: Failed to load command file ${path}]`
           }
         } else {
-          // Built-in command: handle by command type
+          // Built-in command: get prompt content
           if (command === SLASH_COMMANDS.SUMMARY_TO_DOC) {
             if (summarizeUpToTs) {
               this.summarizeUpToTs = summarizeUpToTs
             }
-
-            // Replace text content with full prompt
-            for (const block of userContent) {
-              if (block.type === 'text' && block.text.trim() === command) {
-                block.text = getSummaryToDocPrompt(isChinese)
-              }
+            expandedContent = getSummaryToDocPrompt(isChinese)
+          } else if (command === SLASH_COMMANDS.SUMMARY_TO_SKILL) {
+            if (summarizeUpToTs) {
+              this.summarizeUpToTs = summarizeUpToTs
             }
+            expandedContent = getSummaryToSkillPrompt(isChinese)
+          }
+        }
+
+        // Replace command text in all text blocks
+        for (const block of userContent) {
+          if (block.type === 'text' && block.text.includes(command)) {
+            block.text = block.text.replaceAll(command, expandedContent)
+            logger.debug('[DEBUG] after replacing command in block.text', { text: block.text })
           }
         }
       }
     } catch (error) {
-      console.error('[Task] Failed to process slash commands:', error)
+      logger.error('[Task] Failed to process slash commands', { error: error })
     }
-    return cmdLines
   }
 
   private async handleFirstRequestCheckpoint(): Promise<void> {
@@ -2000,13 +2474,12 @@ export class Task {
     await this.postStateToWebview()
   }
 
-  private async processApiStreamAndResponse(): Promise<boolean> {
+  private async processApiStreamAndResponse(previousApiReqIndex: number): Promise<boolean> {
     const streamMetrics = this.createStreamMetrics()
     const messageUpdater = this.createMessageUpdater(streamMetrics)
 
     this.resetStreamingState()
 
-    const previousApiReqIndex = findLastIndex(this.chatermMessages, (m) => m.say === 'api_req_started')
     const stream = this.attemptApiRequest(previousApiReqIndex)
 
     const assistantMessage = await this.processStream(stream, streamMetrics, messageUpdater)
@@ -2047,6 +2520,7 @@ export class Task {
               streamMetrics.cacheWriteTokens,
               streamMetrics.cacheReadTokens
             ),
+          contextWindow: this.api.getModel().info.contextWindow,
           cancelReason,
           streamingFailedMessage
         } satisfies ChatermApiReqInfo)
@@ -2065,7 +2539,6 @@ export class Task {
     this.presentAssistantMessageLocked = false
     this.presentAssistantMessageHasPendingUpdates = false
     // this.didAutomaticallyRetryFailedApiRequest = false
-    this.isInsideThinkingBlock = false
   }
 
   private async processStream(stream: ApiStream, streamMetrics: StreamMetrics, messageUpdater: MessageUpdater): Promise<string> {
@@ -2148,7 +2621,7 @@ export class Task {
     abortStream: (cancelReason: ChatermApiReqCancelReason, streamingFailedMessage?: string) => Promise<void>
   ): Promise<boolean> {
     if (this.abort) {
-      console.log('aborting stream...')
+      logger.debug('Aborting stream...', { event: 'agent.task.stream.abort' })
       if (!this.abandoned) {
         await abortStream('user_cancelled')
       }
@@ -2177,7 +2650,10 @@ export class Task {
     const lastMessage = this.chatermMessages.at(-1)
     if (lastMessage && lastMessage.partial) {
       lastMessage.partial = false
-      console.log('updating partial message', lastMessage)
+      logger.debug('Updating partial message state', {
+        event: 'agent.task.partial_message.finalize',
+        messageType: lastMessage.type
+      })
     }
 
     await this.addToApiConversationHistory({
@@ -2282,38 +2758,12 @@ export class Task {
     return false
   }
 
-  async loadContext(userContent: UserContent, includeHostDetails: boolean = false): Promise<[UserContent, string]> {
-    const processUserContent = async () => {
-      return await Promise.all(
-        userContent.map(async (block) => {
-          if (block.type === 'text') {
-            // We need to ensure any user generated content is wrapped in one of these tags so that we know to parse mentions
-            // FIXME: Only parse text in between these tags instead of the entire text block which may contain other tool results. This is part of a larger issue where we shouldn't be using regex to parse mentions in the first place (ie for cases where file paths have spaces)
-            if (
-              block.text.includes('<feedback>') ||
-              block.text.includes('<answer>') ||
-              block.text.includes('<task>') ||
-              block.text.includes('<user_message>')
-            ) {
-              return {
-                ...block
-                //text: processedText,
-              }
-            }
-          }
-          return block
-        })
-      )
-    }
-
-    // Run initial promises in parallel
-    const [processedUserContent, environmentDetails] = await Promise.all([processUserContent(), this.getEnvironmentDetails(includeHostDetails)])
-
-    // Return all results
-    return [processedUserContent, environmentDetails]
+  async loadContext(): Promise<string> {
+    const environmentDetails = await this.getEnvironmentDetails()
+    return environmentDetails
   }
 
-  async getEnvironmentDetails(includeHostDetails: boolean = false) {
+  async getEnvironmentDetails() {
     let details = ''
     // Add current time information with timezone
     const now = new Date()
@@ -2331,35 +2781,31 @@ export class Task {
     const timeZoneOffsetStr = `${timeZoneOffset >= 0 ? '+' : ''}${timeZoneOffset}:00`
     details += `\n\n# ${this.messages.currentTimeTitle}:\n${formatter.format(now)} (${timeZone}, UTC${timeZoneOffsetStr})`
 
-    if (includeHostDetails && this.hosts && this.hosts.length > 0) {
-      details += `\n\n# ${this.messages.currentHostsTitle}:\n${this.hosts.map((h) => h.host).join(', ')}`
+    const hosts = this.hosts?.map((h) => h.host).join(', ') ?? ''
+    details += `\n\n# ${this.messages.currentHostsTitle}:[${hosts}]\n\n`
 
-      for (const host of this.hosts) {
-        if (host.assetType?.startsWith('person-switch-')) {
-          continue
-        }
-
-        details += `\n\n# ${formatMessage(this.messages.hostWorkingDirectory, { host: host.host })}:\n`
-
-        const res = await this.executeCommandInRemoteServer('ls -al', host.host)
-
-        const processLsOutput = (output: string): string => {
-          const lines = output.split('\n')
-          const totalLine = lines[0]
-          const fileLines = lines.slice(1).filter((line) => line.trim() !== '')
-          const limitedLines = fileLines.slice(0, 200)
-          let result = totalLine + '\n'
-          result += limitedLines.join('\n')
-          if (fileLines.length > 200) {
-            result += formatMessage(this.messages.moreFilesNotShown, { count: fileLines.length - 200 })
-          }
-          return result
-        }
-
-        const processedOutput = processLsOutput(res)
-        details += processedOutput
-      }
-    }
+    // Files informations are not used for now because we can't get the current working directory of the hosts
+    // for (const host of this.hosts) {
+    //   if (host.assetType?.startsWith('person-switch-')) {
+    //     continue
+    //   }
+    //   details += `\n\n# ${formatMessage(this.messages.hostWorkingDirectory, { host: host.host })}:\n`
+    //   const res = await this.executeCommandInRemoteServer('ls -al', host.host)
+    //   const processLsOutput = (output: string): string => {
+    //     const lines = output.split('\n')
+    //     const totalLine = lines[0]
+    //     const fileLines = lines.slice(1).filter((line) => line.trim() !== '')
+    //     const limitedLines = fileLines.slice(0, 200)
+    //     let result = totalLine + '\n'
+    //     result += limitedLines.join('\n')
+    //     if (fileLines.length > 200) {
+    //       result += formatMessage(this.messages.moreFilesNotShown, { count: fileLines.length - 200 })
+    //     }
+    //     return result
+    //   }
+    //   const processedOutput = processLsOutput(res)
+    //   details += processedOutput
+    // }
 
     // Add context window usage information
     const { contextWindow } = getContextWindowInfo(this.api)
@@ -2410,12 +2856,12 @@ export class Task {
     try {
       if (block.partial) {
         const shouldAutoApprove = this.shouldAutoApproveTool(block.name)
-        console.log(`[Command Execution] Partial command, shouldAutoApprove: ${shouldAutoApprove}`)
+        logger.debug(`[Command Execution] Partial command, shouldAutoApprove: ${shouldAutoApprove}`)
         if (!shouldAutoApprove) {
-          console.log(`[Command Execution] Asking for partial command approval`)
+          logger.debug(`[Command Execution] Asking for partial command approval`)
           await this.ask('command', this.removeClosingTag(block.partial, 'command', command), block.partial).catch(() => {})
         } else {
-          console.log(`[Command Execution] Auto-approving partial command`)
+          logger.debug(`[Command Execution] Auto-approving partial command`)
         }
         return
       } else {
@@ -2478,13 +2924,10 @@ export class Task {
           // 2. Session setting: user clicked "auto-approve read-only" button in this session
           const latestAutoApprovalSettings = await getGlobalState('autoApprovalSettings')
           const globalAutoExecuteReadOnly = latestAutoApprovalSettings?.actions?.autoExecuteReadOnlyCommands ?? false
-          // console.log(
-          //   `[Command Execution] Read-only auto-approval check: command="${command}", requiresApprovalPerLLM=${requiresApprovalPerLLM}, globalAutoExecuteReadOnly=${globalAutoExecuteReadOnly}, sessionAutoApproved=${this.readOnlyCommandsAutoApproved}`
-          // )
           if (!requiresApprovalPerLLM && (globalAutoExecuteReadOnly || this.readOnlyCommandsAutoApproved)) {
             // Auto-approve read-only command
             const reason = globalAutoExecuteReadOnly ? 'global setting' : 'session auto-approval'
-            console.log(`[Command Execution] Auto-approving read-only command (${reason} enabled)`)
+            logger.info(`[Command Execution] Auto-approving read-only command (${reason} enabled)`)
             this.removeLastPartialMessageIfExistsWithType('ask', 'command')
             await this.say('command', command, false)
             this.consecutiveAutoApprovedRequestsCount++
@@ -2492,7 +2935,7 @@ export class Task {
           } else {
             this.showNotificationIfNeeded(`Chaterm wants to execute a command: ${command}`)
             const didApprove = await this.askApproval(toolDescription, 'command', command)
-            console.log(`[Command Execution] User approval result: ${didApprove}`)
+            logger.debug(`[Command Execution] User approval result: ${didApprove}`)
             if (!didApprove) {
               await this.saveCheckpoint()
               return
@@ -2513,16 +2956,18 @@ export class Task {
         }
 
         const ipList = ip!.split(',')
-        let result = ''
-        for (const ip of ipList) {
-          result += `\n\n# Executing result on ${ip}:`
-          result += await this.executeCommandTool(command!, ip!)
+        let uiResult = ''
+        for (const singleIp of ipList) {
+          const output = await this.executeCommandTool(command!, singleIp)
+          await this.pushToolResult(toolDescription, output, {
+            toolName: block.name,
+            ip: singleIp
+          })
+          uiResult += `\n\n# Executing result on ${singleIp}:\n${output}`
         }
         if (timeoutId) {
           clearTimeout(timeoutId)
         }
-
-        this.pushToolResult(toolDescription, result)
 
         // Record tool call to active todo
         try {
@@ -2531,12 +2976,12 @@ export class Task {
             ip: ip!
           })
         } catch (error) {
-          console.error('Failed to track tool call:', error)
+          logger.error('Failed to track tool call', { error: error })
           // Don't affect main functionality, only log error
         }
 
-        // Add todo status update reminder
-        await this.addTodoStatusUpdateReminder(result)
+        // Add todo status update reminder (use UI-friendly formatted result)
+        await this.addTodoStatusUpdateReminder(uiResult)
 
         await this.saveCheckpoint()
       }
@@ -2548,7 +2993,7 @@ export class Task {
 
   private async handleMissingParam(paramName: string, toolDescription: string, toolName: ToolUseName): Promise<void> {
     this.consecutiveMistakeCount++
-    this.pushToolResult(toolDescription, await this.sayAndCreateMissingParamError(toolName, paramName))
+    await this.pushToolResult(toolDescription, await this.sayAndCreateMissingParamError(toolName, paramName))
     return this.saveCheckpoint()
   }
   /**
@@ -2565,11 +3010,14 @@ export class Task {
     securityMessage: string
     shouldReturn: boolean
   }> {
-    console.log('this.commandSecurityManager.getSecurityConfig()', this.commandSecurityManager.getSecurityConfig())
-
     // Security check: verify if command is in blacklist
     const securityResult = this.commandSecurityManager.validateCommandSecurity(command)
-    console.log('securityResult', securityResult)
+    logger.debug('Command security validation completed', {
+      event: 'agent.task.command_security.result',
+      isAllowed: securityResult.isAllowed,
+      requiresApproval: securityResult.requiresApproval,
+      severity: securityResult.severity
+    })
 
     // Identify if security confirmation is needed
     let needsSecurityApproval = false
@@ -2589,7 +3037,7 @@ export class Task {
         const fullBlockedMessage = `${blockedMessage}\n\n${this.messages.securitySettingsLink}`
         await this.say('command_blocked', fullBlockedMessage, false)
         // Return tool execution blocked result to LLM, use keyword to trigger security stop mechanism
-        this.pushToolResult(toolDescription, `command_blocked! ${blockedMessage}`)
+        await this.pushToolResult(toolDescription, `command_blocked! ${blockedMessage}`)
         await this.saveCheckpoint()
         return { needsSecurityApproval: false, securityMessage: '', shouldReturn: true }
       }
@@ -2604,7 +3052,8 @@ export class Task {
   private getToolDescription(block: any): string {
     switch (block.name) {
       case 'execute_command':
-        return `[${block.name} for '${block.params.command}']`
+        // Keep description concise; avoid embedding verbose "for" phrasing.
+        return `[${block.name} '${block.params.command}']`
       case 'ask_followup_question':
         return `[${block.name} for '${block.params.question}']`
       case 'attempt_completion':
@@ -2619,24 +3068,78 @@ export class Task {
         return `[${block.name} - ${block.params.server_name}/${block.params.tool_name}]`
       case 'access_mcp_resource':
         return `[${block.name} - ${block.params.server_name}:${block.params.uri}]`
+      case 'kb_search':
+        return `[${block.name} for '${block.params.query}']`
+      case 'web_fetch':
+        return `[${block.name} '${block.params.url}']`
       default:
         return `[${block.name}]`
     }
   }
 
-  private pushToolResult(toolDescription: string, content: ToolResponse, options?: { dontLock?: boolean }): void {
-    this.userMessageContent.push({
-      type: 'text',
-      text: `${toolDescription} Result:`
-    })
-    if (typeof content === 'string') {
-      this.userMessageContent.push({
-        type: 'text',
-        text: content || '(tool did not return anything)'
-      })
-    } else {
-      this.userMessageContent.push(...content)
+  private async pushToolResult(
+    toolDescription: string,
+    content: ToolResponse,
+    options?: {
+      dontLock?: boolean
+      toolName?: string
+      ip?: string
+      hosts?: Host[]
+      isError?: boolean
+      ephemeral?: boolean
+      skipOffload?: boolean
     }
+  ): Promise<void> {
+    let docPath: string | undefined
+    let size: number | undefined
+    let resultText: string | undefined
+    let lineCount: number | undefined
+
+    if (typeof content === 'string') {
+      const text = content || '(tool did not return anything)'
+      lineCount = text.split(/\r\n|\r|\n/).length
+      if (!options?.skipOffload && shouldOffload(text)) {
+        try {
+          const offloadResult = await writeToolOutput(this.taskId, toolDescription, text)
+          docPath = `@offload/${offloadResult.relativePath}`
+          size = offloadResult.size
+          // Avoid duplicating large content in context; keep a short note instead.
+          resultText = `Offloaded output to ${docPath}`
+        } catch (error) {
+          logger.error('[pushToolResult] Failed to offload tool output, falling back to inline', {
+            error
+          })
+          resultText = text
+        }
+      } else {
+        resultText = text
+      }
+    } else {
+      const textParts = content
+        .filter((block) => block.type === 'text')
+        .map((block) => (block as Anthropic.TextBlockParam).text)
+        .join('\n')
+      resultText = textParts || '(tool did not return anything)'
+      lineCount = resultText.split(/\r\n|\r|\n/).length
+    }
+
+    const toolResult: ToolResult = {
+      toolName: options?.toolName ?? toolDescription,
+      toolDescription,
+      taskId: this.taskId,
+      timestamp: Date.now(),
+      ip: options?.ip,
+      hosts: options?.hosts,
+      docPath,
+      size,
+      lineCount,
+      isError: options?.isError,
+      ephemeral: options?.ephemeral,
+      result: resultText
+    }
+
+    this.pendingToolResults.push(toolResult)
+
     // For todo tools, we allow combining with one additional tool in the same message.
     // When options.dontLock is true, do not mark that a tool has been used yet.
     if (!options?.dontLock) {
@@ -2644,38 +3147,80 @@ export class Task {
     }
   }
 
-  private pushAdditionalToolFeedback(feedback?: string): void {
+  private async clearEphemeralToolResults(): Promise<void> {
+    let didChange = false
+
+    for (const message of this.apiConversationHistory) {
+      if (!Array.isArray(message?.content)) continue
+      for (const block of message.content) {
+        if (!block || block.type !== 'tool_result' || typeof block.content !== 'string') continue
+
+        const toolResult = this.parseToolResultContent(block.content)
+        const hasEphemeral = toolResult && toolResult.ephemeral === true
+
+        if (!hasEphemeral) continue
+
+        const updated: ToolResult = {
+          ...toolResult,
+          result: '(expired)'
+        }
+
+        block.content = JSON.stringify(updated)
+        didChange = true
+      }
+    }
+
+    if (didChange) {
+      await saveApiConversationHistory(this.taskId, this.apiConversationHistory)
+    }
+  }
+
+  private async pushAdditionalToolFeedback(feedback?: string): Promise<void> {
     if (!feedback) return
-    const truncatedFeedback = this.truncateCommandOutput(feedback)
-    const content = formatResponse.toolResult(formatMessage(this.messages.userProvidedFeedback, { feedback: truncatedFeedback }))
+    const normalizedFeedback = this.truncateCommandOutput(feedback)
+    const content = this.responseFormatter.toolResult(formatMessage(this.messages.userProvidedFeedback, { feedback: normalizedFeedback }))
+
+    // For V2, only keep a short note in userMessageContent; the full feedback
+    // is handled via structured tool_result metadata and content.
     if (typeof content === 'string') {
-      this.userMessageContent.push({ type: 'text', text: content })
+      this.userMessageContent.push({
+        type: 'text',
+        text: content
+      })
     } else {
       this.userMessageContent.push(...content)
     }
   }
 
   private async askApproval(toolDescription: string, type: ChatermAsk, partialMessage?: string): Promise<boolean> {
-    const { response, text, contentParts } = await this.ask(type, partialMessage, false)
+    const { response, text, contentParts, toolResult } = await this.ask(type, partialMessage, false)
     const approved = response === 'yesButtonClicked' || response === 'autoApproveReadOnlyClicked'
 
     // If user clicked "auto-approve read-only" button, enable session-level auto-approval for subsequent read-only commands
     if (response === 'autoApproveReadOnlyClicked') {
       this.readOnlyCommandsAutoApproved = true
-      console.log(`[Command Execution] User enabled session auto-approval for read-only commands`)
+      logger.info(`[Command Execution] User enabled session auto-approval for read-only commands`)
     }
 
     if (!approved) {
-      this.pushToolResult(toolDescription, formatResponse.toolDenied())
+      await this.pushToolResult(toolDescription, this.responseFormatter.toolDenied())
       if (text) {
-        this.pushAdditionalToolFeedback(text)
-        await this.sayUserFeedback(text, contentParts)
+        await this.pushAdditionalToolFeedback(text)
+        await this.saveUserMessage(text, contentParts)
         await this.saveCheckpoint()
       }
       this.didRejectTool = true
+    } else if (toolResult) {
+      await this.pushToolResult(toolDescription, toolResult.output, {
+        toolName: toolResult.toolName ?? 'execute_command',
+        hosts: this.hosts,
+        isError: toolResult.isError
+      })
+      await this.saveUserMessage(toolResult.output, undefined, 'command_output')
+      await this.saveCheckpoint()
     } else if (text) {
-      this.pushAdditionalToolFeedback(text)
-      await this.sayUserFeedback(text, contentParts)
+      await this.pushAdditionalToolFeedback(text)
+      await this.saveUserMessage(text, contentParts)
       await this.saveCheckpoint()
     }
     return approved
@@ -2702,12 +3247,12 @@ export class Task {
 
   private async handleToolError(toolDescription: string, action: string, error: Error): Promise<void> {
     if (this.abandoned) {
-      console.log('Ignoring error since task was abandoned')
+      logger.debug('Ignoring error since task was abandoned')
       return
     }
     const errorString = `Error ${action}: ${JSON.stringify(serializeError(error))}`
     await this.say('error', `Error ${action}:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`)
-    this.pushToolResult(toolDescription, formatResponse.toolError(errorString))
+    await this.pushToolResult(toolDescription, this.responseFormatter.toolError(errorString))
   }
 
   private async handleAskFollowupQuestionToolUse(block: ToolUse): Promise<void> {
@@ -2728,7 +3273,7 @@ export class Task {
 
       if (!question) {
         this.consecutiveMistakeCount++
-        this.pushToolResult(toolDescription, await this.sayAndCreateMissingParamError('ask_followup_question', 'question'))
+        await this.pushToolResult(toolDescription, await this.sayAndCreateMissingParamError('ask_followup_question', 'question'))
         await this.saveCheckpoint()
         return
       }
@@ -2757,10 +3302,10 @@ export class Task {
         }
       } else {
         telemetryService.captureOptionsIgnored(this.taskId, options.length, 'act')
-        await this.sayUserFeedback(text ?? '', contentParts)
+        await this.saveUserMessage(text ?? '', contentParts)
       }
 
-      this.pushToolResult(toolDescription, formatResponse.toolResult(`<answer>\n${text}\n</answer>`))
+      await this.pushToolResult(toolDescription, this.responseFormatter.toolResult(`<answer>\n${text}\n</answer>`))
       await this.saveCheckpoint()
     } catch (error) {
       await this.handleToolError(toolDescription, 'asking question', error as Error)
@@ -2773,6 +3318,7 @@ export class Task {
     const result: string | undefined = block.params.result
     const command: string | undefined = block.params.command
     const ip: string | undefined = block.params.ip
+    const depositExperienceRaw: string | undefined = block.params.depositExperience
 
     const addNewChangesFlagToLastCompletionResultMessage = async () => {
       const hasNewChanges = await this.doesLatestTaskCompletionHaveNewChanges()
@@ -2804,7 +3350,7 @@ export class Task {
 
       if (!result) {
         this.consecutiveMistakeCount++
-        this.pushToolResult(toolDescription, await this.sayAndCreateMissingParamError('attempt_completion', 'result'))
+        await this.pushToolResult(toolDescription, await this.sayAndCreateMissingParamError('attempt_completion', 'result'))
         return
       }
       this.consecutiveMistakeCount = 0
@@ -2819,7 +3365,6 @@ export class Task {
           await this.say('completion_result', result, false)
           await this.saveCheckpoint(true)
           await addNewChangesFlagToLastCompletionResultMessage()
-          telemetryService.captureTaskCompleted(this.taskId)
         } else {
           await this.saveCheckpoint(true)
         }
@@ -2835,15 +3380,39 @@ export class Task {
         await this.say('completion_result', result, false)
         await this.saveCheckpoint(true)
         await addNewChangesFlagToLastCompletionResultMessage()
-        telemetryService.captureTaskCompleted(this.taskId)
+      }
+
+      telemetryService.captureTaskCompleted(this.taskId)
+      const depositExperience = this.normalizeBooleanToolParam(depositExperienceRaw)
+      if (depositExperience === true) {
+        this.enqueueExperienceExtraction()
+      } else {
+        logger.info('experience.extract.skipped', {
+          event: 'experience.extract.skipped',
+          taskId: this.taskId,
+          reason: depositExperienceRaw === undefined ? 'deposit_experience_missing' : 'deposit_experience_false'
+        })
+      }
+
+      // Auto-complete all in_progress todos when task is completed (intranet feature)
+      await this.completeAllInProgressTodos()
+      // Clear ephemeral tool results (upstream feature)
+      await this.clearEphemeralToolResults()
+
+      // Trigger chat sync upload after the agent emits a completion result
+      try {
+        const { ChatSyncScheduler } = await import('../../../storage/chat_sync/index')
+        ChatSyncScheduler.getInstance()?.triggerUploadSync()
+      } catch {
+        // Chat sync module may not be available, ignore silently
       }
 
       const { response, text, contentParts } = await this.ask('completion_result', '', false)
       if (response === 'yesButtonClicked') {
-        this.pushToolResult(toolDescription, '')
+        await this.pushToolResult(toolDescription, '')
         return
       }
-      await this.sayUserFeedback(text ?? '', contentParts)
+      await this.saveUserMessage(text ?? '', contentParts)
       await this.saveCheckpoint()
 
       const toolResults: (Anthropic.TextBlockParam | Anthropic.ImageBlockParam)[] = []
@@ -2856,7 +3425,7 @@ export class Task {
       }
       toolResults.push({
         type: 'text',
-        text: `The user has provided feedback on the results. Consider their input to continue the task, and then attempt completion again.\n<feedback>\n${text}\n</feedback>`
+        text: formatMessage(this.messages.userProvidedFeedback, { feedback: text })
       })
       this.userMessageContent.push({ type: 'text', text: `${toolDescription} Result:` })
       this.userMessageContent.push(...toolResults)
@@ -2876,7 +3445,7 @@ export class Task {
       }
       if (!context) {
         this.consecutiveMistakeCount++
-        this.pushToolResult(toolDescription, await this.sayAndCreateMissingParamError('condense', 'context'))
+        await this.pushToolResult(toolDescription, await this.sayAndCreateMissingParamError('condense', 'context'))
         await this.saveCheckpoint()
         return
       }
@@ -2892,13 +3461,13 @@ export class Task {
       const { text, contentParts } = await this.ask('condense', context, false)
 
       if (text) {
-        await this.sayUserFeedback(text ?? '', contentParts)
-        this.pushToolResult(
+        await this.saveUserMessage(text ?? '', contentParts)
+        await this.pushToolResult(
           toolDescription,
-          formatResponse.toolResult(`The user provided feedback on the condensed conversation summary:\n<feedback>\n${text}\n</feedback>`)
+          this.responseFormatter.toolResult(`The user provided feedback on the condensed conversation summary:\n<feedback>\n${text}\n</feedback>`)
         )
       } else {
-        this.pushToolResult(toolDescription, formatResponse.toolResult(formatResponse.condense()))
+        await this.pushToolResult(toolDescription, this.responseFormatter.toolResult(this.responseFormatter.condense()))
 
         const lastMessage = this.apiConversationHistory[this.apiConversationHistory.length - 1]
         const summaryAlreadyAppended = lastMessage && lastMessage.role === 'assistant'
@@ -2910,6 +3479,7 @@ export class Task {
           keepStrategy
         )
         await this.saveChatermMessagesAndUpdateHistory()
+        this.contextManager.setLanguage(await this.getUserLocale())
         await this.contextManager.triggerApplyStandardContextTruncationNoticeChange(Date.now(), this.taskId)
       }
       await this.saveCheckpoint()
@@ -2942,7 +3512,7 @@ export class Task {
       const requiredCheck = async (val: unknown, name: string): Promise<boolean> => {
         if (!val) {
           this.consecutiveMistakeCount++
-          this.pushToolResult(toolDescription, await this.sayAndCreateMissingParamError('report_bug', name))
+          await this.pushToolResult(toolDescription, await this.sayAndCreateMissingParamError('report_bug', name))
           await this.saveCheckpoint()
           return false
         }
@@ -2968,7 +3538,7 @@ export class Task {
       }
 
       const operatingSystem = os.platform() + ' ' + os.release()
-      const providerAndModel = `${(await getGlobalState('apiProvider')) as string} / ${this.api.getModel().id}`
+      const providerAndModel = `${this.apiProviderId ?? (await getGlobalState('apiProvider'))} / ${this.api.getModel().id}`
 
       const bugReportData = JSON.stringify({
         title,
@@ -2982,15 +3552,15 @@ export class Task {
 
       const { text, contentParts } = await this.ask('report_bug', bugReportData, false)
       if (text) {
-        await this.sayUserFeedback(text ?? '', contentParts)
-        this.pushToolResult(
+        await this.saveUserMessage(text ?? '', contentParts)
+        await this.pushToolResult(
           toolDescription,
-          formatResponse.toolResult(
+          this.responseFormatter.toolResult(
             `The user did not submit the bug, and provided feedback on the Github issue generated instead:\n<feedback>\n${text}\n</feedback>`
           )
         )
       } else {
-        this.pushToolResult(toolDescription, formatResponse.toolResult('The user accepted the creation of the Github issue.'))
+        await this.pushToolResult(toolDescription, this.responseFormatter.toolResult('The user accepted the creation of the Github issue.'))
         // Logic to create an issue can be added here
       }
       await this.saveCheckpoint()
@@ -3008,7 +3578,9 @@ export class Task {
     if (chatSettings?.mode === 'chat') {
       this.userMessageContent.push({
         type: 'text',
-        text: formatResponse.toolError('Chat mode does not support tool execution. This mode is for conversation, learning, and brainstorming only.')
+        text: this.responseFormatter.toolError(
+          'Chat mode does not support tool execution. This mode is for conversation, learning, and brainstorming only.'
+        )
       })
       await this.say('error', 'Chat mode does not support tool execution. This mode is for conversation, learning, and brainstorming only.', false)
       await this.saveCheckpoint()
@@ -3035,7 +3607,7 @@ export class Task {
       if (block.name !== 'todo_write' && block.name !== 'todo_read') {
         this.userMessageContent.push({
           type: 'text',
-          text: formatResponse.toolAlreadyUsed(block.name)
+          text: this.responseFormatter.toolAlreadyUsed(block.name)
         })
         return
       }
@@ -3075,6 +3647,12 @@ export class Task {
       case 'grep_search':
         await this.handleGrepSearchToolUse(block)
         break
+      case 'read_file':
+        await this.handleReadFileToolUse(block)
+        break
+      case 'write_to_file':
+        await this.handleWriteToFileToolUse(block)
+        break
       case 'use_mcp_tool':
         await this.handleUseMcpToolUse(block)
         break
@@ -3087,8 +3665,17 @@ export class Task {
       case 'summarize_to_knowledge':
         await this.handleSummarizeToKnowledgeToolUse(block)
         break
+      case 'summarize_to_skill':
+        await this.handleSummarizeToSkillToolUse(block)
+        break
+      case 'kb_search':
+        await this.handleKbSearchToolUse(block)
+        break
+      case 'web_fetch':
+        await this.handleWebFetchToolUse(block)
+        break
       default:
-        console.error(`[Task] Unknown tool name: ${block.name}`)
+        logger.error(`[Task] Unknown tool name: ${block.name}`)
     }
     if (!block.name.startsWith('todo_') && block.name !== 'ask_followup_question' && block.name !== 'attempt_completion') {
       await this.addTodoStatusUpdateReminder('')
@@ -3124,8 +3711,23 @@ export class Task {
           .join('\n')
         if (list) summary += list
       } else {
+        // Determine base directory for local search
+        let baseDir = process.cwd()
+        let searchPath = relPath
+
+        // Check if searching in offload directory
+        if (relPath.startsWith('@offload/') || relPath.startsWith('offload/')) {
+          baseDir = getOffloadDir(this.taskId)
+          searchPath = relPath.replace(/^@?offload\//, '') || '.'
+          logger.info('[glob_search] Searching in offload directory', { taskId: this.taskId, searchPath })
+        } else if (relPath.startsWith('@knowledgebase') || relPath.startsWith('knowledgebase')) {
+          baseDir = getKnowledgeBaseRoot()
+          searchPath = relPath.replace(/^@?knowledgebase\/?/, '') || '.'
+          logger.info('[glob_search] Searching in knowledgebase', { taskId: this.taskId, searchPath })
+        }
+
         // Local
-        const res = await globSearch(process.cwd(), { pattern, path: relPath, limit, sort })
+        const res = await globSearch(baseDir, { pattern, path: searchPath, limit, sort })
         const count = res.total
         summary += `Found ${count} files matching "${pattern}" in ${relPath} (sorted by ${sort}).\n`
         const list = res.files
@@ -3138,7 +3740,7 @@ export class Task {
       // Show search results in UI immediately
       await this.say('search_result', summary.trim(), false)
       // Also push to LLM as tool result for context
-      this.pushToolResult(toolDescription, summary.trim())
+      await this.pushToolResult(toolDescription, summary.trim())
       await this.saveCheckpoint()
     } catch (error) {
       await this.handleToolError(toolDescription, 'glob search', error as Error)
@@ -3184,7 +3786,18 @@ export class Task {
           summary += '---\n'
         }
       } else {
-        const res = await localGrepSearch(process.cwd(), relPath, pattern, include, max, ctx, caseSensitive)
+        // Determine base directory for local search
+        let baseDir = process.cwd()
+        let searchPath = relPath
+
+        // Check if searching in offload directory
+        if (relPath.startsWith('@offload/') || relPath.startsWith('offload/')) {
+          baseDir = getOffloadDir(this.taskId)
+          searchPath = relPath.replace(/^@?offload\//, '') || '.'
+          logger.info('[grep_search] Searching in offload directory', { taskId: this.taskId, searchPath })
+        }
+
+        const res = await localGrepSearch(baseDir, searchPath, pattern, include, max, ctx, caseSensitive)
         matchesCount = res.total
         summary += `Found ${matchesCount} match(es) for /${pattern}/ in ${relPath}${include ? ` (filter: "${include}")` : ''}.\n---\n`
         const grouped: Record<string, { line: number; text: string }[]> = {}
@@ -3205,10 +3818,185 @@ export class Task {
       // Show search results in UI immediately
       await this.say('search_result', summary.trim(), false)
       // Also push to LLM as tool result for context
-      this.pushToolResult(toolDescription, summary.trim())
+      await this.pushToolResult(toolDescription, summary.trim())
       await this.saveCheckpoint()
     } catch (error) {
       await this.handleToolError(toolDescription, 'grep search', error as Error)
+      await this.saveCheckpoint()
+    }
+  }
+
+  private async handleReadFileToolUse(block: ToolUse): Promise<void> {
+    const toolDescription = this.getToolDescription(block)
+    try {
+      const filePath = block.params.path || block.params.file_path
+      // const ip = block.params.ip
+      const limit = block.params.limit ? Number.parseInt(block.params.limit, 10) : undefined
+      const offset = block.params.offset ? Math.max(Number.parseInt(block.params.offset, 10), 0) : 0
+
+      if (!filePath) {
+        await this.handleMissingParam('path', toolDescription, 'read_file')
+        return
+      }
+
+      let content = ''
+      let actualPath = filePath
+      let isOffloadFile = false
+
+      // Check if path is referencing an offload file
+      if (filePath.startsWith('@offload/') || filePath.startsWith('offload/')) {
+        const relativePath = filePath.replace(/^@?offload\//, '')
+        actualPath = path.join(getOffloadDir(this.taskId), relativePath)
+        isOffloadFile = true
+        logger.info('[read_file] Reading offload file', { taskId: this.taskId, relativePath })
+      } else if (filePath.startsWith('@knowledgebase') || filePath.startsWith('knowledgebase')) {
+        // Resolve @knowledgebase/ or knowledgebase/ to absolute path under knowledge base root (cross-platform)
+        const relativePath = filePath.replace(/^@?knowledgebase\/?/, '').replace(/\\/g, '/') || '.'
+        actualPath = path.join(getKnowledgeBaseRoot(), relativePath)
+        logger.info('[read_file] Reading knowledge base file', { taskId: this.taskId, relativePath })
+      } else if (filePath.length > 1 && filePath.startsWith('@')) {
+        // Strip leading @ when the rest is an absolute path (e.g. @C:/Users/.../knowledgebase/test/1.md on Windows)
+        const candidate = filePath.slice(1).trim()
+        if (path.isAbsolute(candidate)) {
+          actualPath = path.resolve(candidate)
+          logger.info('[read_file] Resolved @-prefixed absolute path', { taskId: this.taskId, resolved: actualPath })
+        }
+      }
+
+      // For offload files, enforce a safe default window size when the model
+      // does not provide an explicit limit to avoid loading the entire file
+      // into context in a single call.
+      const hasExplicitLimit = typeof limit === 'number' && !Number.isNaN(limit)
+      const effectiveLimit = hasExplicitLimit ? limit : isOffloadFile ? 200 : undefined
+
+      // TODO: Remote file reading
+      // if (ip && !this.isLocalHost(ip)) {
+      //   const hasLimit = typeof effectiveLimit === 'number' && !Number.isNaN(effectiveLimit)
+      //   const startLine = offset + 1
+      //   let readCommand: string
+
+      //   if (offset > 0 && hasLimit) {
+      //     // Read a specific window of lines
+      //     readCommand = `tail -n +${startLine} "${actualPath}" | head -n ${effectiveLimit}`
+      //   } else if (offset > 0) {
+      //     // Read from a specific line to the end
+      //     readCommand = `tail -n +${startLine} "${actualPath}"`
+      //   } else if (hasLimit) {
+      //     // Read only the first N lines
+      //     readCommand = `head -n ${effectiveLimit} "${actualPath}"`
+      //   } else {
+      //     // Read entire file
+      //     readCommand = `cat "${actualPath}"`
+      //   }
+
+      //   content = await this.executeCommandInRemoteServer(readCommand, ip, undefined)
+      // }
+      // Local file reading
+      const fullPath = path.isAbsolute(actualPath) ? actualPath : path.join(process.cwd(), actualPath)
+
+      // Security check: ensure file is within workspace, offload directory, or knowledge base directory
+      const workspace = process.cwd()
+      const offloadDir = getOffloadDir(this.taskId)
+      const resolvedPath = path.resolve(fullPath)
+
+      const isInWorkspace = resolvedPath.startsWith(workspace)
+      const isInOffload = resolvedPath.startsWith(offloadDir)
+      const isInKnowledgeBase = resolvedPath.includes(`${path.sep}knowledgebase${path.sep}`)
+
+      if (!isInWorkspace && !isInOffload && !isInKnowledgeBase) {
+        await this.pushToolResult(toolDescription, this.responseFormatter.toolError(`Access denied: file is outside workspace and offload directory`))
+        await this.saveCheckpoint()
+        return
+      }
+
+      const lines: string[] = []
+      try {
+        const stream = createReadStream(fullPath, { encoding: 'utf-8' })
+        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity })
+        let lineIndex = 0
+        try {
+          for await (const line of rl) {
+            lineIndex++
+            if (lineIndex < offset) {
+              continue
+            }
+            lines.push(line)
+            if (typeof effectiveLimit === 'number' && !Number.isNaN(effectiveLimit) && lines.length >= effectiveLimit) break
+          }
+          content = lines.join('\n')
+        } finally {
+          rl.close()
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          await this.pushToolResult(toolDescription, this.responseFormatter.toolError(`File not found: ${actualPath}`))
+          await this.saveCheckpoint()
+          return
+        }
+        throw error
+      }
+
+      const linesRead = lines.length
+      // Display file content in UI
+      if (isOffloadFile) {
+        await this.say('text', `Read tool output L${offset + 1}~${offset + linesRead}\n`, false)
+      } else {
+        const fileName = path.basename(filePath)
+        await this.say('text', `Read file ${fileName} L${offset + 1}~${offset + linesRead}\n`, false)
+      }
+
+      await this.pushToolResult(toolDescription, content || '(empty file)', { ephemeral: true, skipOffload: true })
+      await this.saveCheckpoint()
+    } catch (error) {
+      await this.handleToolError(toolDescription, 'read file', error as Error)
+      await this.saveCheckpoint()
+    }
+  }
+
+  private async handleWriteToFileToolUse(block: ToolUse): Promise<void> {
+    const toolDescription = this.getToolDescription(block)
+    try {
+      const filePath = block.params.path || block.params.file_path
+      const content = block.params.content || ''
+      const ip = block.params.ip
+
+      if (!filePath) {
+        await this.handleMissingParam('path', toolDescription, 'write_to_file')
+        return
+      }
+
+      if (ip && !this.isLocalHost(ip)) {
+        // Remote file writing
+        const escapedContent = content.replace(/'/g, "'\\''")
+        const writeCommand = `cat > "${filePath}" << 'CHATERM_EOF'\n${escapedContent}\nCHATERM_EOF`
+        await this.executeCommandInRemoteServer(writeCommand, ip, undefined)
+      } else {
+        // Local file writing
+        const fullPath = path.isAbsolute(filePath) ? filePath : path.join(process.cwd(), filePath)
+
+        // Security check: ensure file is within workspace
+        const workspace = process.cwd()
+        const resolvedPath = path.resolve(fullPath)
+
+        if (!resolvedPath.startsWith(workspace)) {
+          await this.pushToolResult(toolDescription, this.responseFormatter.toolError(`Access denied: cannot write outside workspace`))
+          await this.saveCheckpoint()
+          return
+        }
+
+        // Ensure parent directory exists
+        await fs.mkdir(path.dirname(fullPath), { recursive: true })
+        await fs.writeFile(fullPath, content, 'utf-8')
+      }
+
+      // Display success message in UI
+      await this.say('text', `Wrote ${content.length} bytes to ${filePath}`, false)
+
+      // Push success result to LLM
+      await this.pushToolResult(toolDescription, `Successfully wrote ${content.length} bytes to ${filePath}`)
+      await this.saveCheckpoint()
+    } catch (error) {
+      await this.handleToolError(toolDescription, 'write file', error as Error)
       await this.saveCheckpoint()
     }
   }
@@ -3255,9 +4043,11 @@ export class Task {
       } catch (parseError) {
         this.consecutiveMistakeCount++
         await this.say('error', this.messages.mcpInvalidArguments || `Invalid MCP tool arguments format: ${parseError}`)
-        this.pushToolResult(
+        await this.pushToolResult(
           toolDescription,
-          formatResponse.toolError(`Invalid JSON format for arguments: ${parseError instanceof Error ? parseError.message : String(parseError)}`)
+          this.responseFormatter.toolError(
+            `Invalid JSON format for arguments: ${parseError instanceof Error ? parseError.message : String(parseError)}`
+          )
         )
         await this.saveCheckpoint()
         return
@@ -3276,7 +4066,7 @@ export class Task {
           errorMsg = `MCP server "${serverName}" is not connected (status: ${server.status})`
         }
         await this.say('error', errorMsg)
-        this.pushToolResult(toolDescription, formatResponse.toolError(errorMsg))
+        await this.pushToolResult(toolDescription, this.responseFormatter.toolError(errorMsg))
         await this.saveCheckpoint()
         return
       }
@@ -3287,7 +4077,7 @@ export class Task {
           tool: toolName
         })
         await this.say('error', errorMsg)
-        this.pushToolResult(toolDescription, formatResponse.toolError(errorMsg))
+        await this.pushToolResult(toolDescription, this.responseFormatter.toolError(errorMsg))
         await this.saveCheckpoint()
         return
       }
@@ -3303,7 +4093,7 @@ export class Task {
           tool: toolName
         })
         await this.say('error', errorMsg)
-        this.pushToolResult(toolDescription, formatResponse.toolError(errorMsg))
+        await this.pushToolResult(toolDescription, this.responseFormatter.toolError(errorMsg))
         await this.saveCheckpoint()
         return
       }
@@ -3320,18 +4110,18 @@ export class Task {
         })
         const approved = response === 'yesButtonClicked'
         if (!approved) {
-          this.pushToolResult(toolDescription, formatResponse.toolDenied())
+          await this.pushToolResult(toolDescription, this.responseFormatter.toolDenied())
           if (text) {
-            this.pushAdditionalToolFeedback(text)
-            await this.sayUserFeedback(text, contentParts)
+            await this.pushAdditionalToolFeedback(text)
+            await this.saveUserMessage(text, contentParts)
             await this.saveCheckpoint()
           }
           this.didRejectTool = true
           await this.saveCheckpoint()
           return
         } else if (text) {
-          this.pushAdditionalToolFeedback(text)
-          await this.sayUserFeedback(text, contentParts)
+          await this.pushAdditionalToolFeedback(text)
+          await this.saveUserMessage(text, contentParts)
           await this.saveCheckpoint()
         }
       } else {
@@ -3343,7 +4133,7 @@ export class Task {
       const result = await this.mcpHub.callTool(serverName, toolName, argumentsObj, ulid)
 
       const resultText = this.formatMcpToolCallResponse(result)
-      this.pushToolResult(toolDescription, resultText)
+      await this.pushToolResult(toolDescription, resultText)
 
       // Send tool execution result to frontend
       await this.say('command_output', resultText, false)
@@ -3378,7 +4168,7 @@ export class Task {
           errorMsg = `MCP server "${serverName}" is not connected (status: ${server.status})`
         }
         await this.say('error', errorMsg)
-        this.pushToolResult(toolDescription, formatResponse.toolError(errorMsg))
+        await this.pushToolResult(toolDescription, this.responseFormatter.toolError(errorMsg))
         await this.saveCheckpoint()
         return
       }
@@ -3387,7 +4177,7 @@ export class Task {
 
       // 6. Handle return result
       const resultText = this.formatMcpResourceResponse(resourceResponse)
-      this.pushToolResult(toolDescription, resultText)
+      await this.pushToolResult(toolDescription, resultText)
 
       // Send resource access result to frontend
       await this.say('command_output', resultText, false)
@@ -3414,7 +4204,7 @@ export class Task {
       if (!this.skillsManager) {
         const errorMsg = 'Skills manager is not available'
         await this.say('error', errorMsg)
-        this.pushToolResult(toolDescription, formatResponse.toolError(errorMsg))
+        await this.pushToolResult(toolDescription, this.responseFormatter.toolError(errorMsg))
         await this.saveCheckpoint()
         return
       }
@@ -3424,7 +4214,7 @@ export class Task {
       if (!skill) {
         const errorMsg = `Skill "${skillName}" not found. Please check the available skills list.`
         await this.say('error', errorMsg)
-        this.pushToolResult(toolDescription, formatResponse.toolError(errorMsg))
+        await this.pushToolResult(toolDescription, this.responseFormatter.toolError(errorMsg))
         await this.saveCheckpoint()
         return
       }
@@ -3432,7 +4222,7 @@ export class Task {
       if (!skill.enabled) {
         const errorMsg = `Skill "${skillName}" is disabled. Please enable it in settings first.`
         await this.say('error', errorMsg)
-        this.pushToolResult(toolDescription, formatResponse.toolError(errorMsg))
+        await this.pushToolResult(toolDescription, this.responseFormatter.toolError(errorMsg))
         await this.saveCheckpoint()
         return
       }
@@ -3460,10 +4250,10 @@ export class Task {
         }
       }
 
-      this.pushToolResult(toolDescription, resultText)
+      await this.pushToolResult(toolDescription, resultText)
 
       // Optionally show activation message in UI
-      await this.say('text', `Activated Skill: ${skill.metadata.name}`, false)
+      await this.say('skill_activated', skill.metadata.name, false)
 
       await this.saveCheckpoint()
     } catch (error) {
@@ -3530,13 +4320,10 @@ export class Task {
 
     let content = block.content
     if (content) {
-      // Handle streaming <thinking> tags
-      content = this.processThinkingTags(content)
-
       const lastOpenBracketIndex = content.lastIndexOf('<')
       if (lastOpenBracketIndex !== -1) {
         const possibleTag = content.slice(lastOpenBracketIndex)
-        // Check if there's a '>' after the last '<' (i.e., if the tag is complete) (complete thinking and tool tags will have been removed by now)
+        // Check if there's a '>' after the last '<' (i.e., if the tag is complete)
         const hasCloseBracket = possibleTag.includes('>')
         if (!hasCloseBracket) {
           // Extract the potential tag name
@@ -3581,51 +4368,16 @@ export class Task {
       }
 
       if (text) {
-        await this.sayUserFeedback(text, contentParts)
+        await this.saveUserMessage(text, contentParts)
         this.userMessageContent.push({
           type: 'text',
-          text: `The user has provided feedback on the response. Consider their input to continue the conversation.\n<feedback>\n${text}\n</feedback>`
+          text: formatMessage(this.messages.userProvidedFeedback, { feedback: text })
         })
       }
 
       this.didAlreadyUseTool = true
       // }
     }
-  }
-
-  private processThinkingTags(content: string): string {
-    if (!content) return content
-
-    // If currently inside a thinking block, check for an end tag
-    if (this.isInsideThinkingBlock) {
-      const endIndex = content.indexOf('</thinking>')
-      if (endIndex !== -1) {
-        // Found end tag, exit thinking block state, return content after end tag
-        this.isInsideThinkingBlock = false
-        return content.slice(endIndex + '</thinking>'.length)
-      } else {
-        // Still inside thinking block, remove all content
-        return ''
-      }
-    }
-
-    const startIndex = content.indexOf('<thinking>')
-    if (startIndex !== -1) {
-      // Found start tag
-      const beforeThinking = content.slice(0, startIndex)
-      const afterThinking = content.slice(startIndex + '<thinking>'.length)
-
-      const endIndex = afterThinking.indexOf('</thinking>')
-      if (endIndex !== -1) {
-        const afterThinkingBlock = afterThinking.slice(endIndex + '</thinking>'.length)
-        return beforeThinking + afterThinkingBlock
-      } else {
-        this.isInsideThinkingBlock = true
-        return beforeThinking
-      }
-    }
-
-    return content
   }
 
   private async buildSystemPrompt(): Promise<string> {
@@ -3649,17 +4401,9 @@ export class Task {
       // Use switch-specific prompt (switch only supports Command mode)
       systemPrompt = switchPrompt
     } else if (userLanguage === 'zh-CN') {
-      if (chatSettings?.mode === 'chat') {
-        systemPrompt = SYSTEM_PROMPT_CHAT_CN
-      } else {
-        systemPrompt = SYSTEM_PROMPT_CN
-      }
+      systemPrompt = SYSTEM_PROMPT_CN
     } else {
-      if (chatSettings?.mode === 'chat') {
-        systemPrompt = SYSTEM_PROMPT_CHAT
-      } else {
-        systemPrompt = SYSTEM_PROMPT
-      }
+      systemPrompt = SYSTEM_PROMPT
     }
     // Update messages language before building system information
 
@@ -3670,20 +4414,45 @@ export class Task {
       systemInformation +=
         'Chat mode: No server connection or system information available. This mode is for conversation, learning, and brainstorming only.\n'
     } else if (!this.hosts || this.hosts.length === 0) {
-      console.warn('No hosts configured, skipping system information collection')
+      logger.warn('No hosts configured, skipping system information collection')
       systemInformation += this.messages.noHostsConfigured + '\n'
     } else {
-      console.log(`Collecting system information for ${this.hosts.length} host(s)`)
+      logger.info(`Collecting system information for ${this.hosts.length} host(s)`)
 
       for (const host of this.hosts) {
         try {
           if (host.assetType?.startsWith('person-switch-')) {
             continue
           }
+
+          // Handle K8S hosts separately
+          if (this.isK8sHost(host.host)) {
+            const k8sAgentManager = getK8sAgentManager()
+            const currentCluster = k8sAgentManager.getCurrentCluster()
+
+            if (currentCluster.contextName) {
+              systemInformation += `
+            ## Kubernetes Cluster: ${host.host}
+            Context: ${currentCluster.contextName}
+            Type: Kubernetes
+            Commands: kubectl (use execute_command tool with kubectl commands)
+            ====
+          `
+            } else {
+              systemInformation += `
+            ## Kubernetes Cluster: ${host.host}
+            Status: Not connected
+            Note: Please ensure the K8S cluster is connected before executing kubectl commands
+            ====
+          `
+            }
+            continue
+          }
+
           // Check cache, if no cache, get system info and cache it
           let hostInfo = this.hostSystemInfoCache.get(host.host)
           if (!hostInfo) {
-            console.log(`Fetching system information for host: ${host.host}`)
+            logger.debug('Fetching system information for host')
 
             let systemInfoOutput: string
 
@@ -3721,7 +4490,11 @@ USERNAME:${localSystemInfo.userName}`
               systemInfoOutput = await this.executeCommandInRemoteServer(systemInfoScript, host.host)
             }
 
-            console.log(`System info output for ${host.host}:`, systemInfoOutput)
+            logger.debug(`System info command completed for host: ${host.host}`, {
+              event: 'agent.task.system_info.command.complete',
+              host: host.host,
+              outputLength: systemInfoOutput?.length || 0
+            })
 
             if (!systemInfoOutput || systemInfoOutput.trim() === '') {
               throw new Error('Failed to get system information: connection failed or no output received')
@@ -3773,12 +4546,15 @@ USERNAME:${localSystemInfo.userName}`
             }
 
             hostInfo = parseSystemInfo(systemInfoOutput)
-            console.log(`Parsed system info for ${host.host}:`, hostInfo)
+            logger.debug(`Parsed system info for ${host.host}`, {
+              event: 'agent.task.system_info.parsed',
+              host: host.host
+            })
 
             // Cache system information
             this.hostSystemInfoCache.set(host.host, hostInfo)
           } else {
-            console.log(`Using cached system information for host: ${host.host}`)
+            logger.debug('Using cached system information for host')
           }
 
           systemInformation += `
@@ -3791,7 +4567,7 @@ USERNAME:${localSystemInfo.userName}`
             ====
           `
         } catch (error) {
-          console.error(`Failed to get system information for host ${host.host}:`, error)
+          logger.error(`Failed to get system information for host ${host.host}`, { error: error })
           const chatSettings = await getGlobalState('chatSettings')
           const isLocalConnection = host.connection?.toLowerCase?.() === 'localhost' || this.isLocalHost(host.host) || host.uuid === 'localhost'
 
@@ -3814,7 +4590,10 @@ USERNAME:${localSystemInfo.userName}`
       }
     }
 
-    console.log('Final system information section:', systemInformation)
+    logger.debug('Final system information section built', {
+      event: 'agent.task.system_info.section.built',
+      length: systemInformation.length
+    })
     systemPrompt += systemInformation
 
     // Build MCP Tools and Resources section
@@ -3940,7 +4719,7 @@ USERNAME:${localSystemInfo.userName}`
 
       return `${sectionTitle}\n\n${sectionHeader}\n\n${serverDescriptions.join('\n')}`
     } catch (error) {
-      console.error('Failed to build MCP tools section:', error)
+      logger.error('Failed to build MCP tools section', { error: error })
       return null
     }
   }
@@ -3949,23 +4728,23 @@ USERNAME:${localSystemInfo.userName}`
    * Build skills section for system prompt
    */
   private buildSkillsSection(): string | null {
-    console.log('[Skills] buildSkillsSection called, skillsManager exists:', !!this.skillsManager)
+    logger.debug('[Skills] buildSkillsSection called', { hasSkillsManager: !!this.skillsManager })
 
     if (!this.skillsManager) {
-      console.log('[Skills] No skillsManager available')
+      logger.debug('[Skills] No skillsManager available')
       return null
     }
 
     try {
       const skillsPrompt = this.skillsManager.buildSkillsPrompt()
-      console.log('[Skills] Skills prompt length:', skillsPrompt?.length || 0)
+      logger.debug('[Skills] Skills prompt length', { value: skillsPrompt?.length || 0 })
 
       if (skillsPrompt && skillsPrompt.trim()) {
         return skillsPrompt
       }
       return null
     } catch (error) {
-      console.error('Failed to build skills section:', error)
+      logger.error('Failed to build skills section', { error: error })
       return null
     }
   }
@@ -3976,7 +4755,7 @@ USERNAME:${localSystemInfo.userName}`
       const todosParam = (block as { params?: { todos?: unknown } }).params?.todos
 
       if (todosParam === undefined || todosParam === null) {
-        this.pushToolResult(this.getToolDescription(block), 'Todo write failed: missing todos parameter', { dontLock: true })
+        await this.pushToolResult(this.getToolDescription(block), 'Todo write failed: missing todos parameter', { dontLock: true })
         return
       }
 
@@ -3986,7 +4765,7 @@ USERNAME:${localSystemInfo.userName}`
         try {
           todos = JSON.parse(todosParam) as Todo[]
         } catch (parseError) {
-          this.pushToolResult(this.getToolDescription(block), `Todo write failed: JSON parse error - ${parseError}`, { dontLock: true })
+          await this.pushToolResult(this.getToolDescription(block), `Todo write failed: JSON parse error - ${parseError}`, { dontLock: true })
           return
         }
       } else if (Array.isArray(todosParam)) {
@@ -4001,8 +4780,8 @@ USERNAME:${localSystemInfo.userName}`
           todos = [todosParam as Todo]
         }
       } else {
-        console.error(`[Task] Unsupported todos parameter type: ${typeof todosParam}`)
-        this.pushToolResult(this.getToolDescription(block), 'Todo write failed: todos parameter type not supported', { dontLock: true })
+        logger.error(`[Task] Unsupported todos parameter type: ${typeof todosParam}`)
+        await this.pushToolResult(this.getToolDescription(block), 'Todo write failed: todos parameter type not supported', { dontLock: true })
         return
       }
 
@@ -4010,7 +4789,7 @@ USERNAME:${localSystemInfo.userName}`
       const result = await TodoWriteTool.execute(params, this.taskId)
 
       // Allow todo_write to be combined with another tool in the same message
-      this.pushToolResult(this.getToolDescription(block), result, { dontLock: true })
+      await this.pushToolResult(this.getToolDescription(block), result, { dontLock: true })
 
       // Send todo update event to renderer process
       await this.postMessageToWebview({
@@ -4022,8 +4801,8 @@ USERNAME:${localSystemInfo.userName}`
         triggerReason: 'agent_update'
       })
     } catch (error) {
-      console.error(`[Task] todo_write tool call handling failed:`, error)
-      this.pushToolResult(this.getToolDescription(block), `Todo write failed: ${error instanceof Error ? error.message : String(error)}`, {
+      logger.error(`[Task] todo_write tool call handling failed`, { error: error })
+      await this.pushToolResult(this.getToolDescription(block), `Todo write failed: ${error instanceof Error ? error.message : String(error)}`, {
         dontLock: true
       })
     }
@@ -4034,9 +4813,9 @@ USERNAME:${localSystemInfo.userName}`
       const params: TodoReadParams = {} // TodoRead doesn't need parameters
       const result = await TodoReadTool.execute(params, this.taskId)
       // Allow todo_read to be combined with another tool in the same message
-      this.pushToolResult(this.getToolDescription(block), result, { dontLock: true })
+      await this.pushToolResult(this.getToolDescription(block), result, { dontLock: true })
     } catch (error) {
-      this.pushToolResult(this.getToolDescription(block), `Todo 读取失败: ${error instanceof Error ? error.message : String(error)}`, {
+      await this.pushToolResult(this.getToolDescription(block), `Todo 读取失败: ${error instanceof Error ? error.message : String(error)}`, {
         dontLock: true
       })
     }
@@ -4086,12 +4865,199 @@ USERNAME:${localSystemInfo.userName}`
         false
       )
 
-      this.pushToolResult(toolDescription, `Knowledge summary has been sent to knowledge base. File: ${fileName}.md`)
+      await this.pushToolResult(toolDescription, `Knowledge summary has been sent to knowledge base. File: ${fileName}.md`)
 
       await this.saveCheckpoint()
     } catch (error) {
-      console.error('[Task] summarize_to_knowledge failed:', error)
-      this.pushToolResult(toolDescription, `Failed to save knowledge: ${error instanceof Error ? error.message : String(error)}`)
+      logger.error('[Task] summarize_to_knowledge failed', { error: error })
+      await this.pushToolResult(toolDescription, `Failed to save knowledge: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /**
+   * Handle summarize_to_skill tool use.
+   * Sends skill data to the frontend for creation.
+   */
+  private async handleSummarizeToSkillToolUse(block: ToolUse): Promise<void> {
+    const toolDescription = this.getToolDescription(block)
+    const skillName = block.params.skill_name
+    const description = block.params.description
+    const content = block.params.content
+
+    try {
+      // Handle partial streaming (parameters may be incomplete)
+      if (block.partial) {
+        await this.say(
+          'skill_summary',
+          JSON.stringify({
+            skillName: skillName || '',
+            description: description || '',
+            content: content || ''
+          }),
+          true
+        )
+        return
+      }
+
+      // Only validate required parameters when streaming is complete
+      if (!skillName) {
+        await this.handleMissingParam('skill_name', toolDescription, 'summarize_to_skill')
+        return
+      }
+
+      if (!description) {
+        await this.handleMissingParam('description', toolDescription, 'summarize_to_skill')
+        return
+      }
+
+      if (!content) {
+        await this.handleMissingParam('content', toolDescription, 'summarize_to_skill')
+        return
+      }
+
+      // Send final message with complete parameters
+      await this.say(
+        'skill_summary',
+        JSON.stringify({
+          skillName,
+          description,
+          content
+        }),
+        false
+      )
+
+      await this.pushToolResult(toolDescription, `Skill has been created successfully. Name: ${skillName}`)
+
+      await this.saveCheckpoint()
+    } catch (error) {
+      logger.error('[Task] summarize_to_skill failed', { error: error })
+      await this.pushToolResult(toolDescription, `Failed to create skill: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private getKbSearchLabel(locale: string): string {
+    return getKbSearchEnabledLabel(locale)
+  }
+
+  private buildKbSearchUiMessage(results: KbSearchResult[], locale: string): { text: string; contentParts: ContentPart[] } {
+    const kbLabel = this.getKbSearchLabel(locale)
+    const kbRoot = getKnowledgeBaseRoot()
+    const text = `${kbLabel}:\n${results.map((r) => `  ${r.path} L${r.startLine}-${r.endLine}`).join('\n')}\n`
+    const contentParts: ContentPart[] = [{ type: 'text', text: `${kbLabel}:` }]
+
+    for (const result of results) {
+      const relPath = result.path.replace(/\\/g, '/')
+      contentParts.push({
+        type: 'chip',
+        chipType: 'doc',
+        ref: {
+          absPath: path.join(kbRoot, relPath).replace(/\\/g, '/'),
+          relPath,
+          name: path.basename(relPath),
+          type: 'file',
+          startLine: result.startLine,
+          endLine: result.endLine
+        }
+      })
+    }
+
+    return { text, contentParts }
+  }
+
+  private async handleKbSearchToolUse(block: ToolUse): Promise<void> {
+    const toolDescription = this.getToolDescription(block)
+    const query = block.params.query
+    const maxResults = parseInt(block.params.max_results || '5', 10)
+
+    try {
+      if (!query) {
+        await this.handleMissingParam('query', toolDescription, 'kb_search')
+        return
+      }
+
+      const mgr = getKbSearchManager()
+      if (!mgr) {
+        await this.pushToolResult(toolDescription, 'Knowledge base search is not available. No embedding provider configured.')
+        return
+      }
+
+      const results = await mgr.search(query, { maxResults: Math.min(Math.max(maxResults, 1), 20) })
+
+      if (results.length === 0) {
+        await this.pushToolResult(toolDescription, 'No relevant results found in the knowledge base.')
+      } else {
+        const locale = await this.getUserLocale()
+        const uiMessage = this.buildKbSearchUiMessage(results, locale)
+        await this.say('text', uiMessage.text, false, undefined, uiMessage.contentParts)
+        const formatted = results
+          .map((r, i) => `[${i + 1}] ${r.path} (lines ${r.startLine}-${r.endLine}, score: ${r.score.toFixed(3)})\n${r.snippet}`)
+          .join('\n\n---\n\n')
+        await this.pushToolResult(toolDescription, `Found ${results.length} results:\n\n${formatted}`)
+      }
+
+      this.didAlreadyUseTool = true
+      await this.saveCheckpoint()
+    } catch (error) {
+      logger.error('[Task] kb_search failed', { error })
+      await this.pushToolResult(toolDescription, `Knowledge base search failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private async handleWebFetchToolUse(block: ToolUse): Promise<void> {
+    const toolDescription = this.getToolDescription(block)
+    try {
+      const url = block.params.url
+      if (!url) {
+        await this.handleMissingParam('url', toolDescription, 'web_fetch')
+        return
+      }
+      const extractMode = block.params.extract_mode === 'text' ? 'text' : 'markdown'
+      const maxChars = block.params.max_chars ? parseInt(block.params.max_chars, 10) : undefined
+
+      const result = await webFetch({
+        url,
+        extractMode: extractMode as 'markdown' | 'text',
+        maxChars
+      })
+      await this.pushToolResult(toolDescription, result, { toolName: 'web_fetch' })
+      this.didAlreadyUseTool = true
+      await this.saveCheckpoint()
+    } catch (error) {
+      await this.handleToolError(toolDescription, 'web fetch', error as Error)
+      await this.saveCheckpoint()
+    }
+  }
+
+  private async performKbSearch(userContent: UserContent): Promise<string | null> {
+    const mgr = getKbSearchManager()
+    if (!mgr) return null
+
+    // Extract text from user content to use as search query
+    const queryParts: string[] = []
+    for (const block of userContent) {
+      if ('text' in block && typeof block.text === 'string') {
+        const cleanedText = block.text.replace(/<\/?task\b[^>]*>/gi, '').trim()
+        if (cleanedText) {
+          queryParts.push(cleanedText)
+        }
+      }
+    }
+    const query = queryParts.join(' ').trim()
+    if (!query) return null
+
+    try {
+      const results = await mgr.search(query)
+      if (results.length === 0) return null
+
+      const locale = await this.getUserLocale()
+      const uiMessage = this.buildKbSearchUiMessage(results, locale)
+      await this.say('text', uiMessage.text, false, undefined, uiMessage.contentParts)
+
+      const formatted = results.map((r) => `[${r.path}:${r.startLine}-${r.endLine}] (score: ${r.score.toFixed(3)})\n${r.snippet}`).join('\n\n---\n\n')
+      return `\n\n<knowledge_base_context>\nThe following knowledge base documents may be relevant to your task:\n\n${formatted}\n</knowledge_base_context>`
+    } catch (error) {
+      logger.error('[Task] First-request KB search failed', { error })
+      return null
     }
   }
 
@@ -4118,9 +5084,11 @@ USERNAME:${localSystemInfo.userName}`
         triggerReason: 'user_request'
       })
 
-      console.log(`[Task] Cleared todos due to ${trigger} for task ${this.taskId}`)
+      logger.info(`[Task] Cleared todos due to ${trigger} for task ${this.taskId}`)
     } catch (error) {
-      console.error(`[Task] Failed to clear todos (${trigger}) for task ${this.taskId}:`, error)
+      logger.error(`[Task] Failed to clear todos (${trigger}) for task ${this.taskId}`, {
+        error: error
+      })
     }
   }
 
@@ -4135,21 +5103,27 @@ USERNAME:${localSystemInfo.userName}`
         .trim()
 
       if (userMessage && !userMessage.includes('<system-reminder>') && !userMessage.includes('<feedback>')) {
-        console.log(`[Smart Todo] Checking user content for todo creation: "${userMessage}"`)
+        logger.debug('[Smart Todo] Checking user content for todo creation', {
+          event: 'agent.task.smart_todo.check.start',
+          messageLength: userMessage.length
+        })
         await this.checkAndCreateTodoIfNeeded(userMessage)
       }
     } catch (error) {
-      console.error('[Smart Todo] Failed to check user content for todo:', error)
+      logger.error('[Smart Todo] Failed to check user content for todo', { error: error })
     }
   }
 
   // 智能检测相关方法 - 使用优化后的检测逻辑
   private async checkAndCreateTodoIfNeeded(userMessage: string): Promise<void> {
     try {
-      console.log(`[Smart Todo] Analyzing message: "${userMessage}"`)
+      logger.debug('[Smart Todo] Analyzing user message', {
+        event: 'agent.task.smart_todo.analyze',
+        messageLength: userMessage.length
+      })
 
       const shouldCreate = SmartTaskDetector.shouldCreateTodo(userMessage)
-      console.log(`[Smart Todo] Should create todo: ${shouldCreate}`)
+      logger.debug(`[Smart Todo] Should create todo: ${shouldCreate}`)
 
       if (shouldCreate) {
         // 获取用户语言设置
@@ -4158,7 +5132,7 @@ USERNAME:${localSystemInfo.userName}`
           const userConfig = await getUserConfig()
           isChineseMode = userConfig?.language === 'zh-CN'
         } catch (error) {
-          console.log(`[Smart Todo] 获取用户语言设置失败，使用默认语言`)
+          logger.debug(`[Smart Todo] 获取用户语言设置失败，使用默认语言`)
         }
 
         // 发送简化的核心系统消息给 Agent
@@ -4170,11 +5144,82 @@ USERNAME:${localSystemInfo.userName}`
           text: coreMessage
         })
       } else {
-        console.log(`[Smart Todo] Task not complex enough for todo creation`)
+        logger.debug(`[Smart Todo] Task not complex enough for todo creation`)
       }
     } catch (error) {
-      console.error('[Smart Todo] Failed to check and create todo if needed:', error)
+      logger.error('[Smart Todo] Failed to check and create todo if needed', { error: error })
       // 不影响主要功能，只记录错误
+    }
+  }
+
+  // Complete all in_progress todos when task is completed
+  private async completeAllInProgressTodos(): Promise<void> {
+    const methodName = 'completeAllInProgressTodos'
+    logger.info(`[Task:${methodName}] Starting for task ${this.taskId}`)
+
+    try {
+      const { TodoStorage } = await import('../storage/todo/TodoStorage')
+      const storage = new TodoStorage(this.taskId)
+      const todos = await storage.readTodos()
+
+      logger.info(`[Task:${methodName}] Read ${todos.length} todos for task ${this.taskId}`)
+
+      if (todos.length === 0) {
+        logger.info(`[Task:${methodName}] No todos found, skipping`)
+        return
+      }
+
+      // Find all in_progress todos
+      const inProgressTodos = todos.filter((todo) => todo.status === 'in_progress')
+
+      logger.info(`[Task:${methodName}] Found ${inProgressTodos.length} in_progress todos`)
+
+      if (inProgressTodos.length === 0) {
+        logger.info(`[Task:${methodName}] No in_progress todos, skipping`)
+        return
+      }
+
+      // Mark all in_progress todos as completed
+      const now = new Date()
+      const updatedTodos = todos.map((todo) => {
+        if (todo.status === 'in_progress') {
+          return {
+            ...todo,
+            status: 'completed' as const,
+            completedAt: now,
+            updatedAt: now,
+            isFocused: false
+          }
+        }
+        return todo
+      })
+
+      // Save updated todos
+      logger.info(`[Task:${methodName}] Writing ${updatedTodos.length} todos to storage`)
+      await storage.writeTodos(updatedTodos)
+      logger.info(`[Task:${methodName}] Successfully wrote todos to storage`)
+
+      // Send todo update event to renderer process
+      logger.info(`[Task:${methodName}] Sending todoUpdated message to webview`)
+      await this.postMessageToWebview({
+        type: 'todoUpdated',
+        todos: updatedTodos,
+        sessionId: this.taskId,
+        taskId: this.taskId,
+        changeType: 'completed',
+        triggerReason: 'agent_update'
+      })
+      logger.info(`[Task:${methodName}] Successfully sent todoUpdated message`)
+
+      logger.info(`[Task:${methodName}] Auto-completed ${inProgressTodos.length} in_progress todos for task ${this.taskId}`)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      const errorStack = error instanceof Error ? error.stack : undefined
+      logger.error(`[Task:${methodName}] Failed to complete in_progress todos for task ${this.taskId}`, {
+        error: errorMessage,
+        stack: errorStack,
+        taskId: this.taskId
+      })
     }
   }
 
@@ -4213,7 +5258,7 @@ USERNAME:${localSystemInfo.userName}`
         })
       }
     } catch (error) {
-      console.error('[Task] 添加 todo 状态更新提醒失败:', error)
+      logger.error('[Task] 添加 todo 状态更新提醒失败', { error: error })
     }
   }
 }

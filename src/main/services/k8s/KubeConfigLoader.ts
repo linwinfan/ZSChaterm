@@ -5,7 +5,11 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
-import { K8sContext, K8sContextInfo, LoadConfigOptions, LoadConfigResult } from './types'
+import { K8sContext, K8sContextInfo, LoadConfigOptions, LoadConfigResult, K8sProxyConfig } from './types'
+
+import { createLogger } from '../logging'
+
+const logger = createLogger('k8s')
 
 // Lazy load kubernetes client to avoid ESM issues
 let k8sModule: any = null
@@ -20,6 +24,34 @@ async function ensureK8sModule() {
 }
 
 /**
+ * Build proxy URL from proxy configuration
+ */
+function buildProxyUrl(config: K8sProxyConfig): string {
+  const { type, host, port, enableProxyIdentity, username, password } = config
+  const auth = enableProxyIdentity && username && password ? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@` : ''
+
+  // Determine protocol based on proxy type
+  let protocol: string
+  switch (type) {
+    case 'SOCKS4':
+      protocol = 'socks4'
+      break
+    case 'SOCKS5':
+      protocol = 'socks5'
+      break
+    case 'HTTPS':
+      protocol = 'https'
+      break
+    case 'HTTP':
+    default:
+      protocol = 'http'
+      break
+  }
+
+  return `${protocol}://${auth}${host}:${port}`
+}
+
+/**
  * KubeConfigLoader handles loading and parsing Kubernetes configuration files
  */
 export class KubeConfigLoader {
@@ -27,10 +59,56 @@ export class KubeConfigLoader {
   private defaultConfigPath: string
   private initialized: boolean = false
   private kubeConfigFactory: (() => any) | null = null
+  private proxyConfig: K8sProxyConfig | null = null
 
   constructor(kubeConfigFactory?: () => any) {
     this.defaultConfigPath = path.join(os.homedir(), '.kube', 'config')
     this.kubeConfigFactory = kubeConfigFactory || null
+  }
+
+  /**
+   * Set proxy configuration for K8S API server connections
+   * @param config - Proxy configuration
+   */
+  public setProxyConfig(config: K8sProxyConfig | null): void {
+    this.proxyConfig = config
+    logger.info('[K8s] Proxy configuration updated', { hasProxy: !!config })
+  }
+
+  /**
+   * Get current proxy configuration
+   */
+  public getProxyConfig(): K8sProxyConfig | null {
+    return this.proxyConfig
+  }
+
+  /**
+   * Apply proxy configuration to all clusters in the KubeConfig
+   */
+  private applyProxyToAllClusters(): void {
+    if (!this.kc || !this.proxyConfig) return
+    this.applyProxyToKubeConfig(this.kc, this.proxyConfig)
+  }
+
+  /**
+   * Apply proxy configuration to a specific KubeConfig instance
+   * This is a public method that can be used by InformerPool and other components
+   * @param kc - KubeConfig instance to apply proxy to
+   * @param config - Proxy configuration
+   */
+  public applyProxyToKubeConfig(kc: any, config: K8sProxyConfig): void {
+    if (!kc || !config) return
+
+    const proxyUrl = buildProxyUrl(config)
+    const clusters = kc.getClusters()
+
+    for (const cluster of clusters) {
+      // Set proxyUrl on the cluster object
+      // @kubernetes/client-node uses this to create proxy agents
+      cluster.proxyUrl = proxyUrl
+    }
+
+    logger.info('[K8s] Applied proxy to clusters', { event: 'k8s.proxy.applied', clusterCount: clusters.length, proxyUrl })
   }
 
   /**
@@ -71,6 +149,9 @@ export class KubeConfigLoader {
       // Load the config file
       this.kc.loadFromFile(configPath)
 
+      // Apply proxy configuration to all clusters
+      this.applyProxyToAllClusters()
+
       // Extract contexts information
       const contexts = this.extractContexts()
       const currentContext = this.kc.getCurrentContext()
@@ -82,7 +163,7 @@ export class KubeConfigLoader {
         error: undefined
       }
     } catch (error) {
-      console.error('[K8s] Failed to load config:', error)
+      logger.error('[K8s] Failed to load config', { error: error })
       return {
         success: false,
         contexts: [],
@@ -99,6 +180,10 @@ export class KubeConfigLoader {
       await this.initialize()
 
       this.kc.loadFromDefault()
+
+      // Apply proxy configuration to all clusters
+      this.applyProxyToAllClusters()
+
       const contexts = this.extractContexts()
       const currentContext = this.kc.getCurrentContext()
 
@@ -108,7 +193,7 @@ export class KubeConfigLoader {
         currentContext
       }
     } catch (error) {
-      console.error('[K8s] Failed to load from default:', error)
+      logger.error('[K8s] Failed to load from default', { error: error })
       return {
         success: false,
         contexts: [],
@@ -194,7 +279,7 @@ export class KubeConfigLoader {
    */
   public getKubeConfig(): any {
     if (!this.initialized) {
-      console.warn('[K8s] Attempting to get KubeConfig before initialization')
+      logger.warn('[K8s] Attempting to get KubeConfig before initialization')
       return undefined
     }
     return this.kc
@@ -219,7 +304,7 @@ export class KubeConfigLoader {
       this.kc.setCurrentContext(contextName)
       return true
     } catch (error) {
-      console.error('[K8s] Failed to set current context:', error)
+      logger.error('[K8s] Failed to set current context', { error: error })
       return false
     }
   }
@@ -237,6 +322,9 @@ export class KubeConfigLoader {
           return false
         }
       }
+
+      // Ensure proxy is applied before validation
+      this.applyProxyToAllClusters()
 
       const { k8sModule } = await ensureK8sModule()
       const CoreV1Api = k8sModule.CoreV1Api
@@ -256,10 +344,10 @@ export class KubeConfigLoader {
         try {
           this.kc.setCurrentContext(originalContext)
         } catch (restoreError) {
-          console.error(`[K8s] Failed to restore context:`, restoreError)
+          logger.error(`[K8s] Failed to restore context`, { error: restoreError })
         }
       }
-      console.error(`[K8s] Context validation failed for ${contextName}:`, error)
+      logger.error(`[K8s] Context validation failed for ${contextName}`, { error: error })
       return false
     }
   }

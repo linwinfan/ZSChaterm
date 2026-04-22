@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3'
 import { getUserConfig } from '../../../agent/core/storage/state'
 import { capabilityRegistry } from '../../../ssh/capabilityRegistry'
+const logger = createLogger('db')
 
 /**
  * Get available organization asset types dynamically based on capability registry.
@@ -49,7 +50,9 @@ export function getOrganizationAssetTypesWithExisting(db: Database.Database): st
       }
     }
   } catch (error) {
-    console.warn('[getOrganizationAssetTypesWithExisting] Failed to query existing types:', error)
+    logger.warn('[getOrganizationAssetTypesWithExisting] Failed to query existing types', {
+      error: error
+    })
   }
 
   return types
@@ -61,37 +64,121 @@ const isOrganizationType = (assetType: string): boolean => {
   return assetType === 'organization' || assetType.startsWith('organization-')
 }
 
+/**
+ * Build grouped tree children for Qizhi bastion assets.
+ * Groups assets by bastion_comment (asset category name) into intermediate folder nodes.
+ * An asset with bastion_comment "A||B" belongs to both group A and group B.
+ * Assets without bastion_comment are added as direct children.
+ */
+function buildQizhiGroupedChildren(orgUuid: string, orgAssetType: string, nodes: any[]): any[] {
+  const groupMap = new Map<string, any[]>()
+  const ungrouped: any[] = []
+
+  for (const node of nodes) {
+    const rawComment = node.bastion_comment
+    if (rawComment) {
+      // Split by "||" to support assets belonging to multiple groups
+      const groupNames = rawComment.split('||')
+      for (const groupName of groupNames) {
+        const trimmed = groupName.trim()
+        if (!trimmed) continue
+        if (!groupMap.has(trimmed)) {
+          groupMap.set(trimmed, [])
+        }
+        groupMap.get(trimmed)!.push(node)
+      }
+    } else {
+      ungrouped.push(node)
+    }
+  }
+
+  const children: any[] = []
+
+  // Add grouped assets as intermediate folder nodes
+  for (const [groupName, groupNodes] of groupMap) {
+    const groupChildren = groupNodes.map((node: any) => ({
+      key: `${orgUuid}_${groupName}_${node.asset_ip}_${node.asset_name || 'no_name'}`,
+      title: node.asset_name || node.asset_ip,
+      favorite: node.favorite === 1,
+      ip: node.asset_ip,
+      uuid: node.uuid,
+      comment: node.comment,
+      asset_type: orgAssetType,
+      organizationId: orgUuid
+    }))
+
+    children.push({
+      key: `${orgUuid}_group_${groupName}`,
+      title: groupName,
+      children: groupChildren,
+      asset_type: orgAssetType,
+      organizationId: orgUuid,
+      isAssetGroup: true
+    })
+  }
+
+  // Add ungrouped assets directly
+  for (const node of ungrouped) {
+    children.push({
+      key: `${orgUuid}_${node.asset_ip}_${node.asset_name || 'no_name'}`,
+      title: node.asset_name || node.asset_ip,
+      favorite: node.favorite === 1,
+      ip: node.asset_ip,
+      uuid: node.uuid,
+      comment: node.comment,
+      asset_type: orgAssetType,
+      organizationId: orgUuid
+    })
+  }
+
+  return children
+}
+
 // Import language translations
 const translations = {
   'zh-CN': {
-    favoriteBar: '收藏栏'
+    favoriteBar: '收藏栏',
+    recentConnections: '最近连接'
   },
   'zh-TW': {
-    favoriteBar: '收藏欄'
+    favoriteBar: '收藏欄',
+    recentConnections: '最近連接'
   },
   'en-US': {
-    favoriteBar: 'Favorites'
+    favoriteBar: 'Favorites',
+    recentConnections: 'Recent Connections'
   },
   'ja-JP': {
-    favoriteBar: 'お気に入り'
+    favoriteBar: 'お気に入り',
+    recentConnections: '最近の接続'
   },
   'ko-KR': {
-    favoriteBar: '즐겨찾기'
+    favoriteBar: '즐겨찾기',
+    recentConnections: '최근 연결'
   },
   'de-DE': {
-    favoriteBar: 'Favoriten'
+    favoriteBar: 'Favoriten',
+    recentConnections: 'Letzte Verbindungen'
   },
   'fr-FR': {
-    favoriteBar: 'Favoris'
+    favoriteBar: 'Favoris',
+    recentConnections: 'Connexions r\u00e9centes'
   },
   'it-IT': {
-    favoriteBar: 'Preferiti'
+    favoriteBar: 'Preferiti',
+    recentConnections: 'Connessioni recenti'
   },
   'pt-PT': {
-    favoriteBar: 'Favoritos'
+    favoriteBar: 'Favoritos',
+    recentConnections: 'Conex\u00f5es recentes'
   },
   'ru-RU': {
-    favoriteBar: 'Избранное'
+    favoriteBar: 'Избранное',
+    recentConnections: 'Недавние подключения'
+  },
+  'ar-AR': {
+    favoriteBar: 'المفضلة',
+    recentConnections: 'الاتصالات الأخيرة'
   }
 }
 
@@ -127,10 +214,10 @@ function migrateDatabaseIfNeeded(db: Database.Database) {
     const hasCommentColumn = columns.some((col: any) => col.name === 'comment')
 
     if (!hasCommentColumn) {
-      console.log('Adding comment field to t_organization_assets table...')
+      logger.info('Adding comment field to t_organization_assets table...')
       const alterStmt = db.prepare('ALTER TABLE t_organization_assets ADD COLUMN comment TEXT')
       alterStmt.run()
-      console.log('Comment field added successfully')
+      logger.info('Comment field added successfully')
     }
 
     // Check and create custom folders table
@@ -141,7 +228,7 @@ function migrateDatabaseIfNeeded(db: Database.Database) {
     const customFoldersTable = checkCustomFoldersTable.get()
 
     if (!customFoldersTable) {
-      console.log('Creating custom folders table...')
+      logger.info('Creating custom folders table...')
       const createCustomFoldersTable = db.prepare(`
         CREATE TABLE IF NOT EXISTS t_custom_folders (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,7 +240,7 @@ function migrateDatabaseIfNeeded(db: Database.Database) {
         )
       `)
       createCustomFoldersTable.run()
-      console.log('Custom folders table created successfully')
+      logger.info('Custom folders table created successfully')
     }
 
     // Check and create asset folder mapping table
@@ -164,7 +251,7 @@ function migrateDatabaseIfNeeded(db: Database.Database) {
     const assetFolderMappingTable = checkAssetFolderMappingTable.get()
 
     if (!assetFolderMappingTable) {
-      console.log('Creating asset folder mapping table...')
+      logger.info('Creating asset folder mapping table...')
       const createAssetFolderMappingTable = db.prepare(`
         CREATE TABLE IF NOT EXISTS t_asset_folder_mapping (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,10 +263,10 @@ function migrateDatabaseIfNeeded(db: Database.Database) {
         )
       `)
       createAssetFolderMappingTable.run()
-      console.log('Asset folder mapping table created successfully')
+      logger.info('Asset folder mapping table created successfully')
     }
   } catch (error) {
-    console.error('Database migration failed:', error)
+    logger.error('Database migration failed', { error: error })
   }
 }
 
@@ -250,6 +337,40 @@ export async function getLocalAssetRouteLogic(db: Database, searchType: string, 
 
     if (assetType === 'person') {
       if (searchType !== 'assetConfig') {
+        // Recent connections for personal workspace
+        try {
+          const recentStmt = db.prepare(`
+            SELECT asset_uuid, asset_ip, asset_label, asset_port, asset_username, asset_type, organization_id,
+                   MAX(connected_at) as last_connected
+            FROM t_connection_history
+            WHERE organization_id = 'personal'
+            GROUP BY asset_uuid, asset_ip
+            ORDER BY last_connected DESC
+            LIMIT 10
+          `)
+          const recentAssets = recentStmt.all() || []
+
+          if (recentAssets.length > 0) {
+            result.data.routers.push({
+              key: 'recent_connections',
+              title: await getTranslation('recentConnections'),
+              asset_type: 'recent_connections',
+              children: recentAssets.map((item: any) => ({
+                key: `recent_${item.asset_uuid}_${item.asset_ip}_${item.asset_username || 'no_user'}`,
+                title: item.asset_label || item.asset_ip || '',
+                ip: item.asset_ip || '',
+                uuid: item.asset_uuid || '',
+                port: item.asset_port || 22,
+                username: item.asset_username || '',
+                asset_type: item.asset_type || 'person',
+                organizationId: item.organization_id || 'personal'
+              }))
+            })
+          }
+        } catch {
+          // t_connection_history may not exist yet, skip silently
+        }
+
         const favoritesStmt = db.prepare(`
           SELECT label, asset_ip, uuid, group_name, label, auth_type, port, username, password, key_chain_id, asset_type, rdp_extra_args
           FROM t_assets
@@ -335,6 +456,40 @@ export async function getLocalAssetRouteLogic(db: Database, searchType: string, 
 
       // Organization asset logic (JumpServer and Qizhi) - add favorites bar support
       if (searchType !== 'assetConfig') {
+        // Recent connections for enterprise workspace
+        try {
+          const recentStmt = db.prepare(`
+            SELECT asset_uuid, asset_ip, asset_label, asset_port, asset_username, asset_type, organization_id,
+                   MAX(connected_at) as last_connected
+            FROM t_connection_history
+            WHERE organization_id != 'personal'
+            GROUP BY asset_uuid, asset_ip
+            ORDER BY last_connected DESC
+            LIMIT 10
+          `)
+          const recentAssets = recentStmt.all() || []
+
+          if (recentAssets.length > 0) {
+            result.data.routers.push({
+              key: 'recent_connections',
+              title: await getTranslation('recentConnections'),
+              asset_type: 'recent_connections',
+              children: recentAssets.map((item: any) => ({
+                key: `recent_${item.asset_uuid}_${item.asset_ip}_${item.asset_username || 'no_user'}`,
+                title: item.asset_label || item.asset_ip || '',
+                ip: item.asset_ip || '',
+                uuid: item.asset_uuid || '',
+                port: item.asset_port || 22,
+                username: item.asset_username || '',
+                asset_type: item.asset_type || 'organization',
+                organizationId: item.organization_id || ''
+              }))
+            })
+          }
+        } catch {
+          // t_connection_history may not exist yet, skip silently
+        }
+
         const favoriteAssets: any[] = []
 
         // Favorite organizations (based on available types)
@@ -456,37 +611,116 @@ export async function getLocalAssetRouteLogic(db: Database, searchType: string, 
       `)
       const organizationAssets = organizationAssetsStmt.all(...availableOrgTypes) || []
 
-      for (const orgAsset of organizationAssets) {
-        const nodesStmt = db.prepare(`
-          SELECT hostname as asset_name, host as asset_ip, organization_uuid, uuid, created_at, favorite, comment
+      if (organizationAssets.length > 0) {
+        // Fetch all org asset nodes in a single query instead of N separate queries
+        const orgUuids = organizationAssets.map((o: any) => o.uuid)
+        const placeholders = orgUuids.map(() => '?').join(', ')
+        const allNodesStmt = db.prepare(`
+          SELECT hostname as asset_name, host as asset_ip, organization_uuid, uuid, created_at, favorite, comment, bastion_comment
           FROM t_organization_assets
-          WHERE organization_uuid = ?
-          ORDER BY hostname
+          WHERE organization_uuid IN (${placeholders})
+          ORDER BY organization_uuid, hostname
         `)
-        const nodes = nodesStmt.all(orgAsset.uuid) || []
+        const allNodes = allNodesStmt.all(...orgUuids) || []
 
-        const children = nodes.map((node: any) => ({
-          key: `${orgAsset.uuid}_${node.asset_ip}_${node.asset_name || 'no_name'}`,
-          title: node.asset_name || node.asset_ip,
-          favorite: node.favorite === 1,
-          ip: node.asset_ip,
-          uuid: node.uuid,
-          comment: node.comment,
-          asset_type: orgAsset.asset_type || 'organization',
-          organizationId: orgAsset.uuid
-        }))
+        // Group nodes by organization_uuid
+        const nodesByOrg = new Map<string, any[]>()
+        for (const node of allNodes) {
+          const orgUuid = node.organization_uuid
+          if (!nodesByOrg.has(orgUuid)) {
+            nodesByOrg.set(orgUuid, [])
+          }
+          nodesByOrg.get(orgUuid)!.push(node)
+        }
 
-        result.data.routers.push({
-          key: orgAsset.uuid,
-          title: orgAsset.label || orgAsset.asset_ip,
-          children: children
-        })
+        for (const orgAsset of organizationAssets) {
+          const nodes = nodesByOrg.get(orgAsset.uuid) || []
+
+          // Check if this is a Qizhi organization with asset groups (bastion_comment)
+          const isQizhiType = orgAsset.asset_type === 'organization-qizhi'
+          const hasGroups = isQizhiType && nodes.some((node: any) => node.bastion_comment)
+
+          const assetType = orgAsset.asset_type || 'organization'
+
+          if (hasGroups) {
+            const children = buildQizhiGroupedChildren(orgAsset.uuid, assetType, nodes)
+            result.data.routers.push({
+              key: orgAsset.uuid,
+              title: orgAsset.label || orgAsset.asset_ip,
+              children: children
+            })
+          } else {
+            // No groups — flat list (original behavior)
+            const children = nodes.map((node: any) => ({
+              key: `${orgAsset.uuid}_${node.asset_ip}_${node.asset_name || 'no_name'}`,
+              title: node.asset_name || node.asset_ip,
+              favorite: node.favorite === 1,
+              ip: node.asset_ip,
+              uuid: node.uuid,
+              comment: node.comment,
+              asset_type: assetType,
+              organizationId: orgAsset.uuid
+            }))
+
+            result.data.routers.push({
+              key: orgAsset.uuid,
+              title: orgAsset.label || orgAsset.asset_ip,
+              children: children
+            })
+          }
+        }
       }
     }
 
     return result
   } catch (error) {
-    console.error('Chaterm database query error:', error)
+    logger.error('Chaterm database query error', { error: error })
     throw error
+  }
+}
+
+/**
+ * Record a successful SSH connection for the "Recent Connections" feature.
+ * Inserts a row into t_connection_history and cleans up old entries.
+ */
+export function recordConnectionLogic(
+  db: Database.Database,
+  params: {
+    assetUuid: string
+    assetIp: string
+    assetLabel?: string
+    assetPort?: number
+    assetUsername?: string
+    assetType: string
+    organizationId?: string
+  }
+): void {
+  try {
+    const stmt = db.prepare(`
+      INSERT INTO t_connection_history
+        (asset_uuid, asset_ip, asset_label, asset_port, asset_username, asset_type, organization_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `)
+    stmt.run(
+      params.assetUuid,
+      params.assetIp,
+      params.assetLabel || null,
+      params.assetPort || 22,
+      params.assetUsername || null,
+      params.assetType,
+      params.organizationId || 'personal'
+    )
+
+    // Cleanup: keep only the latest 100 rows to prevent unbounded growth
+    db.prepare(
+      `
+      DELETE FROM t_connection_history
+      WHERE id NOT IN (
+        SELECT id FROM t_connection_history ORDER BY connected_at DESC LIMIT 100
+      )
+    `
+    ).run()
+  } catch (error) {
+    logger.error('Failed to record connection history', { error: error })
   }
 }

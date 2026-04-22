@@ -21,6 +21,7 @@ import { EventEmitter } from 'events'
 import stripAnsi from 'strip-ansi-cjs'
 import { z } from 'zod'
 import type { InteractionResult, InteractionRequest, QuickPattern, InteractionDetectorConfig, TuiCategory, InteractionDetectorEvents } from './types'
+const logger = createLogger('agent')
 
 // Re-export types
 export * from './types'
@@ -127,6 +128,7 @@ export class InteractionDetector extends EventEmitter {
 
   // TUI auto-cancel state
   private tuiCategory: TuiCategory = null
+  private isShellSpawning = false
   private tuiSilenceTimer: NodeJS.Timeout | null = null
   private tuiHardTimeoutTimer: NodeJS.Timeout | null = null
   private lastOutputTimeForTui = 0
@@ -275,7 +277,39 @@ export class InteractionDetector extends EventEmitter {
   ]
 
   // Always-TUI: Programs that are always interactive
-  private readonly ALWAYS_TUI_COMMANDS = [/^vim?\b/i, /^vi\b/i, /^nano\b/i, /^emacs\b/i, /^tmux\b/i, /^screen\b/i, /^mc\b/i, /^nnn\b/i, /^ranger\b/i]
+  private readonly ALWAYS_TUI_COMMANDS = [
+    /^vim?\b/i,
+    /^vi\b/i,
+    /^nano\b/i,
+    /^emacs\b/i,
+    /^tmux\b/i,
+    /^screen\b/i,
+    /^mc\b/i,
+    /^nnn\b/i,
+    /^ranger\b/i,
+    // Shell-spawning commands (create new interactive shells that block Agent execution)
+    /^sudo\s+su\b/i,
+    /^su\s*$/i,
+    /^su\s+-/i,
+    /^su\s+\w/i
+  ]
+
+  // Shell-spawning command patterns (subset of TUI commands that create new shells)
+  // Used to provide specific messaging and force-terminate behavior
+  private readonly SHELL_SPAWNING_PATTERNS = [
+    /^sudo\s+su\b/i,
+    /^su\s*$/i,
+    /^su\s+-/i,
+    /^su\s+\w/i,
+    /^bash\s*$/i,
+    /^sh\s*$/i,
+    /^zsh\s*$/i,
+    /^ksh\s*$/i,
+    /^csh\s*$/i,
+    /^tcsh\s*$/i,
+    /^fish\s*$/i,
+    /^dash\s*$/i
+  ]
 
   // Conditional-TUI: Programs that may be non-interactive with specific arguments
   private readonly CONDITIONAL_TUI_COMMANDS: Array<{
@@ -291,7 +325,16 @@ export class InteractionDetector extends EventEmitter {
     { pattern: /^ssh\b/i, nonInteractiveArgs: [/-T\b/, /-o\s*BatchMode=yes/i, /\s+['"]?[^-]/] },
     { pattern: /^sftp\b/i, nonInteractiveArgs: [/-b\b/] },
     { pattern: /^ftp\b/i, nonInteractiveArgs: [/-n\b/] },
-    { pattern: /^mongo\b/i, nonInteractiveArgs: [/--eval\b/, /-e\s/] }
+    { pattern: /^mongo\b/i, nonInteractiveArgs: [/--eval\b/, /-e\s/] },
+    // Shell-spawning commands: interactive when invoked without -c or script file
+    { pattern: /^bash\b/i, nonInteractiveArgs: [/-c\s/, /\s+\S+\.\w+/, /\s+\/\S+/] },
+    { pattern: /^sh\b/i, nonInteractiveArgs: [/-c\s/, /\s+\S+\.\w+/, /\s+\/\S+/] },
+    { pattern: /^zsh\b/i, nonInteractiveArgs: [/-c\s/, /\s+\S+\.\w+/, /\s+\/\S+/] },
+    { pattern: /^ksh\b/i, nonInteractiveArgs: [/-c\s/, /\s+\S+\.\w+/, /\s+\/\S+/] },
+    { pattern: /^csh\b/i, nonInteractiveArgs: [/-c\s/, /\s+\S+\.\w+/, /\s+\/\S+/] },
+    { pattern: /^tcsh\b/i, nonInteractiveArgs: [/-c\s/, /\s+\S+\.\w+/, /\s+\/\S+/] },
+    { pattern: /^fish\b/i, nonInteractiveArgs: [/-c\s/, /\s+\S+\.\w+/, /\s+\/\S+/] },
+    { pattern: /^dash\b/i, nonInteractiveArgs: [/-c\s/, /\s+\S+\.\w+/, /\s+\/\S+/] }
   ]
 
   // Pager command whitelist (higher priority than TUI)
@@ -372,6 +415,7 @@ export class InteractionDetector extends EventEmitter {
     // Classify command type on initialization (but don't trigger auto-cancel immediately)
     const isPagerCommand = this.isPagerCommand()
     this.tuiCategory = this.classifyTuiCommand()
+    this.isShellSpawning = this.SHELL_SPAWNING_PATTERNS.some((p) => p.test(this.command.trim()))
 
     this.debug('init', {
       command: this.command,
@@ -817,7 +861,8 @@ export class InteractionDetector extends EventEmitter {
           this.emit('tui-detected', {
             commandId: this.commandId,
             taskId: this.taskId,
-            message: this.getLocalizedMessage('tuiDetected')
+            message: this.getLocalizedMessage(this.isShellSpawning ? 'shellSpawningDetected' : 'tuiDetected'),
+            isShellSpawning: this.isShellSpawning
           })
         } else {
           // Output arrived during timer, restart
@@ -854,7 +899,8 @@ export class InteractionDetector extends EventEmitter {
       this.emit('tui-detected', {
         commandId: this.commandId,
         taskId: this.taskId,
-        message: this.getLocalizedMessage('tuiDetected')
+        message: this.getLocalizedMessage(this.isShellSpawning ? 'shellSpawningDetected' : 'tuiDetected'),
+        isShellSpawning: this.isShellSpawning
       })
     }, this.config.tuiHardTimeoutMs)
   }
@@ -1177,7 +1223,7 @@ export class InteractionDetector extends EventEmitter {
 
     // Check if LLM call limit reached - stop calling LLM
     if (this.llmCallCount >= this.config.maxLlmCalls) {
-      console.log(`[InteractionDetector] LLM call limit reached (${this.llmCallCount}/${this.config.maxLlmCalls}), degrading to freeform`)
+      logger.info(`[InteractionDetector] LLM call limit reached (${this.llmCallCount}/${this.config.maxLlmCalls}), degrading to freeform`)
       return {
         needsInteraction: true,
         interactionType: 'freeform',
@@ -1213,14 +1259,14 @@ export class InteractionDetector extends EventEmitter {
         this.debug('llm-result', { result: rawResult })
         return this.validateResult(rawResult)
       } catch (error) {
-        console.warn('[InteractionDetector] LLM call failed:', error)
+        logger.warn('[InteractionDetector] LLM call failed', { error: error })
         throw error
       }
     }
 
     // No LLM caller - return no interaction needed
     if (!this.warnedMissingLlm) {
-      console.warn('[InteractionDetector] llmCaller not configured; LLM detection disabled')
+      logger.warn('[InteractionDetector] llmCaller not configured; LLM detection disabled')
       this.warnedMissingLlm = true
     }
     this.debug('llm-missing', { message: 'no llmCaller configured' })
@@ -1362,10 +1408,10 @@ export class InteractionDetector extends EventEmitter {
   private debug(message: string, data?: Record<string, unknown>): void {
     if (!this.debugEnabled) return
     if (!data) {
-      console.log(`[InteractionDetector] ${message}`)
+      logger.info(`[InteractionDetector] ${message}`)
       return
     }
-    console.log(`[InteractionDetector] ${message} ${this.safeStringify(data)}`)
+    logger.info(`[InteractionDetector] ${message} ${this.safeStringify(data)}`)
   }
 
   private safeStringify(data: Record<string, unknown>): string {
@@ -1394,6 +1440,10 @@ export class InteractionDetector extends EventEmitter {
       tuiDetected: {
         zh: '检测到全屏程序，已自动发送 Ctrl+C 终止。如需继续请重新执行命令',
         en: 'Full-screen program detected; Ctrl+C was sent to stop it. Re-run the command if needed.'
+      },
+      shellSpawningDetected: {
+        zh: '检测到交互式 Shell 命令，Agent 无法在新 Shell 中执行操作，已自动终止。如需切换用户，请使用 sudo -u <user> <command> 代替',
+        en: 'Interactive shell command detected. Agent cannot operate inside a new shell. Use sudo -u <user> <command> instead.'
       },
       pagerMode: {
         zh: '翻页浏览中',

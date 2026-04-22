@@ -38,6 +38,13 @@
         <span>{{ $t('common.clone') }}</span>
       </div>
       <div
+        v-if="canForkSshChannel"
+        class="context-menu-item"
+        @click="forkSshChannel"
+      >
+        <span>{{ $t('common.forkSsh') }}</span>
+      </div>
+      <div
         class="context-menu-item"
         @click="createNewPanel(false, 'right')"
       >
@@ -137,6 +144,7 @@
             ></LeftTab>
           </div>
           <div class="term_content">
+            <!-- Normal splitpanes layout for all menus -->
             <splitpanes
               class="left-sidebar-container"
               @resize="(params: ResizeParams) => handleLeftPaneResize(params)"
@@ -166,8 +174,14 @@
                   :toggle-sidebar="toggleSideBar"
                   @open-user-tab="openUserTab"
                 />
+                <Files
+                  v-else-if="currentMenu == 'files'"
+                  :toggle-sidebar="toggleSideBar"
+                  @open-user-tab="openUserTab"
+                />
                 <Snippets v-else-if="currentMenu == 'snippets'" />
                 <KnowledgeCenter v-else-if="currentMenu == 'knowledgecenter'" />
+                <K8sTerminal v-else-if="currentMenu == 'k8s-explorer' || currentMenu == 'kubernetes'" />
 
                 <ExtensionViewHost
                   v-else
@@ -197,6 +211,7 @@
                       >
                         <div
                           class="main-terminal-area"
+                          :class="{ 'has-preview-actions': isPreviewActionsVisible }"
                           @mousedown="handleMainPaneFocus"
                         >
                           <transition name="fade">
@@ -210,7 +225,11 @@
                           <DockviewVue
                             v-if="configLoaded"
                             ref="dockviewRef"
-                            :class="currentTheme === 'light' ? 'dockview-theme-light' : 'dockview-theme-dark'"
+                            :class="[
+                              currentTheme === 'light' ? 'dockview-theme-light' : 'dockview-theme-dark',
+                              { 'hide-tab-close-button': hideTabCloseButton }
+                            ]"
+                            :disable-tabs-overflow-list="true"
                             :style="{
                               width: '100%',
                               height: '100%',
@@ -299,13 +318,16 @@ import { Pane, Splitpanes } from 'splitpanes'
 import 'splitpanes/dist/splitpanes.css'
 import AiTab from '@views/components/AiTab/index.vue'
 import { isImageFile } from '@views/components/AiTab/utils'
+import { signalResizeStart } from '@views/components/AiTab/composables/useAutoScroll'
 import Header from '@views/components/Header/index.vue'
 import LeftTab from '@views/components/LeftTab/index.vue'
 import Workspace from '@views/components/Workspace/index.vue'
+import Files from '@views/components/Files/tabIndex.vue'
 import Extensions from '@views/components/Extensions/index.vue'
 import Assets from '@views/components/Assets/index.vue'
 import Snippets from '@views/components/LeftTab/config/snippets.vue'
 import KnowledgeCenter from '@views/components/KnowledgeCenter/KnowledgeCenter.vue'
+import K8sTerminal from '@views/k8s/terminal/index.vue'
 import AgentsSidebar from '@views/components/AgentsSidebar/index.vue'
 import TabsPanel from './tabsPanel.vue'
 import ExtensionViewHost from './ExtensionViewHost.vue'
@@ -316,11 +338,13 @@ import { aliasConfigStore } from '@/store/aliasConfigStore'
 import eventBus from '@/utils/eventBus'
 import { getActualTheme, initializeThemeFromDatabase } from '@/utils/themeUtils'
 import { componentInstances, inputManager, isGlobalInput, isShowCommandBar } from '@renderer/views/components/Ssh/utils/termInputManager'
+import { getSshConnectionId } from '@renderer/views/components/Ssh/utils/sshConnectionRegistry'
 import { shortcutService } from '@/services/shortcutService'
 import { captureExtensionUsage, ExtensionNames, ExtensionStatus } from '@/utils/telemetry'
 import Dashboard from '@renderer/views/components/Ssh/components/dashboard.vue'
-import { getGlobalState } from '@/agent/storage/state'
 import { useAiSidebarModelRefresh } from './composables/useAiSidebarModelRefresh'
+import { isFocusInAiTab } from '@/utils/domUtils'
+
 import 'dockview-vue/dist/styles/dockview.css'
 import { type DockviewReadyEvent, DockviewVue } from 'dockview-vue'
 import type { DockviewApi } from 'dockview-core'
@@ -330,6 +354,7 @@ const props = defineProps<{
 }>()
 
 const { t } = useI18n()
+const logger = createRendererLogger('layout.terminal')
 
 // Computed styles for layout visibility
 const getLayoutStyle = (
@@ -348,6 +373,7 @@ const getLayoutStyle = (
 }
 const aliasConfig = aliasConfigStore()
 const configStore = piniaUserConfigStore()
+const hideTabCloseButton = ref(false)
 const isTransparent = computed(() => !!configStore.getUserConfig.background.image)
 const headerRef = ref<InstanceType<typeof Header> | null>(null)
 const allTabs = ref<InstanceType<typeof TabsPanel> | null>(null)
@@ -357,10 +383,13 @@ const isSkippedLogin = computed(() => {
 })
 const watermarkContent = reactive({
   content: computed(() => {
+    if (!showWatermark.value) {
+      return ['']
+    }
     if (isSkippedLogin.value) {
       return ['Guest User']
     }
-    return showWatermark.value ? [userInfoStore().userInfo.name, userInfoStore().userInfo.email] : ['']
+    return [userInfoStore().userInfo.name, userInfoStore().userInfo.email]
   }),
   font: {
     fontSize: 12,
@@ -481,7 +510,7 @@ const saveAiSidebarState = () => {
         savedAiSidebarState.value.size = aiSidebarSize.value
       }
     } catch (error) {
-      console.warn('Failed to get AI Tab state:', error)
+      logger.warn('Failed to get AI Tab state', { error: error })
       if (savedAiSidebarState.value) {
         savedAiSidebarState.value.size = aiSidebarSize.value
       }
@@ -506,7 +535,7 @@ const restorePreviousFocus = () => {
       try {
         lastFocusedElement.value?.focus()
       } catch (error) {
-        console.warn('Failed to restore focus:', error)
+        logger.warn('Failed to restore focus', { error: error })
       }
     })
   }
@@ -756,6 +785,7 @@ onMounted(async () => {
 
   document.addEventListener('keydown', handleCtrlW, true)
   ;(globalThis as any).__ctrlWHandler = handleCtrlW
+  window.addEventListener('keydown', handleCloseTabKeyDown)
 
   eventBus.on('updateWatermark', (watermark) => {
     showWatermark.value = watermark !== 'close'
@@ -777,7 +807,8 @@ onMounted(async () => {
     }
     store.setUserConfig(config)
     configLoaded.value = true
-    currentTheme.value = getActualTheme(config.theme || 'auto')
+    currentTheme.value = getActualTheme(config.theme || 'dark')
+    hideTabCloseButton.value = config.showCloseButton === 2
 
     // Delay of 2 seconds to wait for the main thread to complete telemetry initialization
     setTimeout(async () => {
@@ -798,7 +829,7 @@ onMounted(async () => {
       showWatermark.value = config.watermark !== 'close'
     })
   } catch (e) {
-    currentTheme.value = getActualTheme('auto')
+    currentTheme.value = getActualTheme('dark')
     nextTick(() => {
       showWatermark.value = true
     })
@@ -838,7 +869,7 @@ onMounted(async () => {
         return true
       }
     } catch (error) {
-      console.warn('Failed to restore AI Tab state:', error)
+      logger.warn('Failed to restore AI Tab state', { error: error })
       // Clear invalid state
       localStorage.removeItem('sharedAiTabState')
     }
@@ -934,6 +965,9 @@ onMounted(async () => {
   // Initialize shortcut service
   shortcutService.init()
 
+  eventBus.on('showCloseButtonChanged', (checked) => {
+    hideTabCloseButton.value = !checked
+  })
   eventBus.on('currentClickServer', currentClickServer)
   eventBus.on('getActiveTabAssetInfo', handleGetActiveTabAssetInfo)
   eventBus.on('getAllOpenedHosts', handleGetAllOpenedHosts)
@@ -950,6 +984,7 @@ onMounted(async () => {
   eventBus.on('createNewTerminal', handleCreateNewTerminal)
   eventBus.on('open-user-tab', openUserTab)
   eventBus.on('kbEntriesRemoved', handleKbEntriesRemoved)
+  eventBus.on('kbFileRenamed', handleKbFileRenamed)
   eventBus.on('openKbPreview', handleOpenKbPreview)
   eventBus.on('searchHost', handleSearchHost)
   eventBus.on('save-state-before-switch', () => {
@@ -963,10 +998,11 @@ onMounted(async () => {
           savedAiSidebarState.value = currentState
         }
       } catch (error) {
-        console.warn('Failed to save AI state before layout switch:', error)
+        logger.warn('Failed to save AI state before layout switch', { error: error })
       }
     }
   })
+  await setupXshellWakeupBridge()
 
   // Try to restore state on initial mount (unified for both modes)
   nextTick(async () => {
@@ -1153,6 +1189,9 @@ const handleLeftPaneResize = (params: ResizeParams) => {
   if (isQuickClosing.value) {
     return
   }
+
+  // Signal resize to pause expensive chat observers
+  signalResizeStart()
 
   const container = document.querySelector('.left-sidebar-container') as HTMLElement
   const containerWidth = container ? container.offsetWidth : 1000
@@ -1495,6 +1534,130 @@ interface TabItem {
 }
 const openedTabs = ref<TabItem[]>([])
 const activeTabId = ref('')
+
+type XshellWakeupPayload = {
+  source?: string
+  url?: string
+  host?: string
+  port?: number
+  username?: string
+  password?: string
+  targetHint?: string
+  newTab?: boolean
+  receivedAt?: string
+}
+
+let removeXshellWakeupListener: (() => void) | null = null
+const xshellWakeupDedupTimestamps = new Map<string, number>()
+const XSHELL_WAKEUP_DEDUP_WINDOW_MS = 10 * 60 * 1000
+
+const makeXshellWakeupDedupKey = (payload: XshellWakeupPayload): string => {
+  const host = String(payload.host || '')
+  const port = Number(payload.port || 22)
+  const username = String(payload.username || '')
+  const targetHint = String(payload.targetHint || '')
+  const receivedAt = String(payload.receivedAt || '')
+  return `${host}:${port}:${username}:${targetHint}:${receivedAt}`
+}
+
+const shouldSkipDuplicateXshellWakeup = (payload: XshellWakeupPayload): boolean => {
+  const key = makeXshellWakeupDedupKey(payload)
+  const now = Date.now()
+
+  for (const [dedupKey, ts] of xshellWakeupDedupTimestamps.entries()) {
+    if (now - ts > XSHELL_WAKEUP_DEDUP_WINDOW_MS) {
+      xshellWakeupDedupTimestamps.delete(dedupKey)
+    }
+  }
+
+  const last = xshellWakeupDedupTimestamps.get(key)
+  xshellWakeupDedupTimestamps.set(key, now)
+  return typeof last === 'number' && now - last <= XSHELL_WAKEUP_DEDUP_WINDOW_MS
+}
+
+const openTerminalFromXshellWakeup = (payload: XshellWakeupPayload) => {
+  if (!payload || !payload.host || !payload.username) {
+    logger.warn('Invalid xshell wakeup payload, missing host or username', {
+      event: 'xshell.wakeup.invalid',
+      hasHost: !!payload.host,
+      hasUsername: !!payload.username
+    })
+    return
+  }
+
+  if (shouldSkipDuplicateXshellWakeup(payload)) {
+    logger.info('Skip duplicated xshell wakeup event', { event: 'xshell.wakeup.dedup', port: payload.port || 22 })
+    return
+  }
+
+  const host = String(payload.host)
+  const port = Number(payload.port || 22)
+  const username = String(payload.username)
+  const password = String(payload.password || '')
+  const targetHint = String(payload.targetHint || '')
+  const title = targetHint || `${username}@${host}`
+  const key = targetHint || host
+  const wakeupNewTab = payload.newTab === true
+
+  const wakeupUuid =
+    typeof globalThis.crypto?.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${performance.now().toString().replace('.', '')}`
+
+  const node = {
+    title,
+    key,
+    type: 'term',
+    organizationId: 'personal',
+    connection: 'personal',
+    uuid: `xshell-${wakeupUuid}`,
+    ip: host,
+    host,
+    hostname: host,
+    port,
+    username,
+    password,
+    authType: 'password',
+    asset_type: 'person',
+    comment: targetHint || host,
+    source: payload.source || 'xshell-direct',
+    wakeupSource: payload.source || 'xshell-direct',
+    wakeupNewTab,
+    disablePoolReuse: true,
+    skipAssetLookup: true
+  }
+
+  logger.info('Open terminal from xshell wakeup', {
+    source: payload.source || 'unknown',
+    port,
+    hasPassword: password.length > 0,
+    targetHint
+  })
+  currentClickServer(node)
+}
+
+const setupXshellWakeupBridge = async () => {
+  const api = (window as any).api
+  if (!api) return
+
+  if (typeof api.onXshellWakeup === 'function') {
+    removeXshellWakeupListener = api.onXshellWakeup((payload: XshellWakeupPayload) => {
+      openTerminalFromXshellWakeup(payload)
+    })
+  }
+
+  if (typeof api.consumePendingXshellWakeups === 'function') {
+    try {
+      const pending = await api.consumePendingXshellWakeups()
+      if (Array.isArray(pending)) {
+        pending.forEach((payload: XshellWakeupPayload) => openTerminalFromXshellWakeup(payload))
+      }
+    } catch (error) {
+      logger.error('Failed to consume pending xshell wakeups', { error: error })
+    }
+  }
+}
+
 const currentClickServer = async (item) => {
   if (item.children) return
 
@@ -1717,7 +1880,47 @@ const handleKbEntriesRemoved = (payload: { entries: KbRemovedEntry[] }) => {
   }
 }
 
+// Update KnowledgeCenterEditor tabs when a file or folder is renamed
+const handleKbFileRenamed = (payload: { oldRelPath: string; newRelPath: string; newName: string }) => {
+  if (!dockApi) return
+  const { oldRelPath, newRelPath, newName } = payload
+  if (!oldRelPath || !newRelPath) return
+
+  const panels = [...dockApi.panels]
+  for (const panel of panels) {
+    const params = panel.params as Record<string, any> | undefined
+    if (!params || params.content !== 'KnowledgeCenterEditor') continue
+    const tabRelPath = String(params.props?.relPath || params.data?.props?.relPath || '')
+    if (!tabRelPath) continue
+
+    let updatedRelPath = ''
+    let updatedTitle = ''
+
+    if (tabRelPath === oldRelPath) {
+      // Exact match: the renamed file/folder itself
+      updatedRelPath = newRelPath
+      updatedTitle = newName
+    } else if (tabRelPath.startsWith(oldRelPath + '/')) {
+      // Child of renamed directory
+      updatedRelPath = newRelPath + tabRelPath.slice(oldRelPath.length)
+      updatedTitle = updatedRelPath.split('/').pop() || updatedRelPath
+    }
+
+    if (!updatedRelPath) continue
+
+    panel.api.setTitle(updatedTitle)
+    if (params.props) params.props.relPath = updatedRelPath
+    if (params.data?.props) params.data.props.relPath = updatedRelPath
+    params.title = updatedTitle
+    panel.api.updateParameters?.({ ...params })
+  }
+}
+
 onUnmounted(() => {
+  if (removeXshellWakeupListener) {
+    removeXshellWakeupListener()
+    removeXshellWakeupListener = null
+  }
   eventBus.off('save-state-before-switch')
   shortcutService.destroy()
   window.removeEventListener('resize', updatePaneSize)
@@ -1733,6 +1936,7 @@ onUnmounted(() => {
     delete (globalThis as any).__ctrlWHandler
   }
   document.removeEventListener('mousemove', handleGlobalMouseMove)
+  window.removeEventListener('keydown', handleCloseTabKeyDown)
 
   eventBus.off('currentClickServer', currentClickServer)
   eventBus.off('getActiveTabAssetInfo', handleGetActiveTabAssetInfo)
@@ -1749,6 +1953,7 @@ onUnmounted(() => {
   eventBus.off('createNewTerminal', handleCreateNewTerminal)
   eventBus.off('open-user-tab', openUserTab)
   eventBus.off('kbEntriesRemoved', handleKbEntriesRemoved)
+  eventBus.off('kbFileRenamed', handleKbFileRenamed)
   eventBus.off('openKbPreview', handleOpenKbPreview)
   eventBus.off('searchHost', handleSearchHost)
 })
@@ -1761,6 +1966,10 @@ interface OpenUserTabObject {
   fromLocal?: boolean
   pluginId?: string
   props?: {
+    relPath?: string
+    startLine?: number
+    endLine?: number
+    jumpToken?: number | string
     pluginId?: string
     filePath?: string
     initialContent?: string
@@ -1805,11 +2014,30 @@ const openUserTab = async function (arg: OpenUserTabArg) {
 
     const target = arg as Exclude<OpenUserTabArg, string>
     const relPath = String(target.props?.relPath || '')
+    const targetProps = {
+      ...target.props,
+      relPath
+    }
     // Only check for editor mode panels, not preview panels
     const existing = dockApi.panels.find(
       (panel) => panel.params?.content === 'KnowledgeCenterEditor' && panel.params?.props?.relPath === relPath && panel.params?.mode !== 'preview'
     )
     if (existing) {
+      const existingParams = existing.params || {}
+      const shouldUpdateJump = targetProps.startLine !== undefined || targetProps.endLine !== undefined || targetProps.jumpToken !== undefined
+      if (shouldUpdateJump) {
+        const nextProps = {
+          ...(existingParams.props || {}),
+          ...targetProps
+        }
+        if (existingParams.props) existingParams.props = nextProps
+        if (existingParams.data?.props) existingParams.data.props = nextProps
+        existing.api.updateParameters?.({
+          ...existingParams,
+          props: nextProps,
+          data: existingParams.data ? { ...existingParams.data, props: nextProps } : existingParams.data
+        })
+      }
       existing.api.setActive()
       return
     }
@@ -1826,11 +2054,43 @@ const openUserTab = async function (arg: OpenUserTabArg) {
         title: target.title || relPath.split('/').pop() || 'KnowledgeCenter',
         key: 'KnowledgeCenterEditor',
         type: 'KnowledgeCenterEditor',
-        props: target.props
+        props: targetProps
       },
-      props: target.props,
+      props: targetProps,
       isMarkdown: relPath.toLowerCase().endsWith('.md') || relPath.toLowerCase().endsWith('.markdown'),
       mode: 'editor'
+    })
+    checkActiveTab('config')
+    return
+  }
+
+  if (value === 'assetManagement') {
+    if (isStringArg) return
+    if (!dockApi) return
+
+    const target = arg as Exclude<OpenUserTabArg, string>
+    const orgUuid = String(target.props?.organizationUuid || '')
+    const existing = dockApi.panels.find((panel) => panel.params?.content === 'assetManagement' && panel.params?.props?.organizationUuid === orgUuid)
+    if (existing) {
+      existing.api.setActive()
+      return
+    }
+
+    const stableId = `assetManage_${orgUuid || Date.now()}`
+    addDockPanel({
+      id: stableId,
+      title: target.title || 'Asset Management',
+      content: 'assetManagement',
+      type: 'config',
+      organizationId: '',
+      ip: '',
+      data: {
+        title: target.title || 'Asset Management',
+        key: 'assetManagement',
+        type: 'assetManagement',
+        props: target.props
+      },
+      props: target.props
     })
     checkActiveTab('config')
     return
@@ -1846,6 +2106,8 @@ const openUserTab = async function (arg: OpenUserTabArg) {
     value === 'keywordHighlightEditor' ||
     value === 'jumpserverSupport' ||
     value === 'aliasConfig' ||
+    value === 'k8sClusterConfig' ||
+    value === 'files' ||
     value.startsWith('plugins:')
   ) {
     if (!dockApi) return
@@ -1871,6 +2133,9 @@ const openUserTab = async function (arg: OpenUserTabArg) {
       p.title = 'jumpserverSupportPlugin'
       p.type = 'extensions'
       break
+    case 'k8sClusterConfig':
+      p.title = t('k8s.terminal.k8sClusterConfig')
+      break
     case 'securityConfigEditor': {
       // Get config file path and extract file name
       try {
@@ -1880,7 +2145,7 @@ const openUserTab = async function (arg: OpenUserTabArg) {
         const fileName = configPath.split(/[/\\]/).pop() || 'chaterm-security.json'
         p.title = fileName
       } catch (error) {
-        console.error('Failed to get security config path:', error)
+        logger.error('Failed to get security config path', { error: error })
         p.title = 'chaterm-security.json' // Default file name
       }
       break
@@ -1894,7 +2159,7 @@ const openUserTab = async function (arg: OpenUserTabArg) {
         const fileName = configPath.split(/[/\\]/).pop() || 'keyword-highlight.json'
         p.title = fileName
       } catch (error) {
-        console.error('Failed to get keyword highlight config path:', error)
+        logger.error('Failed to get keyword highlight config path', { error: error })
         p.title = 'keyword-highlight.json' // Default file name
       }
       break
@@ -1931,6 +2196,24 @@ const getActiveTabAssetInfo = async () => {
   const params = activePanel.params
   if (!params) {
     return null
+  }
+
+  // K8s tab: use cluster.id as uuid and server_url as ip
+  if (params.type === 'k8s') {
+    const cluster = params.data?.data || params.data
+    if (!cluster || !cluster.id) {
+      return null
+    }
+    return {
+      uuid: cluster.id,
+      title: activePanel.api.title || params.title || cluster.name,
+      ip: cluster.server_url || params.ip || '',
+      organizationId: undefined,
+      type: 'k8s',
+      outputContext: 'Output context not applicable for this tab type.',
+      tabSessionId: activePanel.id,
+      assetType: undefined
+    }
   }
 
   const ip = params.data?.ip || params.ip
@@ -2041,6 +2324,9 @@ const onMainSplitResize = (params) => {
     return
   }
 
+  // Signal resize to pause expensive chat observers
+  signalResizeStart()
+
   mainTerminalSize.value = params.prevPane.size
   if (showAiSidebar.value) {
     aiSidebarSize.value = params.panes[params.panes.length - 1].size
@@ -2114,39 +2400,28 @@ const handleModeChange = (mode: 'terminal' | 'agents') => {
         savedAiSidebarState.value = currentState
       }
     } catch (error) {
-      console.warn('Failed to save AI state before mode switch:', error)
+      logger.warn('Failed to save AI state before mode switch', { error: error })
     }
   }
   eventBus.emit('switch-mode', mode)
 }
 
 // Agents mode handlers
-const handleConversationSelect = async (conversationId: string) => {
+const handleConversationSelect = async (conversation: { id: string; title: string; ts: number; favorite?: boolean }) => {
   if (aiTabRef.value) {
-    try {
-      const taskHistory = ((await getGlobalState('taskHistory')) as any[]) || []
-      const task = taskHistory.find((h) => h.id === conversationId)
+    const history = {
+      id: conversation.id,
+      chatTitle: conversation.title || 'New Chat',
+      chatContent: [],
+      isFavorite: conversation.favorite || false,
+      ts: conversation.ts
+    }
 
-      if (task) {
-        // Convert TaskHistoryItem to HistoryItem format to ensure chatTitle is present
-        const history = {
-          id: task.id,
-          chatTitle: task?.chatTitle || task?.task || 'New Chat',
-          chatType: task.chatType || 'agent',
-          chatContent: [],
-          isFavorite: task.isFavorite || false,
-          ts: task.ts
-        }
-
-        const aiTabInstance = aiTabRef.value as any
-        if (aiTabInstance && typeof aiTabInstance.restoreHistoryTab === 'function') {
-          await aiTabInstance.restoreHistoryTab(history)
-        } else {
-          eventBus.emit('restore-history-tab', history)
-        }
-      }
-    } catch (error) {
-      console.error('Failed to select conversation:', error)
+    const aiTabInstance = aiTabRef.value as any
+    if (aiTabInstance && typeof aiTabInstance.restoreHistoryTab === 'function') {
+      await aiTabInstance.restoreHistoryTab(history)
+    } else {
+      eventBus.emit('restore-history-tab', history)
     }
   }
 }
@@ -2161,7 +2436,7 @@ const handleNewChat = async () => {
         eventBus.emit('create-new-empty-tab')
       }
     } catch (error) {
-      console.error('Failed to create new chat:', error)
+      logger.error('Failed to create new chat', { error: error })
     }
   }
 }
@@ -2176,7 +2451,7 @@ const handleConversationDelete = async (conversationId: string) => {
         eventBus.emit('remove-tab', conversationId)
       }
     } catch (error) {
-      console.error('Failed to delete conversation tab:', error)
+      logger.error('Failed to delete conversation tab', { error: error })
     }
   }
 }
@@ -2186,6 +2461,60 @@ const panelCount = ref(0)
 const hasPanels = computed(() => panelCount.value > 0)
 let dockApi: DockviewApi | null = null
 const dockApiInstance = ref<DockviewApi | null>(null)
+const isPreviewActionsVisible = ref(false)
+
+const computePreviewActionsVisible = (): boolean => {
+  const panel = dockApi?.activePanel
+  if (!panel) return false
+  // Keep in sync with `EditorActions.vue` showActions logic.
+  return panel.params?.content === 'KnowledgeCenterEditor' && panel.params?.mode !== 'preview' && panel.params?.isMarkdown
+}
+
+const isFocusInTerminal = (event: KeyboardEvent): boolean => {
+  const target = event.target as HTMLElement | null
+  const activeElement = document.activeElement as HTMLElement | null
+  const terminalContainer = target?.closest('.terminal-container') || activeElement?.closest('.terminal-container')
+  const xtermElement = target?.closest('.xterm') || activeElement?.closest('.xterm')
+
+  return !!(terminalContainer || xtermElement)
+}
+
+const handleCloseTabKeyDown = (event: KeyboardEvent) => {
+  const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0
+  const isCloseShortcut = (isMac && event.metaKey && event.key === 'w') || (!isMac && event.ctrlKey && event.shiftKey && event.key === 'W')
+
+  if (!isCloseShortcut) {
+    return
+  }
+
+  if (isFocusInAiTab(event)) {
+    return
+  }
+
+  if (!dockApi || !dockApi.activePanel) {
+    return
+  }
+
+  const activePanel = dockApi.activePanel
+  const params = activePanel.params as Record<string, any> | undefined
+
+  if (isFocusInTerminal(event) && params?.organizationId && params.organizationId !== '') {
+    return
+  }
+
+  const CLOSE_DEBOUNCE_TIME = 100
+  const currentTime = Date.now()
+  if (currentTime - ((window as any).lastCloseTime || 0) < CLOSE_DEBOUNCE_TIME) {
+    event.preventDefault()
+    event.stopPropagation()
+    return
+  }
+  ;(window as any).lastCloseTime = currentTime
+
+  event.preventDefault()
+  event.stopPropagation()
+  activePanel.api.close()
+}
 
 defineOptions({
   name: 'TerminalLayout',
@@ -2240,6 +2569,25 @@ const handleActivePanelChange = async () => {
     return
   }
 
+  // Handle K8s tab changes: use cluster.id as uuid and server_url as ip
+  if (panelType === 'k8s') {
+    const cluster = params.data?.data || params.data
+    if (cluster && cluster.id && cluster.server_url) {
+      eventBus.emit('activeTabChanged', {
+        ip: cluster.server_url,
+        data: {
+          uuid: cluster.id,
+          asset_type: undefined
+        },
+        connection: 'k8s',
+        title: activePanel.api.title || params.title || cluster.name,
+        organizationId: undefined,
+        type: 'k8s'
+      })
+    }
+    return
+  }
+
   // Handle terminal and SSH tab changes
   if (panelType !== 'term' && panelType !== 'ssh') {
     return
@@ -2266,6 +2614,7 @@ const handleActivePanelChange = async () => {
 const onDockReady = (event: DockviewReadyEvent) => {
   dockApi = event.api
   dockApiInstance.value = event.api
+  isPreviewActionsVisible.value = computePreviewActionsVisible()
 
   dockApi.onDidAddPanel(() => {
     panelCount.value = dockApi?.panels.length ?? 0
@@ -2275,12 +2624,13 @@ const onDockReady = (event: DockviewReadyEvent) => {
     panelCount.value = dockApi?.panels.length ?? 0
     // Clear Assets menu selection when corresponding tab is closed
     const content = panel.params?.content
-    if (content === 'assetConfig' || content === 'keyManagement' || content === 'files') {
+    if (content === 'assetConfig' || content === 'keyManagement') {
       assetsRef.value?.handleExplorerActive(content)
     }
   })
 
   dockApi.onDidActivePanelChange(() => {
+    isPreviewActionsVisible.value = computePreviewActionsVisible()
     handleActivePanelChange()
   })
 
@@ -2361,19 +2711,19 @@ const setupTabContextMenu = () => {
     if (!contextMenu.value.visible) return
 
     const target = e.target as HTMLElement
-
     const inMenu = contextMenuRef.value?.contains(target)
-    const inTab = !!target.closest('.dv-tab')
 
-    if (inMenu || inTab) return
+    if (inMenu) return
 
+    e.preventDefault()
+    e.stopPropagation()
     hideContextMenu()
   }
 
-  document.addEventListener('mousedown', handleMouseDown)
+  document.addEventListener('mousedown', handleMouseDown, true)
 
   onBeforeUnmount(() => {
-    document.removeEventListener('mousedown', handleMouseDown)
+    document.removeEventListener('mousedown', handleMouseDown, true)
   })
 }
 
@@ -2453,6 +2803,76 @@ const setupTabDragToAi = () => {
       e.dataTransfer.effectAllowed = 'copy'
     }
   })
+}
+
+const canForkSshChannel = computed(() => {
+  const panelId = contextMenu.value.panelId
+  if (!panelId || !dockApi) return false
+  const panel = dockApi.getPanel(panelId)
+  if (!panel) return false
+  const params = (panel as any).api?.panel?._params ?? (panel as any).panel?._params
+  const panelType = params?.type || params?.data?.type
+  if (panelType !== 'term' && panelType !== 'ssh') return false
+  // params.id is the pure uuid that maps to sshConnect's currentConnectionId prop
+  const tabId = params?.id
+  return !!tabId && !!getSshConnectionId(tabId)
+})
+
+const forkSshChannel = () => {
+  const targetPanelId = contextMenu.value.panelId
+  if (!dockApi || !targetPanelId) {
+    hideContextMenu()
+    return
+  }
+
+  const sourcePanel = dockApi.getPanel(targetPanelId)
+  if (!sourcePanel) {
+    hideContextMenu()
+    return
+  }
+
+  const sourceTitle = sourcePanel.api.title ?? sourcePanel.id
+  const sourceComponent = sourcePanel.api.component
+  const rawParams = (sourcePanel as any).api?.panel?._params ?? (sourcePanel as any).panel?._params
+
+  // Get the SSH connectionId from registry using the tab's id (pure uuid)
+  const tabId = rawParams?.id
+  const sshConnectionId = tabId ? getSshConnectionId(tabId) : undefined
+  if (!sshConnectionId) {
+    hideContextMenu()
+    return
+  }
+
+  const newIdV4 = uuidv4()
+  const newId = 'panel_' + newIdV4
+
+  const params = {
+    ...safeCloneParams(rawParams),
+    currentPanelId: newId,
+    closeCurrentPanel: (pid?: string) => closeCurrentPanel(pid || newId),
+    createNewPanel: (isClone: boolean, direction: string, pid?: string) => createNewPanel(isClone, direction as any, pid || newId)
+  }
+
+  params.id = newIdV4
+  // Inject forkFromConnectionId so sshConnect.vue takes the fork path
+  if (params.data) {
+    params.data = { ...params.data, forkFromConnectionId: sshConnectionId }
+  } else {
+    params.data = { forkFromConnectionId: sshConnectionId }
+  }
+
+  dockApi.addPanel({
+    id: newId,
+    component: sourceComponent,
+    title: sourceTitle,
+    params: params,
+    position: {
+      referencePanel: sourcePanel,
+      direction: 'within'
+    }
+  })
+
+  hideContextMenu()
 }
 
 const createNewPanel = (isClone: boolean, direction: 'left' | 'right' | 'above' | 'below' | 'within', panelId?: string) => {
@@ -2847,6 +3267,16 @@ defineExpose({
     right: 0;
     z-index: 10;
   }
+
+  // Reserve space for the preview actions overlay so it never covers
+  // Dockview header tabs when they overflow/clamp.
+  &.has-preview-actions {
+    .dockview-theme-light .dv-tabs-and-actions-container,
+    .dockview-theme-dark .dv-tabs-and-actions-container {
+      padding-right: 30px;
+      box-sizing: border-box;
+    }
+  }
 }
 
 .ant-input-group-wrapper {
@@ -2974,6 +3404,10 @@ defineExpose({
     box-shadow: none !important;
   }
 }
+
+.hide-tab-close-button .dv-default-tab-action {
+  display: none !important;
+}
 </style>
 <style lang="less">
 .splitpanes__splitter {
@@ -3018,24 +3452,36 @@ defineExpose({
   position: fixed;
   background-color: var(--bg-color);
   border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 2px 0;
+  border-radius: 8px;
+  padding: 4px;
   z-index: 1000;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-  min-width: 120px;
-  font-size: 12px;
+  box-shadow:
+    0 4px 20px rgba(0, 0, 0, 0.15),
+    0 2px 8px rgba(0, 0, 0, 0.1);
+  min-width: 180px;
+  font-size: 13px;
+  backdrop-filter: blur(10px);
 }
 
 .context-menu-item {
   padding: 6px 12px;
+  margin: 1px 0;
   cursor: pointer;
   color: var(--text-color);
-  transition: background-color 0.2s ease;
+  border-radius: 6px;
+  font-weight: 500;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
   user-select: none;
 }
 
 .context-menu-item:hover {
   background-color: var(--hover-bg-color);
+  transform: translateX(2px);
+}
+
+.context-menu-item:active {
+  background-color: var(--active-bg-color);
+  transform: translateX(2px) scale(0.98);
 }
 
 .tab-title-input {
@@ -3070,13 +3516,13 @@ defineExpose({
   --dv-active-sash-color: transparent;
   --dv-active-sash-transition-duration: 0.1s;
   --dv-active-sash-transition-delay: 0.5s;
-  --dv-group-view-background-color: white;
+  --dv-group-view-background-color: var(--bg-color);
   --dv-tabs-and-actions-container-background-color: var(--bg-color);
   --dv-activegroup-visiblepanel-tab-background-color: var(--bg-color-tertiary);
   --dv-activegroup-hiddenpanel-tab-background-color: var(--bg-color);
-  --dv-inactivegroup-visiblepanel-tab-background-color: white;
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--bg-color-secondary);
   --dv-inactivegroup-hiddenpanel-tab-background-color: var(--bg-color);
-  --dv-tab-divider-color: #e2e8f0;
+  --dv-tab-divider-color: var(--border-color);
   --dv-activegroup-visiblepanel-tab-color: rgb(51, 51, 51);
   --dv-activegroup-hiddenpanel-tab-color: rgba(51, 51, 51, 0.7);
   --dv-inactivegroup-visiblepanel-tab-color: rgba(51, 51, 51, 0.7);
@@ -3087,11 +3533,11 @@ defineExpose({
 }
 
 .dockview-theme-light .dv-tabs-and-actions-container {
-  border-bottom: 1px solid #e2e8f0;
+  border-bottom: 1px solid var(--border-color);
 }
 
 .dockview-theme-light .dv-groupview.dv-active-group > .dv-tabs-and-actions-container .dv-tab.dv-active-tab {
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--border-color);
   border-bottom: none;
   border-radius: 4px 4px 0 0;
 }

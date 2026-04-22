@@ -1,4 +1,16 @@
-import { userConfigStore } from './userConfigStoreService'
+import { getStoredUserConfigSnapshot, resolveDataSyncPreference } from './userConfigStoreService'
+import { chatSyncService } from './chatSyncService'
+import { userConfigSyncService } from './userConfigSyncService'
+import { editorConfigSyncService } from './editorConfigSyncService'
+import { userRulesSyncService } from './userRulesSyncService'
+import { aiPreferencesSyncService } from './aiPreferencesSyncService'
+
+const logger = createRendererLogger('service.dataSync')
+
+/**
+ * All config sync services, iterated for lifecycle operations.
+ */
+const allConfigSyncServices = [userConfigSyncService, editorConfigSyncService, userRulesSyncService, aiPreferencesSyncService]
 
 /**
  * Data sync service - manages data sync start and stop in renderer process
@@ -25,45 +37,37 @@ export class DataSyncService {
    */
   async initialize(): Promise<void> {
     if (this.isInitialized) {
-      console.log('Data sync service already initialized, skipping duplicate initialization')
+      logger.info('Data sync service already initialized, skipping duplicate initialization')
       return
     }
 
     try {
-      console.log('Initializing data sync service...')
+      logger.info('Initializing data sync service...')
 
       // Check if it's a guest user
       const isSkippedLogin = localStorage.getItem('login-skipped') === 'true'
       const token = localStorage.getItem('ctm-token')
 
       if (isSkippedLogin || token === 'guest_token') {
-        console.log('Guest user detected, skipping data sync initialization')
+        logger.info('Guest user detected, skipping data sync initialization')
         this.isInitialized = true
         return
       }
 
-      // Get user config
-      const userConfig = await userConfigStore.getConfig()
-
-      if (!userConfig) {
-        console.log('Unable to get user config, skipping data sync initialization')
-        return
-      }
-
-      // Check if data sync is enabled
-      const isDataSyncEnabled = userConfig.dataSync === 'enabled'
-      console.log(`User data sync config: ${isDataSyncEnabled ? 'enabled' : 'disabled'}`)
+      const rawConfig = await getStoredUserConfigSnapshot()
+      const isDataSyncEnabled = resolveDataSyncPreference(rawConfig, true) === 'enabled'
+      logger.info('User data sync config', { enabled: isDataSyncEnabled })
 
       if (isDataSyncEnabled) {
         await this.enableDataSync()
       } else {
-        console.log('Data sync is disabled, not starting sync service')
+        logger.info('Data sync is disabled, not starting sync service')
       }
 
       this.isInitialized = true
-      console.log('Data sync service initialization completed')
+      logger.info('Data sync service initialization completed')
     } catch (error) {
-      console.error('Data sync service initialization failed:', error)
+      logger.error('Data sync service initialization failed', { error: error })
     }
   }
 
@@ -72,24 +76,39 @@ export class DataSyncService {
    */
   async enableDataSync(): Promise<boolean> {
     try {
-      console.log('Enabling data sync...')
+      logger.info('Enabling data sync...')
 
       if (!window.api?.setDataSyncEnabled) {
-        console.error('Data sync API not available')
+        logger.error('Data sync API not available')
         return false
       }
 
       const result = await window.api.setDataSyncEnabled(true)
 
       if (result?.success) {
-        console.log('Data sync successfully enabled, background sync task is in progress...')
+        logger.info('Data sync successfully enabled, initializing chat sync and all config sync services...')
+
+        // Enable chat sync as part of unified dataSync switch (failure does not block others)
+        await chatSyncService.enable().catch((e) => {
+          logger.error('Chat sync enable failed', { error: e })
+        })
+
+        // Initialize all config sync services (failure does not block others)
+        await Promise.allSettled(
+          allConfigSyncServices.map((svc) =>
+            svc.initialize().catch((e) => {
+              logger.error('Config sync service initialization failed', { error: e })
+            })
+          )
+        )
+
         return true
       } else {
-        console.error('Failed to enable data sync:', result?.error)
+        logger.error('Failed to enable data sync', { error: result?.error })
         return false
       }
     } catch (error) {
-      console.error('Error occurred while enabling data sync:', error)
+      logger.error('Error occurred while enabling data sync', { error: error })
       return false
     }
   }
@@ -99,24 +118,37 @@ export class DataSyncService {
    */
   async disableDataSync(): Promise<boolean> {
     try {
-      console.log('Disabling data sync...')
+      logger.info('Disabling data sync...')
 
       if (!window.api?.setDataSyncEnabled) {
-        console.error('Data sync API not available')
+        logger.error('Data sync API not available')
         return false
       }
 
       const result = await window.api.setDataSyncEnabled(false)
 
       if (result?.success) {
-        console.log('Data sync successfully disabled')
+        logger.info('Data sync successfully disabled, stopping chat sync and all config sync services')
+
+        // Disable chat sync as part of unified dataSync switch
+        try {
+          await chatSyncService.disable()
+        } catch (e) {
+          logger.error('Chat sync disable failed', { error: e })
+        }
+
+        // Stop all config sync services
+        for (const svc of allConfigSyncServices) {
+          svc.stop()
+        }
+
         return true
       } else {
-        console.error('Failed to disable data sync:', result?.error)
+        logger.error('Failed to disable data sync', { error: result?.error })
         return false
       }
     } catch (error) {
-      console.error('Error occurred while disabling data sync:', error)
+      logger.error('Error occurred while disabling data sync', { error: error })
       return false
     }
   }
@@ -126,7 +158,11 @@ export class DataSyncService {
    */
   reset(): void {
     this.isInitialized = false
-    console.log('Data sync service status has been reset')
+    chatSyncService.reset()
+    for (const svc of allConfigSyncServices) {
+      svc.reset()
+    }
+    logger.info('Data sync service status has been reset')
   }
 
   /**

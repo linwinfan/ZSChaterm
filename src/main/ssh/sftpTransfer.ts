@@ -1,10 +1,35 @@
 import { ipcMain, app } from 'electron'
 import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
-import { getSftpConnection, getUniqueRemoteName, sftpConnections } from './sshHandle'
+import { getSftpConnection, getUniqueRemoteName, pickReconnectConnectionInfo } from './sshHandle'
 import nodeFs from 'node:fs/promises'
 import fs from 'fs'
-const activeTasks = new Map<string, { read: any; write: any; localPath?: string; cancel?: () => void }>()
+import type { Client } from 'ssh2'
+import { Client as SSHClient } from 'ssh2'
+import {
+  connectionStatus,
+  sftpConnections,
+  sshConnections,
+  sshConnectionPool,
+  KeyboardInteractiveTimeout,
+  handleRequestKeyboardInteractive
+} from './sshHandle'
+import { jumpserverConnections } from './jumpserverHandle'
+import { getConnectionPoolKey, createProxyCommandSocket } from './sshHandle'
+import { createProxySocket } from './proxy'
+import { getAlgorithmsByAssetType } from './algorithms'
+import { getPackageInfo } from './jumpserver/connectionManager'
+const sftpLogger = createLogger('ssh')
+
+export type SftpConnectResult = { status: string; message: string }
+
+const activeTasks = new Map<string, { read?: any; write?: any; localPath?: string; cancel?: () => void }>()
+// Tracks JumpServer connections created by SFTP itself, not by the SSH connect flow.
+const sftpOwnedJumpServerConnections = new Map<string, Client>()
+// Stores shell streams opened only to bootstrap SFTP-owned JumpServer sessions.
+const sftpOwnedJumpServerStreams = new Map<string, any>()
+
+export const sftpConnectionInfoMap = new Map<string, any>()
 
 type R2RFileArgs = {
   fromId: string
@@ -23,7 +48,112 @@ type R2RDirArgs = {
   concurrency?: number
 }
 
+type GroupKind = 'directory' | 'file'
+
+type ChildTaskOptions = {
+  parentTaskKey?: string
+  taskKeyOverride?: string
+  isGroup?: boolean
+  groupKind?: GroupKind
+}
+
+function createAsyncPool<T>(worker: (item: T) => Promise<void>, concurrency: number) {
+  let active = 0
+  let ended = false
+  let firstError: any = null
+  const queue: T[] = []
+
+  let resolveWait: (() => void) | null = null
+  let rejectWait: ((err: any) => void) | null = null
+
+  const settleIfDone = () => {
+    if (firstError) {
+      rejectWait?.(firstError)
+      resolveWait = null
+      rejectWait = null
+      return
+    }
+    if (ended && active === 0 && queue.length === 0) {
+      resolveWait?.()
+      resolveWait = null
+      rejectWait = null
+    }
+  }
+
+  const pump = () => {
+    while (!firstError && active < concurrency && queue.length > 0) {
+      const item = queue.shift()!
+      active++
+      Promise.resolve(worker(item))
+        .catch((err) => {
+          if (!firstError) firstError = err
+        })
+        .finally(() => {
+          active--
+          if (!firstError) pump()
+          settleIfDone()
+        })
+    }
+  }
+
+  return {
+    push(item: T) {
+      if (firstError) throw firstError
+      queue.push(item)
+      pump()
+    },
+    end() {
+      ended = true
+      settleIfDone()
+    },
+    async wait() {
+      if (firstError) throw firstError
+      if (ended && active === 0 && queue.length === 0) return
+      await new Promise<void>((resolve, reject) => {
+        resolveWait = resolve
+        rejectWait = reject
+        pump()
+        settleIfDone()
+      })
+      if (firstError) throw firstError
+    }
+  }
+}
+
 export const registerFileSystemHandlers = () => {
+  ipcMain.handle('ssh:sftp:connect', async (_event, connectionInfo) => {
+    const result = await connectSftpReuseFirst(_event, connectionInfo)
+
+    // Cache the minimum connection info needed for later SFTP reconnects.
+    if (result?.status === 'connected' && connectionInfo?.id) {
+      const picked = pickReconnectConnectionInfo(connectionInfo)
+      if (picked) {
+        sftpConnectionInfoMap.set(String(connectionInfo.id), picked)
+      }
+    }
+
+    return result
+  })
+  ipcMain.handle('ssh:sftp:close', async (_event, payload: { id: string }) => {
+    const id = String(payload?.id || '')
+    const res = await closeSftpOnly(id)
+    sftpConnectionInfoMap.delete(id)
+    return res
+  })
+
+  ipcMain.handle('ssh:sftp:cancel', async (_event, payload: { id: string; requestId?: string }) => {
+    const id = String(payload?.id || '')
+    const reqId = String(payload?.requestId || '')
+    const p = pendingSftpConnects.get(id)
+    if (!p) return { status: 'noop', message: 'no pending connect' }
+    if (reqId && p.requestId !== reqId) return { status: 'noop', message: 'requestId mismatch' }
+
+    p.cancelled = true
+    try {
+      p.conn?.end()
+    } catch {}
+    return { status: 'cancelled', message: 'cancelled' }
+  })
   ipcMain.handle('ssh:sftp:conn:list', async () => {
     return Array.from(sftpConnections.entries()).map(([key, sftpConn]) => ({
       id: key,
@@ -35,52 +165,27 @@ export const registerFileSystemHandlers = () => {
     return app.getPath(name)
   })
 
-  ipcMain.handle('ssh:sftp:list', async (_e, { path: reqPath, id }) => {
-    return new Promise<unknown[]>((resolve) => {
-      if (isLocalId(id)) {
-        ;(async () => {
-          try {
-            const data = await listLocalDir(reqPath)
-            resolve(data)
-          } catch (err: any) {
-            resolve([String(err?.message || err)])
-          }
-        })()
-        return
+  ipcMain.handle('ssh:sftp:list', async (event, { path: reqPath, id }) => {
+    if (isLocalId(id)) {
+      try {
+        return await listLocalDir(reqPath)
+      } catch (err: any) {
+        return [String(err?.message || err)]
       }
+    }
 
-      const sftp = getSftpConnection(id)
-      if (!sftp) return resolve([''])
+    try {
+      // Always probe the current SFTP handle before listing, and reconnect if needed.
+      let sftp = await ensureSftpReady(event, id)
 
-      sftp.readdir(reqPath, (err, list) => {
-        if (err) {
-          const errorCode = (err as { code?: number }).code
-          switch (errorCode) {
-            case 2:
-              return resolve([`cannot open directory '${reqPath}': No such file or directory`])
-            case 3:
-              return resolve([`cannot open directory '${reqPath}': Permission denied`])
-            case 4:
-              return resolve([`cannot open directory '${reqPath}': Operation failed`])
-            case 5:
-              return resolve([`cannot open directory '${reqPath}': Bad message format`])
-            case 6:
-              return resolve([`cannot open directory '${reqPath}': No connection`])
-            case 7:
-              return resolve([`cannot open directory '${reqPath}': Connection lost`])
-            case 8:
-              return resolve([`cannot open directory '${reqPath}': Operation not supported`])
-            default: {
-              const message = (err as Error).message || `Unknown error (code: ${errorCode})`
-              return resolve([`cannot open directory '${reqPath}': ${message}`])
-            }
-          }
-        }
+      try {
+        const list = await sftpReaddirWithTimeout(sftp, reqPath, 10000)
 
-        const files = (list || []).map((item) => {
+        return (list || []).map((item) => {
           const name = item.filename
           const attrs = item.attrs
           const prefix = reqPath === '/' ? '/' : reqPath + '/'
+
           return {
             name,
             path: prefix + name,
@@ -91,11 +196,52 @@ export const registerFileSystemHandlers = () => {
             size: attrs.size
           }
         })
-        resolve(files)
-      })
-    })
-  })
+      } catch {
+        // Retry once with a fresh SFTP session if the current handle fails mid-request.
+        await closeSftpOnly(String(id))
+        sftp = await ensureSftpReady(event, id)
 
+        const list = await sftpReaddirWithTimeout(sftp, reqPath, 10000)
+
+        return (list || []).map((item) => {
+          const name = item.filename
+          const attrs = item.attrs
+          const prefix = reqPath === '/' ? '/' : reqPath + '/'
+
+          return {
+            name,
+            path: prefix + name,
+            isDir: attrs.isDirectory(),
+            isLink: attrs.isSymbolicLink(),
+            mode: '0' + (attrs.mode & 0o777).toString(8),
+            modTime: new Date(attrs.mtime * 1000).toISOString().replace('T', ' ').slice(0, 19),
+            size: attrs.size
+          }
+        })
+      }
+    } catch (err: any) {
+      const errorCode = err?.code
+
+      switch (errorCode) {
+        case 2:
+          return [`cannot open directory '${reqPath}': No such file or directory`]
+        case 3:
+          return [`cannot open directory '${reqPath}': Permission denied`]
+        case 4:
+          return [`cannot open directory '${reqPath}': Operation failed`]
+        case 5:
+          return [`cannot open directory '${reqPath}': Bad message format`]
+        case 6:
+          return [`cannot open directory '${reqPath}': No connection`]
+        case 7:
+          return [`cannot open directory '${reqPath}': Connection lost`]
+        case 8:
+          return [`cannot open directory '${reqPath}': Operation not supported`]
+        default:
+          return [`cannot open directory '${reqPath}': ${err?.message || String(err)}`]
+      }
+    }
+  })
   ipcMain.handle('ssh:sftp:upload-file', (event, args) => handleStreamTransfer(event, args.id, args.localPath, args.remotePath, 'upload'))
 
   ipcMain.handle('ssh:sftp:upload-directory', (event, args) => handleDirectoryTransfer(event, args.id, args.localPath, args.remotePath))
@@ -198,6 +344,10 @@ export const registerFileSystemHandlers = () => {
   ipcMain.handle('sftp:r2r:dir', async (event, args: R2RDirArgs) => {
     return transferDirR2R(event, args)
   })
+
+  ipcMain.handle('ssh:sftp:copy-or-move', async (event, args) => {
+    return copyOrMoveBySftp(event, args)
+  })
 }
 
 const isLocalId = (id: string) => id.includes('localhost@127.0.0.1:local:')
@@ -279,133 +429,6 @@ async function listLocalDir(reqPath: string) {
   return items
 }
 
-async function handleStreamTransfer(event: any, id: string, srcPath: string, destPath: string, type: 'download' | 'upload', isInternalCall = false) {
-  const sftp = getSftpConnection(id)
-  let finalDestPath = destPath.replace(/\\/g, '/')
-
-  if (type === 'upload' && !isInternalCall) {
-    const fileName = path.basename(srcPath)
-    // Calculate unique file names
-    const uniqueName = await getUniqueRemoteName(sftp, finalDestPath, fileName, false)
-    finalDestPath = path.posix.join(finalDestPath, uniqueName)
-  }
-
-  const remotePathForKey = type === 'upload' ? finalDestPath : srcPath
-  const taskKey = type === 'download' ? `${id}:dl:${srcPath}:${finalDestPath}` : `${id}:up:${srcPath}:${finalDestPath}`
-
-  if (activeTasks.has(taskKey)) {
-    return { status: 'skipped', message: 'Task already in progress' }
-  }
-
-  return new Promise((resolve, reject) => {
-    let isCancelled = false
-
-    const getStats = type === 'download' ? (p: string, cb: any) => sftp.stat(p, cb) : (p: string, cb: any) => cb(null, fs.statSync(p))
-
-    getStats(srcPath, (err: any, stats: any) => {
-      if (err) return reject(err)
-
-      const readStream = type === 'download' ? sftp.createReadStream(srcPath) : fs.createReadStream(srcPath)
-      const writeStream = type === 'download' ? fs.createWriteStream(finalDestPath) : sftp.createWriteStream(finalDestPath)
-
-      activeTasks.set(taskKey, {
-        read: readStream,
-        write: writeStream,
-        localPath: type === 'download' ? finalDestPath : srcPath,
-        cancel: () => {
-          isCancelled = true
-          readStream.destroy()
-          writeStream.destroy()
-        }
-      })
-
-      let transferred = 0
-      let lastEmitTime = 0
-
-      readStream.on('data', (chunk: Buffer) => {
-        transferred += chunk.length
-        const now = Date.now()
-        if (now - lastEmitTime > 150 || transferred === stats.size) {
-          event.sender.send('ssh:sftp:transfer-progress', {
-            id,
-            taskKey: taskKey,
-            remotePath: remotePathForKey,
-            bytes: transferred,
-            total: stats.size,
-            type
-          })
-          lastEmitTime = now
-        }
-      })
-
-      readStream.pipe(writeStream)
-
-      writeStream.on('close', () => {
-        activeTasks.delete(taskKey)
-
-        if (isCancelled) {
-          resolve({ status: 'cancelled', message: 'Transfer was cancelled by user' })
-        } else {
-          resolve({ status: 'success', remotePath: finalDestPath })
-        }
-      })
-
-      const handleError = (e: any) => {
-        if (isCancelled) return
-
-        readStream.destroy()
-        writeStream.destroy()
-        activeTasks.delete(taskKey)
-        reject(e)
-      }
-
-      readStream.on('error', handleError)
-      writeStream.on('error', handleError)
-    })
-  })
-}
-
-async function handleDirectoryTransfer(event: any, id: string, localDir: string, remoteDir: string) {
-  const sftp = getSftpConnection(id)
-  const originalDirName = path.basename(localDir)
-
-  const finalDirName = await getUniqueRemoteName(sftp, remoteDir, originalDirName, true)
-  const finalRemoteBaseDir = path.posix.join(remoteDir, finalDirName).replace(/\\/g, '/')
-
-  const allFileTasks: { local: string; remote: string }[] = []
-  const allDirs = new Set<string>()
-  allDirs.add(finalRemoteBaseDir)
-
-  const scan = (currentLocal: string, currentRemote: string) => {
-    const files = fs.readdirSync(currentLocal)
-    for (const file of files) {
-      const lPath = path.join(currentLocal, file)
-      const rPath = path.posix.join(currentRemote, file)
-      const stat = fs.statSync(lPath)
-      if (stat.isDirectory()) {
-        allDirs.add(rPath)
-        scan(lPath, rPath)
-      } else {
-        allFileTasks.push({ local: lPath, remote: rPath })
-      }
-    }
-  }
-  scan(localDir, finalRemoteBaseDir)
-
-  // mkdir
-  const sortedDirs = Array.from(allDirs).sort((a, b) => a.length - b.length)
-  for (const dir of sortedDirs) {
-    await new Promise<void>((res) => sftp.mkdir(dir, { mode: 0o755 }, () => res()))
-  }
-
-  const promises = allFileTasks.map((task) =>
-    handleStreamTransfer(event, id, task.local, task.remote, 'upload', true).catch((err) => console.error(`Error: ${task.remote}`, err))
-  )
-
-  await Promise.all(promises)
-  return { status: 'success' }
-}
-
 // Delete file
 const handleDeleteFile = (_event, id, remotePath, resolve, reject) => {
   const sftp = getSftpConnection(id)
@@ -436,36 +459,115 @@ const handleDeleteFile = (_event, id, remotePath, resolve, reject) => {
     })
 }
 
-function sftpStat(sftp: any, p: string) {
-  return new Promise<any>((resolve, reject) => {
+const withTimeout = async <T>(promise: Promise<T>, ms: number, message: string): Promise<T> => {
+  let timer: NodeJS.Timeout | null = null
+
+  const timeoutPromise = new Promise<T>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(message))
+    }, ms)
+  })
+
+  try {
+    return await Promise.race([promise, timeoutPromise])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+// Wrap ssh2 callback APIs so we can reuse them in reconnect checks.
+const sftpStat = async (sftp: any, p: string): Promise<any> => {
+  return await new Promise<any>((resolve, reject) => {
     sftp.stat(p, (err: any, st: any) => (err ? reject(err) : resolve(st)))
   })
 }
 
-function sftpReaddir(sftp: any, p: string) {
-  return new Promise<any[]>((resolve, reject) => {
+const sftpReaddir = async (sftp: any, p: string): Promise<any[]> => {
+  return await new Promise<any[]>((resolve, reject) => {
     sftp.readdir(p, (err: any, list: any[]) => (err ? reject(err) : resolve(list || [])))
   })
 }
 
+// Keep liveness checks bounded so stale SFTP handles fail fast.
+const sftpStatWithTimeout = async (sftp: any, p: string, timeout = 3000): Promise<any> => {
+  return await withTimeout(sftpStat(sftp, p), timeout, `SFTP stat timeout: ${p}`)
+}
+
+const sftpReaddirWithTimeout = async (sftp: any, p: string, timeout = 10000): Promise<any[]> => {
+  return await withTimeout(sftpReaddir(sftp, p), timeout, `SFTP readdir timeout: ${p}`)
+}
+
+// Reuse reconnect info across sibling file sessions that share the same prefix.
+const getReusableSftpConnectionInfo = (id: string) => {
+  const direct = sftpConnectionInfoMap.get(id)
+  if (direct) return direct
+
+  if (!id) return null
+
+  const prefix = id.substring(0, id.lastIndexOf(':') + 1)
+
+  for (const [existingId, info] of sftpConnectionInfoMap.entries()) {
+    const sessionPart = existingId.substring(existingId.lastIndexOf(':') + 1)
+    if (existingId.startsWith(prefix) && sessionPart.startsWith('files-')) {
+      return info
+    }
+  }
+
+  for (const [existingId, info] of sftpConnectionInfoMap.entries()) {
+    if (existingId.startsWith(prefix)) {
+      return info
+    }
+  }
+
+  return null
+}
+
+const ensureSftpReady = async (event: any, id: string): Promise<any> => {
+  const sid = String(id || '')
+  if (!sid) {
+    throw new Error('missing connection id')
+  }
+
+  let sftp = getSftpConnection(sid)
+
+  if (sftp) {
+    try {
+      await sftpStatWithTimeout(sftp, '.', 3000)
+      return sftp
+    } catch {
+      // Drop only the current SFTP handle and rebuild it from cached connect info.
+      await closeSftpOnly(sid)
+    }
+  }
+
+  const cachedInfo = getReusableSftpConnectionInfo(sid)
+  if (!cachedInfo) {
+    throw new Error('missing reconnect connection info')
+  }
+
+  const result = await connectSftpReuseFirst(event, cachedInfo)
+  if (result?.status !== 'connected') {
+    throw new Error(result?.message || 'SFTP reconnect failed')
+  }
+
+  sftp = getSftpConnection(sid)
+  if (!sftp) {
+    throw new Error('SFTP reconnect failed: no sftp instance')
+  }
+
+  return sftp
+}
+
 function sftpMkdir(sftp: any, p: string) {
-  return new Promise<void>((resolve) => {
-    sftp.mkdir(p, { mode: 0o755 }, () => resolve())
+  return new Promise<void>((resolve, reject) => {
+    sftp.mkdir(p, (err: any) => {
+      if (!err) return resolve()
+      reject(err)
+    })
   })
 }
 
 // R2R
-async function ensureRemoteDir(sftp: any, remoteDir: string) {
-  const dir = toPosix(remoteDir)
-  const parts = dir.split('/').filter(Boolean)
-
-  let cur = dir.startsWith('/') ? '/' : ''
-  for (const part of parts) {
-    cur = cur === '/' ? `/${part}` : `${cur}/${part}`
-    await sftpMkdir(sftp, cur)
-  }
-}
-
 function isDirEntry(ent: any) {
   if (ent?.attrs?.isDirectory) return !!ent.attrs.isDirectory()
   if (typeof ent?.longname === 'string') return ent.longname.startsWith('d')
@@ -476,127 +578,526 @@ function entryName(ent: any) {
   return ent?.filename ?? ent?.name
 }
 
-async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T) => Promise<R>) {
-  const res: R[] = []
-  let idx = 0
-  const workers = new Array(Math.max(1, limit)).fill(0).map(async () => {
-    while (idx < items.length) {
-      const cur = idx++
-      res[cur] = await fn(items[cur])
-    }
-  })
-  await Promise.all(workers)
-  return res
+export type TaskStatus = 'running' | 'success' | 'failed' | 'error'
+export type ErrorSide = 'from' | 'to' | 'remote' | 'local'
+export type TransferStatus = 'success' | 'cancelled' | 'skipped' | 'error'
+
+export interface TransferResult {
+  status: TransferStatus
+  message?: string
+  code?: string
+  taskKey?: string
+
+  // host/ip labels for UI
+  host?: string
+  fromHost?: string
+  toHost?: string
+
+  // which side errored
+  errorSide?: ErrorSide
+
+  // common data
+  remotePath?: string
+  localPath?: string
+  totalFiles?: number
 }
 
-export async function transferFileR2R(event: any, args: R2RFileArgs) {
+const errToMessage = (e: any) => (e as Error)?.message || e?.message || String(e)
+
+const isPrematureStreamError = (e: any) => {
+  const code = e?.code
+  return code === 'ERR_STREAM_PREMATURE_CLOSE' || code === 'ERR_STREAM_DESTROYED' || code === 'ERR_STREAM_WRITE_AFTER_END'
+}
+
+const getTotalUi = (total: number) => (Number.isFinite(total) && total > 0 ? total : 1)
+
+const terminalBytes = (total: number) => getTotalUi(total)
+
+function hookStartOnce(rs: any, ws: any, startOnce: () => void) {
+  rs?.once?.('open', startOnce)
+  ws?.once?.('open', startOnce)
+  rs?.once?.('error', startOnce)
+  ws?.once?.('error', startOnce)
+}
+
+const getSftpHostLabel = (id: string, sftp?: any) => {
+  if (id.includes('local-team')) {
+    const [, rest = ''] = String(id || '').split('@')
+    const parts = rest.split(':')
+    return (parts[2] ? Buffer.from(parts[2], 'base64').toString('utf-8') : '') || sftp?.host || id
+  }
+  return sftp?.host || id
+}
+
+// ssh2 attrs.mode dir check
+const isRemoteDir = (st: any) => {
+  const mode = st?.mode
+  return typeof mode === 'number' && (mode & 0o170000) === 0o040000
+}
+
+// After the mkdir fails, check with stat. If it's already a directory, treat it as a success
+async function sftpMkdirSafe(sftp: any, dir: string) {
+  try {
+    await sftpMkdir(sftp, dir)
+    return
+  } catch (e: any) {
+    try {
+      const st = await sftpStat(sftp, dir)
+      if (isRemoteDir(st)) return
+    } catch {}
+    throw e
+  }
+}
+
+// mkdirp for real transfer output
+const sftpMkdirRaw = (sftp: any, p: string) =>
+  new Promise<void>((resolve, reject) => {
+    sftp.mkdir(p, (err: any) => (err ? reject(err) : resolve()))
+  })
+
+const sftpMkdirpForTransfer = async (sftp: any, dir: string) => {
+  const d = toPosix(dir)
+  if (!d || d === '/' || d === '.') return
+  const parts = d.split('/').filter(Boolean)
+  let cur = d.startsWith('/') ? '/' : ''
+  for (const part of parts) {
+    cur = cur === '/' ? `/${part}` : cur ? `${cur}/${part}` : part
+    try {
+      await sftpMkdirSafe(sftp, cur)
+    } catch (e: any) {
+      // fallback raw mkdir, then stat-if-exists
+      try {
+        await sftpMkdirRaw(sftp, cur)
+      } catch (e2: any) {
+        try {
+          const st = await sftpStat(sftp, cur)
+          if (isRemoteDir(st)) continue
+        } catch {}
+        throw e2
+      }
+    }
+  }
+}
+
+const sendProgress = (event: any, payload: any) => {
+  const wc = event?.sender
+  if (!wc || wc.isDestroyed?.()) {
+    sftpLogger.warn('Progress event skipped: webContents missing or destroyed', {
+      event: 'ssh.sftp.progress.skipped',
+      taskKey: payload?.taskKey
+    })
+    return
+  }
+  try {
+    wc.send('ssh:sftp:transfer-progress', payload)
+  } catch (err) {
+    sftpLogger.error('Failed to send SFTP transfer progress event', {
+      event: 'ssh.sftp.progress.send_failed',
+      taskKey: payload?.taskKey,
+      error: err instanceof Error ? err.message : String(err)
+    })
+  }
+}
+
+function waitStreamOpen(stream: any) {
+  return new Promise<void>((resolve, reject) => {
+    let done = false
+    const ok = () => {
+      if (done) return
+      done = true
+      cleanup()
+      resolve()
+    }
+    const bad = (e: any) => {
+      if (done) return
+      done = true
+      cleanup()
+      reject(e)
+    }
+    const cleanup = () => {
+      stream?.off?.('open', ok)
+      stream?.off?.('error', bad)
+    }
+    stream?.once?.('open', ok)
+    stream?.once?.('error', bad)
+  })
+}
+
+// remote -> remote (single file)
+export async function transferFileR2R(event: any, args: R2RFileArgs & ChildTaskOptions): Promise<TransferResult> {
   const srcSftp = getSftpConnection(args.fromId)
   const dstSftp = getSftpConnection(args.toId)
+
+  const fromHost = getSftpHostLabel(args.fromId, srcSftp)
+  const toHost = getSftpHostLabel(args.toId, dstSftp)
 
   const fromPath = toPosix(args.fromPath)
   let toPath = toPosix(args.toPath)
 
-  const autoRename = args.autoRename !== false
-  if (autoRename) {
-    const dir = path.posix.dirname(toPath)
-    const base = path.posix.basename(toPath)
-    const unique = await getUniqueRemoteName(dstSftp, dir, base, false)
-    toPath = path.posix.join(dir, unique)
+  const rawTaskKeyBase = `${args.fromId}->${args.toId}:r2r:${fromPath}:${toPath}`
+  const progressTaskKeyBase = args.taskKeyOverride || rawTaskKeyBase
+
+  const progressBase = (extra: Record<string, any> = {}) => ({
+    type: 'r2r',
+    fromId: args.fromId,
+    toId: args.toId,
+    fromHost,
+    toHost,
+    taskKey: progressTaskKeyBase,
+    parentTaskKey: args.parentTaskKey,
+    isGroup: args.isGroup ?? false,
+    groupKind: args.groupKind ?? 'file',
+    ...extra
+  })
+
+  if (!srcSftp) {
+    sendProgress(
+      event,
+      progressBase({
+        status: 'error',
+        message: 'Sftp Not connected',
+        errorSide: 'from'
+      })
+    )
+    return { status: 'error', message: 'Sftp Not connected', fromHost, toHost, errorSide: 'from', taskKey: progressTaskKeyBase }
   }
 
-  await ensureRemoteDir(dstSftp, path.posix.dirname(toPath))
+  if (!dstSftp) {
+    sendProgress(
+      event,
+      progressBase({
+        status: 'error',
+        message: 'Sftp Not connected',
+        errorSide: 'to'
+      })
+    )
+    return { status: 'error', message: 'Sftp Not connected', fromHost, toHost, errorSide: 'to', taskKey: progressTaskKeyBase }
+  }
 
-  const taskKey = `${args.fromId}->${args.toId}:r2r:${fromPath}:${toPath}`
-  if (activeTasks.has(taskKey)) return { status: 'skipped', message: 'Task already in progress', taskKey }
+  const autoRename = args.autoRename !== false
 
-  const st = await sftpStat(srcSftp, fromPath)
-  const total = st?.size ?? 0
+  let total = 0
+  try {
+    const st = await sftpStat(srcSftp, fromPath)
+    total = st?.size ?? 0
+  } catch (e: any) {
+    const msg = errToMessage(e)
+    sendProgress(
+      event,
+      progressBase({
+        remotePath: fromPath,
+        destPath: toPath,
+        bytes: 1,
+        total: 1,
+        status: 'error',
+        message: msg,
+        errorSide: 'from'
+      })
+    )
+    return { status: 'error', message: msg, taskKey: progressTaskKeyBase, fromHost, toHost, errorSide: 'from' }
+  }
+
+  if (autoRename) {
+    try {
+      const dir = path.posix.dirname(toPath)
+      const base = path.posix.basename(toPath)
+      const unique = await getUniqueRemoteName(dstSftp, dir, base, false)
+      toPath = path.posix.join(dir, unique)
+    } catch (e: any) {
+      const msg = errToMessage(e)
+      sendProgress(
+        event,
+        progressBase({
+          remotePath: fromPath,
+          destPath: toPath,
+          bytes: 1,
+          total: 1,
+          status: 'error',
+          message: msg,
+          errorSide: 'to'
+        })
+      )
+      return { status: 'error', message: msg, taskKey: progressTaskKeyBase, fromHost, toHost, errorSide: 'to' }
+    }
+  }
+
+  const rawTaskKey = `${args.fromId}->${args.toId}:r2r:${fromPath}:${toPath}`
+  const progressTaskKey = args.taskKeyOverride || rawTaskKey
+
+  if (activeTasks.has(progressTaskKey)) {
+    return { status: 'skipped', message: 'Task already in progress', taskKey: progressTaskKey, fromHost, toHost }
+  }
+
+  const totalUi = getTotalUi(total)
+
+  let created = false
+  const ensureCreated = () => {
+    if (created) return
+    created = true
+    sendProgress(
+      event,
+      progressBase({
+        taskKey: progressTaskKey,
+        remotePath: fromPath,
+        destPath: toPath,
+        bytes: 0,
+        total: totalUi,
+        status: 'running' as TaskStatus,
+        stage: 'init'
+      })
+    )
+  }
+  ensureCreated()
 
   let transferred = 0
   let lastEmitTime = 0
   let isCancelled = false
 
-  const rs = srcSftp.createReadStream(fromPath)
-  const ws = dstSftp.createWriteStream(toPath, { flags: 'w' })
+  let rs: any
+  let ws: any
 
-  activeTasks.set(taskKey, {
-    read: rs,
-    write: ws,
-    cancel: () => {
-      isCancelled = true
-      rs.destroy()
-      ws.destroy()
+  let firstErr: any = null
+  let firstSide: ErrorSide | null = null
+  const markFirst = (side: ErrorSide, e: any) => {
+    if (!firstErr) {
+      firstErr = e
+      firstSide = side
     }
-  })
-
-  rs.on('data', (chunk: Buffer) => {
-    transferred += chunk.length
-    const now = Date.now()
-    if (now - lastEmitTime > 150 || (total > 0 && transferred >= total)) {
-      event.sender.send('ssh:sftp:transfer-progress', {
-        type: 'r2r',
-        taskKey,
-        fromId: args.fromId,
-        toId: args.toId,
-        remotePath: fromPath,
-        destPath: toPath,
-        bytes: transferred,
-        total
-      })
-      lastEmitTime = now
-    }
-  })
-
-  const cleanupPartialOnCancel = true
+  }
 
   try {
-    await pipeline(rs, ws)
-    activeTasks.delete(taskKey)
-    return { status: 'success', remotePath: toPath, taskKey }
-  } catch (e: any) {
-    activeTasks.delete(taskKey)
+    rs = srcSftp.createReadStream(fromPath)
+    rs.once('error', (e: any) => markFirst('from', e))
 
-    const code = e?.code
-    const isPremature = code === 'ERR_STREAM_PREMATURE_CLOSE' || code === 'ERR_STREAM_DESTROYED' || code === 'ERR_STREAM_WRITE_AFTER_END'
+    await waitStreamOpen(rs)
 
-    if (isCancelled || isPremature) {
-      if (cleanupPartialOnCancel) {
-        try {
-          await new Promise<void>((res) => dstSftp.unlink(toPath, () => res()))
-        } catch {}
+    ws = dstSftp.createWriteStream(toPath, { flags: 'w' })
+    ws.once('error', (e: any) => markFirst('to', e))
+
+    activeTasks.set(progressTaskKey, {
+      read: rs,
+      write: ws,
+      cancel: () => {
+        isCancelled = true
+        rs.destroy()
+        ws.destroy()
       }
-      return { status: 'cancelled', message: 'Transfer cancelled', taskKey }
+    })
+
+    rs.on('data', (chunk: Buffer) => {
+      transferred += chunk.length
+      const now = Date.now()
+      if (now - lastEmitTime > 150 || (total > 0 && transferred >= total)) {
+        sendProgress(
+          event,
+          progressBase({
+            taskKey: progressTaskKey,
+            remotePath: fromPath,
+            destPath: toPath,
+            bytes: transferred,
+            total: totalUi,
+            status: 'running' as TaskStatus
+          })
+        )
+        lastEmitTime = now
+      }
+    })
+
+    await pipeline(rs, ws)
+    activeTasks.delete(progressTaskKey)
+
+    sendProgress(
+      event,
+      progressBase({
+        taskKey: progressTaskKey,
+        remotePath: fromPath,
+        destPath: toPath,
+        bytes: terminalBytes(total),
+        total: totalUi,
+        status: 'success' as TaskStatus
+      })
+    )
+
+    return { status: 'success', remotePath: toPath, taskKey: progressTaskKey, fromHost, toHost }
+  } catch (e: any) {
+    activeTasks.delete(progressTaskKey)
+
+    if (isCancelled || isPrematureStreamError(e)) {
+      sendProgress(
+        event,
+        progressBase({
+          taskKey: progressTaskKey,
+          remotePath: fromPath,
+          destPath: toPath,
+          bytes: terminalBytes(total),
+          total: totalUi,
+          status: 'failed' as TaskStatus,
+          message: 'Transfer cancelled',
+          errorSide: 'local'
+        })
+      )
+      return { status: 'cancelled', message: 'Transfer cancelled', taskKey: progressTaskKey, fromHost, toHost, errorSide: 'local' }
     }
 
-    throw e
+    const primaryErr = firstErr || e
+    const msg = errToMessage(primaryErr)
+    const errorSide: ErrorSide = firstSide || 'from'
+
+    sendProgress(
+      event,
+      progressBase({
+        taskKey: progressTaskKey,
+        remotePath: fromPath,
+        destPath: toPath,
+        bytes: terminalBytes(total),
+        total: totalUi,
+        status: 'error' as TaskStatus,
+        message: msg,
+        errorSide
+      })
+    )
+
+    return { status: 'error', message: msg, code: primaryErr?.code, taskKey: progressTaskKey, fromHost, toHost, errorSide }
   }
 }
 
-export async function transferDirR2R(event: any, args: R2RDirArgs) {
+// remote -> remote (directory)
+export async function transferDirR2R(event: any, args: R2RDirArgs): Promise<TransferResult> {
   const srcSftp = getSftpConnection(args.fromId)
   const dstSftp = getSftpConnection(args.toId)
 
+  const fromHost = getSftpHostLabel(args.fromId, srcSftp)
+  const toHost = getSftpHostLabel(args.toId, dstSftp)
+
   const fromDir = toPosix(args.fromDir)
   const toParent = toPosix(args.toDir)
+
+  const nonce = `${Date.now().toString(36)}_${Math.random().toString(16).slice(2)}`
+  const dirTaskKey = `${args.fromId}->${args.toId}:r2r-dir:${fromDir}:${toParent}:${nonce}`
+
+  const sendGroup = (extra?: Record<string, any>) =>
+    sendProgress(event, {
+      type: 'r2r',
+      fromId: args.fromId,
+      toId: args.toId,
+      fromHost,
+      toHost,
+      taskKey: dirTaskKey,
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: fromDir,
+      destPath: toParent,
+      bytes: 0,
+      total: 1,
+      status: 'running',
+      stage: 'scanning',
+      ...extra
+    })
+
+  if (!srcSftp || !dstSftp) {
+    const errorSide: ErrorSide = !srcSftp ? 'from' : 'to'
+    const msg = 'Sftp Not connected'
+    sendGroup({ status: 'error', message: msg, bytes: 1, total: 1, stage: undefined, errorSide })
+    return { status: 'error', message: msg, fromHost, toHost, errorSide }
+  }
+
+  let cancelled = false
+  activeTasks.set(dirTaskKey, {
+    cancel: () => {
+      cancelled = true
+    }
+  })
 
   const autoRename = args.autoRename !== false
   const concurrency = args.concurrency ?? 3
 
   const originalDirName = path.posix.basename(fromDir)
-  const finalDirName = autoRename ? await getUniqueRemoteName(dstSftp, toParent, originalDirName, true) : originalDirName
+  let finalDirName = originalDirName
+  try {
+    finalDirName = autoRename ? await getUniqueRemoteName(dstSftp, toParent, originalDirName, true) : originalDirName
+  } catch (e: any) {
+    const msg = errToMessage(e)
+    sendGroup({ status: 'error', message: msg, bytes: 1, total: 1, stage: undefined, errorSide: 'to' })
+    activeTasks.delete(dirTaskKey)
+    return { status: 'error', message: msg, fromHost, toHost, errorSide: 'to' }
+  }
 
   const finalToBaseDir = path.posix.join(toParent, finalDirName)
-  await ensureRemoteDir(dstSftp, finalToBaseDir)
 
-  const allDirs = new Set<string>()
-  const allFiles: { from: string; to: string }[] = []
-  allDirs.add(finalToBaseDir)
+  try {
+    await sftpMkdirSafe(dstSftp, finalToBaseDir)
+  } catch (e: any) {
+    const msg = errToMessage(e)
+    sendGroup({
+      destPath: finalToBaseDir,
+      status: 'error',
+      message: msg,
+      bytes: 1,
+      total: 1,
+      stage: undefined,
+      errorSide: 'to'
+    })
+    activeTasks.delete(dirTaskKey)
+    return { status: 'error', message: msg, fromHost, toHost, remotePath: finalToBaseDir, errorSide: 'to' }
+  }
 
-  // Recursively scan the remote directory structure
-  async function scan(curFrom: string, curTo: string) {
+  const yieldNow = () => new Promise<void>((r) => setImmediate(r))
+  let scanCounter = 0
+  let scannedFiles = 0
+  let finishedFiles = 0
+  let failedFiles = 0
+  let transferStarted = false
+
+  const reportGroup = (extra?: Record<string, any>) => {
+    sendGroup({
+      destPath: finalToBaseDir,
+      bytes: finishedFiles,
+      total: Math.max(scannedFiles, 1),
+      totalFiles: scannedFiles,
+      finishedFiles,
+      failedFiles,
+      stage: transferStarted ? 'transferring' : 'scanning',
+      ...extra
+    })
+  }
+
+  const pool = createAsyncPool<{ from: string; to: string }>(async (f) => {
+    if (cancelled) throw Object.assign(new Error('Transfer cancelled'), { __cancelled: true })
+
+    transferStarted = true
+    const fileTaskKey = `${dirTaskKey}:file:${f.to}`
+
+    const r = await transferFileR2R(event, {
+      fromId: args.fromId,
+      toId: args.toId,
+      fromPath: f.from,
+      toPath: f.to,
+      autoRename: false,
+      parentTaskKey: dirTaskKey,
+      taskKeyOverride: fileTaskKey,
+      isGroup: false,
+      groupKind: 'file'
+    })
+
+    if (r?.status !== 'success') throw r
+
+    finishedFiles++
+    reportGroup()
+  }, concurrency)
+
+  const scan = async (curFrom: string, curTo: string) => {
+    if (cancelled) throw Object.assign(new Error('Transfer cancelled'), { __cancelled: true })
+
     const list = await sftpReaddir(srcSftp, curFrom)
-
     for (const ent of list) {
+      if (cancelled) throw Object.assign(new Error('Transfer cancelled'), { __cancelled: true })
+
+      scanCounter++
+      if (scanCounter % 200 === 0) {
+        reportGroup()
+        await yieldNow()
+      }
+
       const name = entryName(ent)
       if (!name) continue
 
@@ -604,56 +1105,588 @@ export async function transferDirR2R(event: any, args: R2RDirArgs) {
       const d = path.posix.join(curTo, name)
 
       if (isDirEntry(ent)) {
-        allDirs.add(d)
+        await sftpMkdirSafe(dstSftp, d)
         await scan(s, d)
       } else {
-        allFiles.push({ from: s, to: d })
+        scannedFiles++
+        const fileTaskKey = `${dirTaskKey}:file:${d}`
+
+        sendProgress(event, {
+          type: 'r2r',
+          fromId: args.fromId,
+          toId: args.toId,
+          fromHost,
+          toHost,
+          parentTaskKey: dirTaskKey,
+          taskKey: fileTaskKey,
+          isGroup: false,
+          groupKind: 'file',
+          remotePath: s,
+          destPath: d,
+          bytes: 0,
+          total: 1,
+          status: 'running',
+          stage: 'pending'
+        })
+
+        pool.push({ from: s, to: d })
       }
     }
   }
 
-  await scan(fromDir, finalToBaseDir)
+  try {
+    await scan(fromDir, finalToBaseDir)
+    pool.end()
+    await pool.wait()
+  } catch (e: any) {
+    const isCancel = !!e?.__cancelled
+    const tr = e?.status ? (e as TransferResult) : null
+    const msg = tr?.message || errToMessage(e)
 
-  // mkdir (sorted by length from short to long)
-  const sortedDirs = Array.from(allDirs).sort((a, b) => a.length - b.length)
-  for (const dir of sortedDirs) {
-    await ensureRemoteDir(dstSftp, dir)
+    if (tr?.status !== 'success') failedFiles++
+
+    sendGroup({
+      destPath: finalToBaseDir,
+      bytes: finishedFiles,
+      total: Math.max(scannedFiles, 1),
+      totalFiles: scannedFiles,
+      finishedFiles,
+      failedFiles,
+      status: isCancel ? 'failed' : 'error',
+      message: msg,
+      stage: undefined,
+      errorSide: tr?.errorSide || (isCancel ? 'local' : 'to')
+    })
+
+    activeTasks.delete(dirTaskKey)
+    return isCancel
+      ? { status: 'cancelled', message: msg, fromHost, toHost, errorSide: 'local' }
+      : tr || { status: 'error', message: msg, fromHost, toHost, errorSide: 'to' }
   }
 
-  // Concurrent file transfer
-  await mapLimit(allFiles, concurrency, async (f) => {
-    return transferFileR2R(event, {
-      fromId: args.fromId,
-      toId: args.toId,
-      fromPath: f.from,
-      toPath: f.to,
-      autoRename: false
-    }).catch((err) => {
-      console.error(`R2R file error: ${f.from} -> ${f.to}`, err)
-      throw err
-    })
+  sendGroup({
+    destPath: finalToBaseDir,
+    bytes: finishedFiles,
+    total: Math.max(scannedFiles, 1),
+    totalFiles: scannedFiles,
+    finishedFiles,
+    failedFiles,
+    status: 'success',
+    stage: undefined
   })
 
-  return { status: 'success', remotePath: finalToBaseDir, totalFiles: allFiles.length }
+  activeTasks.delete(dirTaskKey)
+  return { status: 'success', remotePath: finalToBaseDir, totalFiles: scannedFiles, fromHost, toHost }
 }
 
-async function handleDirectoryDownload(event: any, id: string, remoteDir: string, localDir: string) {
+// upload/download single file (remote<->local)
+export async function handleStreamTransfer(
+  event: any,
+  id: string,
+  srcPath: string,
+  destPath: string,
+  type: 'download' | 'upload',
+  isInternalCall = false,
+  childOpts?: ChildTaskOptions
+): Promise<TransferResult> {
   const sftp = getSftpConnection(id)
-  if (!sftp) return { status: 'error', message: 'Sftp Not connected' }
+  const host = getSftpHostLabel(id, sftp)
+
+  const rawFallbackTaskKey =
+    type === 'download' ? `${id}:dl:${toPosix(srcPath)}:${path.resolve(destPath)}` : `${id}:up:${srcPath}:${toPosix(destPath)}`
+
+  const progressFallbackTaskKey = childOpts?.taskKeyOverride || rawFallbackTaskKey
+
+  const progressBase = (extra: Record<string, any> = {}) => ({
+    id,
+    host,
+    taskKey: progressFallbackTaskKey,
+    parentTaskKey: childOpts?.parentTaskKey,
+    type,
+    isGroup: childOpts?.isGroup ?? false,
+    groupKind: childOpts?.groupKind ?? 'file',
+    ...extra
+  })
+
+  if (!sftp) {
+    sendProgress(
+      event,
+      progressBase({
+        remotePath: toPosix(srcPath),
+        destPath,
+        bytes: 1,
+        total: 1,
+        status: 'error',
+        message: 'Sftp Not connected',
+        errorSide: 'remote'
+      })
+    )
+    return { status: 'error', message: 'Sftp Not connected', host, errorSide: 'remote', taskKey: progressFallbackTaskKey }
+  }
+
+  let finalRemotePath = destPath
+  let finalLocalPath = destPath
+  let total = 0
+
+  if (type === 'download') {
+    try {
+      const st = await sftpStat(sftp, toPosix(srcPath))
+      total = st?.size ?? 0
+    } catch (e: any) {
+      const msg = errToMessage(e)
+      sendProgress(
+        event,
+        progressBase({
+          remotePath: toPosix(srcPath),
+          destPath: path.resolve(destPath),
+          bytes: 1,
+          total: 1,
+          status: 'error',
+          message: msg,
+          errorSide: 'remote'
+        })
+      )
+      return { status: 'error', message: msg, code: e?.code, taskKey: progressFallbackTaskKey, host, errorSide: 'remote' }
+    }
+
+    try {
+      finalLocalPath = path.resolve(destPath)
+      await fs.promises.mkdir(path.dirname(finalLocalPath), { recursive: true })
+    } catch (e: any) {
+      const msg = errToMessage(e)
+      sendProgress(
+        event,
+        progressBase({
+          remotePath: toPosix(srcPath),
+          destPath: finalLocalPath,
+          bytes: 1,
+          total: 1,
+          status: 'error',
+          message: msg,
+          errorSide: 'local'
+        })
+      )
+      return { status: 'error', message: msg, code: e?.code, taskKey: progressFallbackTaskKey, host, errorSide: 'local' }
+    }
+  } else {
+    try {
+      const st = await fs.promises.stat(srcPath)
+      total = st?.size ?? 0
+    } catch (e: any) {
+      const msg = errToMessage(e)
+      sendProgress(
+        event,
+        progressBase({
+          remotePath: toPosix(destPath),
+          bytes: 1,
+          total: 1,
+          status: 'error',
+          message: msg,
+          errorSide: 'local'
+        })
+      )
+      return { status: 'error', message: msg, code: e?.code, taskKey: progressFallbackTaskKey, host, errorSide: 'local' }
+    }
+
+    if (!isInternalCall) {
+      try {
+        const remoteDir = toPosix(destPath)
+        const fileName = path.basename(srcPath)
+        const uniqueName = await getUniqueRemoteName(sftp, remoteDir, fileName, false)
+        finalRemotePath = path.posix.join(remoteDir, uniqueName)
+      } catch (e: any) {
+        const msg = errToMessage(e)
+        sendProgress(
+          event,
+          progressBase({
+            remotePath: toPosix(destPath),
+            bytes: 1,
+            total: 1,
+            status: 'error',
+            message: msg,
+            errorSide: 'remote'
+          })
+        )
+        return { status: 'error', message: msg, code: e?.code, taskKey: progressFallbackTaskKey, host, errorSide: 'remote' }
+      }
+    } else {
+      finalRemotePath = toPosix(destPath)
+    }
+  }
+
+  const rawTaskKey = type === 'download' ? `${id}:dl:${toPosix(srcPath)}:${finalLocalPath}` : `${id}:up:${srcPath}:${finalRemotePath}`
+
+  const progressTaskKey = childOpts?.taskKeyOverride || rawTaskKey
+
+  if (activeTasks.has(progressTaskKey)) {
+    return { status: 'skipped', message: 'Task already in progress', taskKey: progressTaskKey, host }
+  }
+
+  const totalUi = getTotalUi(total)
+
+  let created = false
+  const ensureCreated = () => {
+    if (created) return
+    created = true
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: progressTaskKey,
+      parentTaskKey: childOpts?.parentTaskKey,
+      type,
+      isGroup: childOpts?.isGroup ?? false,
+      groupKind: childOpts?.groupKind ?? 'file',
+      remotePath: type === 'upload' ? finalRemotePath : toPosix(srcPath),
+      destPath: type === 'download' ? finalLocalPath : undefined,
+      bytes: 0,
+      total: totalUi,
+      status: 'running' as TaskStatus,
+      stage: 'init'
+    })
+  }
+  ensureCreated()
+
+  let isCancelled = false
+  let transferred = 0
+  let lastEmitTime = 0
+
+  const remotePathForUI = type === 'upload' ? finalRemotePath : toPosix(srcPath)
+  const destPathForUI = type === 'download' ? finalLocalPath : undefined
+
+  let readStream: any
+  let writeStream: any
+
+  let firstErr: any = null
+  let firstErrSide: ErrorSide | null = null
+  const markFirstErr = (side: ErrorSide, e: any) => {
+    if (firstErr) return
+    firstErr = e
+    firstErrSide = side
+  }
+
+  try {
+    if (type === 'download') {
+      readStream = sftp.createReadStream(toPosix(srcPath))
+      readStream.once?.('error', (e: any) => markFirstErr('remote', e))
+    } else {
+      readStream = fs.createReadStream(srcPath)
+      readStream.once?.('error', (e: any) => markFirstErr('local', e))
+    }
+  } catch (e: any) {
+    const msg = errToMessage(e)
+    const errorSide: ErrorSide = type === 'download' ? 'remote' : 'local'
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: progressTaskKey,
+      parentTaskKey: childOpts?.parentTaskKey,
+      type,
+      isGroup: childOpts?.isGroup ?? false,
+      groupKind: childOpts?.groupKind ?? 'file',
+      remotePath: remotePathForUI,
+      destPath: destPathForUI,
+      bytes: terminalBytes(total),
+      total: totalUi,
+      status: 'error' as TaskStatus,
+      message: msg,
+      errorSide
+    })
+    return { status: 'error', message: msg, code: e?.code, taskKey: progressTaskKey, host, errorSide }
+  }
+
+  try {
+    if (type === 'download') {
+      writeStream = fs.createWriteStream(finalLocalPath)
+      writeStream.once?.('error', (e: any) => markFirstErr('local', e))
+    } else {
+      writeStream = sftp.createWriteStream(finalRemotePath)
+      writeStream.once?.('error', (e: any) => markFirstErr('remote', e))
+    }
+  } catch (e: any) {
+    const msg = errToMessage(e)
+    const errorSide: ErrorSide = type === 'download' ? 'local' : 'remote'
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: progressTaskKey,
+      parentTaskKey: childOpts?.parentTaskKey,
+      type,
+      isGroup: childOpts?.isGroup ?? false,
+      groupKind: childOpts?.groupKind ?? 'file',
+      remotePath: remotePathForUI,
+      destPath: destPathForUI,
+      bytes: terminalBytes(total),
+      total: totalUi,
+      status: 'error' as TaskStatus,
+      message: msg,
+      errorSide
+    })
+    return { status: 'error', message: msg, code: e?.code, taskKey: progressTaskKey, host, errorSide }
+  }
+
+  let readErr: any = null
+  let writeErr: any = null
+
+  readStream.on('error', (e: any) => {
+    readErr ??= e
+    if (!firstErr) {
+      markFirstErr(type === 'download' ? 'remote' : 'local', e)
+    }
+  })
+
+  writeStream.on('error', (e: any) => {
+    writeErr ??= e
+    if (!firstErr) {
+      markFirstErr(type === 'download' ? 'local' : 'remote', e)
+    }
+  })
+
+  activeTasks.set(progressTaskKey, {
+    read: readStream,
+    write: writeStream,
+    localPath: type === 'download' ? finalLocalPath : srcPath,
+    cancel: () => {
+      isCancelled = true
+      readStream.destroy()
+      writeStream.destroy()
+    }
+  })
+
+  hookStartOnce(readStream, writeStream, ensureCreated)
+
+  readStream.on('data', (chunk: Buffer) => {
+    transferred += chunk.length
+    const now = Date.now()
+    if (now - lastEmitTime > 150 || (total > 0 && transferred >= total)) {
+      sendProgress(event, {
+        id,
+        host,
+        taskKey: progressTaskKey,
+        parentTaskKey: childOpts?.parentTaskKey,
+        type,
+        isGroup: childOpts?.isGroup ?? false,
+        groupKind: childOpts?.groupKind ?? 'file',
+        remotePath: remotePathForUI,
+        destPath: destPathForUI,
+        bytes: transferred,
+        total: totalUi,
+        status: 'running' as TaskStatus
+      })
+      lastEmitTime = now
+    }
+  })
+
+  try {
+    await pipeline(readStream, writeStream)
+    activeTasks.delete(progressTaskKey)
+
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: progressTaskKey,
+      parentTaskKey: childOpts?.parentTaskKey,
+      type,
+      isGroup: childOpts?.isGroup ?? false,
+      groupKind: childOpts?.groupKind ?? 'file',
+      remotePath: remotePathForUI,
+      destPath: destPathForUI,
+      bytes: total > 0 ? total || transferred : 1,
+      total: totalUi,
+      status: 'success' as TaskStatus
+    })
+
+    return { status: 'success', remotePath: remotePathForUI, taskKey: progressTaskKey, host }
+  } catch (e: any) {
+    activeTasks.delete(progressTaskKey)
+
+    if (isCancelled || isPrematureStreamError(e)) {
+      sendProgress(event, {
+        id,
+        host,
+        taskKey: progressTaskKey,
+        parentTaskKey: childOpts?.parentTaskKey,
+        type,
+        isGroup: childOpts?.isGroup ?? false,
+        groupKind: childOpts?.groupKind ?? 'file',
+        remotePath: remotePathForUI,
+        destPath: destPathForUI,
+        bytes: terminalBytes(total),
+        total: totalUi,
+        status: 'failed' as TaskStatus,
+        message: 'Transfer was cancelled by user',
+        errorSide: 'local'
+      })
+      return { status: 'cancelled', message: 'Transfer was cancelled by user', taskKey: progressTaskKey, host, errorSide: 'local' }
+    }
+
+    const primaryErr = firstErr || readErr || writeErr || e
+    const msg = errToMessage(primaryErr)
+
+    let errorSide: ErrorSide
+    if (firstErrSide) {
+      errorSide = firstErrSide
+    } else {
+      errorSide = type === 'download' ? (writeErr ? 'local' : 'remote') : readErr ? 'local' : 'remote'
+    }
+
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: progressTaskKey,
+      parentTaskKey: childOpts?.parentTaskKey,
+      type,
+      isGroup: childOpts?.isGroup ?? false,
+      groupKind: childOpts?.groupKind ?? 'file',
+      remotePath: remotePathForUI,
+      destPath: destPathForUI,
+      bytes: terminalBytes(total),
+      total: totalUi,
+      status: 'error' as TaskStatus,
+      message: msg,
+      errorSide
+    })
+
+    return { status: 'error', message: msg, code: primaryErr?.code, taskKey: progressTaskKey, host, errorSide }
+  }
+}
+
+// remote directory -> local directory
+export async function handleDirectoryDownload(event: any, id: string, remoteDir: string, localDir: string): Promise<TransferResult> {
+  const sftp = getSftpConnection(id)
+  const host = getSftpHostLabel(id, sftp)
 
   const fromDir = toPosix(remoteDir)
   const toParent = path.resolve(localDir)
-
   const dirName = path.posix.basename(fromDir)
   const finalLocalBase = path.join(toParent, dirName)
 
-  await nodeFs.mkdir(finalLocalBase, { recursive: true })
+  const nonce = `${Date.now().toString(36)}_${Math.random().toString(16).slice(2)}`
+  const dirTaskKey = `${id}:dl-dir:${fromDir}:${finalLocalBase}:${nonce}`
 
-  const tasks: { r: string; l: string }[] = []
+  if (!sftp) {
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: dirTaskKey,
+      type: 'download',
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: fromDir,
+      destPath: finalLocalBase,
+      bytes: 1,
+      total: 1,
+      status: 'error',
+      message: 'Sftp Not connected',
+      errorSide: 'remote'
+    })
+    return { status: 'error', message: 'Sftp Not connected', host, errorSide: 'remote' }
+  }
+
+  let cancelled = false
+  activeTasks.set(dirTaskKey, {
+    cancel: () => {
+      cancelled = true
+    }
+  })
+
+  sendProgress(event, {
+    id,
+    host,
+    taskKey: dirTaskKey,
+    type: 'download',
+    isGroup: true,
+    groupKind: 'directory',
+    remotePath: fromDir,
+    destPath: finalLocalBase,
+    bytes: 0,
+    total: 1,
+    status: 'running',
+    stage: 'scanning'
+  })
+
+  try {
+    await fs.promises.mkdir(finalLocalBase, { recursive: true })
+  } catch (e: any) {
+    const msg = errToMessage(e)
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: dirTaskKey,
+      type: 'download',
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: fromDir,
+      destPath: finalLocalBase,
+      bytes: 1,
+      total: 1,
+      status: 'error',
+      message: msg,
+      errorSide: 'local'
+    })
+    activeTasks.delete(dirTaskKey)
+    return { status: 'error', message: msg, host, errorSide: 'local' }
+  }
+
+  const yieldNow = () => new Promise<void>((r) => setImmediate(r))
+  let scanCounter = 0
+  let scannedFiles = 0
+  let finishedFiles = 0
+  let failedFiles = 0
+  let transferStarted = false
+
+  const reportGroup = (extra?: Record<string, any>) => {
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: dirTaskKey,
+      type: 'download',
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: fromDir,
+      destPath: finalLocalBase,
+      bytes: finishedFiles,
+      total: Math.max(scannedFiles, 1),
+      totalFiles: scannedFiles,
+      finishedFiles,
+      failedFiles,
+      status: 'running',
+      stage: transferStarted ? 'transferring' : 'scanning',
+      ...extra
+    })
+  }
+
+  const pool = createAsyncPool<{ r: string; l: string }>(async (t) => {
+    if (cancelled) throw Object.assign(new Error('Transfer cancelled'), { __cancelled: true })
+
+    transferStarted = true
+    const fileTaskKey = `${dirTaskKey}:file:${t.r}`
+
+    const r = await handleStreamTransfer(event, id, t.r, t.l, 'download', true, {
+      parentTaskKey: dirTaskKey,
+      taskKeyOverride: fileTaskKey,
+      isGroup: false,
+      groupKind: 'file'
+    })
+
+    if (r?.status !== 'success') throw r
+
+    finishedFiles++
+    reportGroup()
+  }, 5)
 
   const scan = async (curFrom: string, curTo: string) => {
+    if (cancelled) throw Object.assign(new Error('Transfer cancelled'), { __cancelled: true })
+
     const list = await sftpReaddir(sftp, curFrom)
     for (const ent of list) {
+      if (cancelled) throw Object.assign(new Error('Transfer cancelled'), { __cancelled: true })
+
+      scanCounter++
+      if (scanCounter % 200 === 0) {
+        reportGroup()
+        await yieldNow()
+      }
+
       const name = entryName(ent)
       if (!name) continue
 
@@ -661,17 +1694,1068 @@ async function handleDirectoryDownload(event: any, id: string, remoteDir: string
       const lPath = path.join(curTo, name)
 
       if (isDirEntry(ent)) {
-        await nodeFs.mkdir(lPath, { recursive: true })
+        await fs.promises.mkdir(lPath, { recursive: true })
         await scan(rPath, lPath)
       } else {
-        tasks.push({ r: rPath, l: lPath })
+        scannedFiles++
+        const fileTaskKey = `${dirTaskKey}:file:${rPath}`
+
+        sendProgress(event, {
+          id,
+          host,
+          parentTaskKey: dirTaskKey,
+          taskKey: fileTaskKey,
+          type: 'download',
+          isGroup: false,
+          groupKind: 'file',
+          remotePath: rPath,
+          destPath: lPath,
+          bytes: 0,
+          total: 1,
+          status: 'running',
+          stage: 'pending'
+        })
+
+        pool.push({ r: rPath, l: lPath })
       }
     }
   }
 
-  await scan(fromDir, finalLocalBase)
+  try {
+    await scan(fromDir, finalLocalBase)
+    pool.end()
+    await pool.wait()
+  } catch (e: any) {
+    const isCancel = !!e?.__cancelled
+    const tr = e?.status ? (e as TransferResult) : null
+    const msg = tr?.message || errToMessage(e)
 
-  await Promise.all(tasks.map((t) => handleStreamTransfer(event, id, t.r, t.l, 'download', true)))
+    if (tr?.status !== 'success') failedFiles++
 
-  return { status: 'success', localPath: finalLocalBase }
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: dirTaskKey,
+      type: 'download',
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: fromDir,
+      destPath: finalLocalBase,
+      bytes: finishedFiles,
+      total: Math.max(scannedFiles, 1),
+      totalFiles: scannedFiles,
+      finishedFiles,
+      failedFiles,
+      status: isCancel ? 'failed' : 'error',
+      message: msg,
+      stage: undefined,
+      errorSide: tr?.errorSide || (isCancel ? 'local' : 'local')
+    })
+
+    activeTasks.delete(dirTaskKey)
+    return isCancel
+      ? { status: 'cancelled', message: msg, host, errorSide: 'local' }
+      : tr || { status: 'error', message: msg, host, errorSide: 'local' }
+  }
+
+  sendProgress(event, {
+    id,
+    host,
+    taskKey: dirTaskKey,
+    type: 'download',
+    isGroup: true,
+    groupKind: 'directory',
+    remotePath: fromDir,
+    destPath: finalLocalBase,
+    bytes: finishedFiles,
+    total: Math.max(scannedFiles, 1),
+    totalFiles: scannedFiles,
+    finishedFiles,
+    failedFiles,
+    status: 'success',
+    stage: undefined
+  })
+
+  activeTasks.delete(dirTaskKey)
+  return { status: 'success', localPath: finalLocalBase, host }
+}
+
+// local directory -> remote directory
+export async function handleDirectoryTransfer(event: any, id: string, localDir: string, remoteDir: string): Promise<TransferResult> {
+  const sftp = getSftpConnection(id)
+  const host = getSftpHostLabel(id, sftp)
+
+  const absLocal = path.resolve(localDir)
+  const remoteParent = toPosix(remoteDir)
+  const originalDirName = path.basename(absLocal)
+
+  const nonce = `${Date.now().toString(36)}_${Math.random().toString(16).slice(2)}`
+  const dirTaskKey = `${id}:up-dir:${absLocal}:${remoteParent}:${nonce}`
+
+  if (!sftp) {
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: dirTaskKey,
+      type: 'upload',
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: remoteParent,
+      bytes: 1,
+      total: 1,
+      status: 'error',
+      message: 'Sftp Not connected',
+      errorSide: 'remote'
+    })
+    return { status: 'error', message: 'Sftp Not connected', host, errorSide: 'remote' }
+  }
+
+  let cancelled = false
+  activeTasks.set(dirTaskKey, {
+    cancel: () => {
+      cancelled = true
+    }
+  })
+
+  sendProgress(event, {
+    id,
+    host,
+    taskKey: dirTaskKey,
+    type: 'upload',
+    isGroup: true,
+    groupKind: 'directory',
+    remotePath: remoteParent,
+    bytes: 0,
+    total: 1,
+    status: 'running',
+    stage: 'scanning'
+  })
+
+  try {
+    const st = await fs.promises.stat(absLocal)
+    if (!st.isDirectory()) throw Object.assign(new Error(`Not a directory: ${absLocal}`), { code: 'ENOTDIR' })
+    await fs.promises.readdir(absLocal)
+  } catch (e: any) {
+    const msg = errToMessage(e)
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: dirTaskKey,
+      type: 'upload',
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: remoteParent,
+      bytes: 1,
+      total: 1,
+      status: 'error',
+      message: msg,
+      errorSide: 'local'
+    })
+    activeTasks.delete(dirTaskKey)
+    return { status: 'error', message: msg, host, errorSide: 'local', localPath: absLocal }
+  }
+
+  let finalDirName = originalDirName
+  try {
+    finalDirName = await getUniqueRemoteName(sftp, remoteParent, originalDirName, true)
+  } catch (e: any) {
+    const msg = errToMessage(e)
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: dirTaskKey,
+      type: 'upload',
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: remoteParent,
+      bytes: 1,
+      total: 1,
+      status: 'error',
+      message: msg,
+      errorSide: 'remote'
+    })
+    activeTasks.delete(dirTaskKey)
+    return { status: 'error', message: msg, host, errorSide: 'remote' }
+  }
+
+  const finalRemoteBaseDir = path.posix.join(remoteParent, finalDirName)
+
+  let scannedFiles = 0
+  let finishedFiles = 0
+  let failedFiles = 0
+  let transferStarted = false
+  let scanCounter = 0
+
+  const yieldNow = () => new Promise<void>((r) => setImmediate(r))
+
+  const reportGroup = (extra?: Record<string, any>) => {
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: dirTaskKey,
+      type: 'upload',
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: finalRemoteBaseDir,
+      bytes: finishedFiles,
+      total: Math.max(scannedFiles, 1),
+      totalFiles: scannedFiles,
+      finishedFiles,
+      failedFiles,
+      status: 'running',
+      stage: transferStarted ? 'transferring' : 'scanning',
+      ...extra
+    })
+  }
+
+  try {
+    await sftpMkdirpForTransfer(sftp, finalRemoteBaseDir)
+  } catch (e: any) {
+    const msg = errToMessage(e)
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: dirTaskKey,
+      type: 'upload',
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: finalRemoteBaseDir,
+      bytes: 1,
+      total: 1,
+      status: 'error',
+      message: msg,
+      errorSide: 'remote'
+    })
+    activeTasks.delete(dirTaskKey)
+    return { status: 'error', message: msg, host, errorSide: 'remote' }
+  }
+
+  const pool = createAsyncPool<{ local: string; remote: string }>(async (task) => {
+    if (cancelled) throw Object.assign(new Error('Transfer cancelled'), { __cancelled: true })
+
+    transferStarted = true
+    const fileTaskKey = `${dirTaskKey}:file:${task.remote}`
+
+    const r = await handleStreamTransfer(event, id, task.local, task.remote, 'upload', true, {
+      parentTaskKey: dirTaskKey,
+      taskKeyOverride: fileTaskKey,
+      isGroup: false,
+      groupKind: 'file'
+    })
+
+    if (r?.status !== 'success') throw r
+
+    finishedFiles++
+    reportGroup()
+  }, 3)
+
+  const scan = async (currentLocal: string, currentRemote: string) => {
+    if (cancelled) throw Object.assign(new Error('Transfer cancelled'), { __cancelled: true })
+
+    const entries = await fs.promises.readdir(currentLocal, { withFileTypes: true })
+
+    for (const entry of entries) {
+      if (cancelled) throw Object.assign(new Error('Transfer cancelled'), { __cancelled: true })
+
+      scanCounter++
+      if (scanCounter % 200 === 0) {
+        reportGroup()
+        await yieldNow()
+      }
+
+      const lPath = path.join(currentLocal, entry.name)
+      const rPath = path.posix.join(currentRemote, entry.name)
+
+      if (entry.isDirectory()) {
+        await sftpMkdirpForTransfer(sftp, rPath)
+        await scan(lPath, rPath)
+      } else if (entry.isFile()) {
+        scannedFiles++
+        const fileTaskKey = `${dirTaskKey}:file:${rPath}`
+
+        sendProgress(event, {
+          id,
+          host,
+          parentTaskKey: dirTaskKey,
+          taskKey: fileTaskKey,
+          type: 'upload',
+          isGroup: false,
+          groupKind: 'file',
+          remotePath: rPath,
+          localPath: lPath,
+          bytes: 0,
+          total: 1,
+          status: 'running',
+          stage: 'pending'
+        })
+
+        pool.push({ local: lPath, remote: rPath })
+      }
+    }
+  }
+
+  try {
+    await scan(absLocal, finalRemoteBaseDir)
+    pool.end()
+    await pool.wait()
+  } catch (e: any) {
+    const isCancel = !!e?.__cancelled
+    const tr = e?.status ? (e as TransferResult) : null
+    const msg = tr?.message || errToMessage(e)
+
+    if (tr?.status !== 'success') failedFiles++
+
+    sendProgress(event, {
+      id,
+      host,
+      taskKey: dirTaskKey,
+      type: 'upload',
+      isGroup: true,
+      groupKind: 'directory',
+      remotePath: finalRemoteBaseDir,
+      bytes: finishedFiles,
+      total: Math.max(scannedFiles, 1),
+      totalFiles: scannedFiles,
+      finishedFiles,
+      failedFiles,
+      status: isCancel ? 'failed' : 'error',
+      message: msg,
+      stage: undefined,
+      errorSide: tr?.errorSide || (isCancel ? 'local' : 'remote')
+    })
+
+    activeTasks.delete(dirTaskKey)
+    return isCancel
+      ? { status: 'cancelled', message: msg, host, errorSide: 'local' }
+      : tr || { status: 'error', message: msg, host, errorSide: 'remote' }
+  }
+
+  sendProgress(event, {
+    id,
+    host,
+    taskKey: dirTaskKey,
+    type: 'upload',
+    isGroup: true,
+    groupKind: 'directory',
+    remotePath: finalRemoteBaseDir,
+    bytes: finishedFiles,
+    total: Math.max(scannedFiles, 1),
+    totalFiles: scannedFiles,
+    finishedFiles,
+    failedFiles,
+    status: 'success',
+    stage: undefined
+  })
+
+  activeTasks.delete(dirTaskKey)
+  return { status: 'success', host }
+}
+
+export const initSftpOnConnection = (conn: Client, connectionId: string): Promise<void> => {
+  return new Promise<void>((resolve) => {
+    try {
+      conn.sftp((err, sftp) => {
+        if (err || !sftp) {
+          connectionStatus.set(connectionId, {
+            sftpAvailable: false,
+            sftpError: err?.message || 'SFTP object is empty'
+          })
+          sftpConnections.set(connectionId, {
+            isSuccess: false,
+            error: `sftp init error: "${err?.message || 'SFTP object is empty'}"`
+          })
+          return resolve()
+        }
+
+        // Probe the session with a cheap read to avoid caching a dead SFTP wrapper.
+        sftp.readdir('.', (readDirErr) => {
+          if (readDirErr) {
+            connectionStatus.set(connectionId, {
+              sftpAvailable: false,
+              sftpError: readDirErr.message
+            })
+            try {
+              sftp.end()
+            } catch {}
+            sftpConnections.set(connectionId, {
+              isSuccess: false,
+              error: `sftp readdir error: "${readDirErr.message}"`
+            })
+          } else {
+            sftpConnections.set(connectionId, { isSuccess: true, sftp })
+            connectionStatus.set(connectionId, { sftpAvailable: true })
+          }
+          resolve()
+        })
+      })
+    } catch (err: any) {
+      connectionStatus.set(connectionId, {
+        sftpAvailable: false,
+        sftpError: err?.message || String(err)
+      })
+      sftpConnections.set(connectionId, {
+        isSuccess: false,
+        error: `sftp init error: "${err?.message || String(err)}"`
+      })
+      resolve()
+    }
+  })
+}
+
+const isSkippedConn = (conn: Client | undefined, skipped?: Client) => {
+  return !!conn && !!skipped && conn === skipped
+}
+
+// Prefer an existing SSH connection when it is still alive and not explicitly skipped.
+const findReusableSftpConn = (connectionInfo: any, skippedConn?: Client): Client | undefined => {
+  const { id } = connectionInfo
+
+  const direct = sshConnections.get(id)
+  if (direct && !isSkippedConn(direct, skippedConn) && isClientSocketAlive(direct)) return direct
+
+  if (id) {
+    const prefix = id.substring(0, id.lastIndexOf(':') + 1)
+
+    for (const [existingId, existingConn] of sshConnections.entries()) {
+      const sessionPart = existingId.substring(existingId.lastIndexOf(':') + 1)
+      if (
+        existingId.startsWith(prefix) &&
+        sessionPart.startsWith('files-') &&
+        !isSkippedConn(existingConn, skippedConn) &&
+        isClientSocketAlive(existingConn)
+      ) {
+        return existingConn
+      }
+    }
+
+    for (const [existingId, existingConn] of sshConnections.entries()) {
+      if (existingId.startsWith(prefix) && !isSkippedConn(existingConn, skippedConn) && isClientSocketAlive(existingConn)) return existingConn
+    }
+  }
+
+  return undefined
+}
+
+// ssh2 keeps socket state on the client instance, so this is the cheapest health signal we can read.
+const isClientSocketAlive = (conn?: Client) => {
+  const client = conn as any
+  if (!client) return false
+
+  const sock = client._sock
+  if (!sock) return true
+
+  return !sock.destroyed && !sock.closed
+}
+
+// JumpServer reuse is read-only here: dead connect-side records are ignored, not deleted.
+const findReusableJumpServerConn = (connectionInfo: any, skippedConn?: Client): Client | undefined => {
+  const { id, assetUuid } = connectionInfo
+  const jumpserverUuid = assetUuid || id
+
+  for (const [, existingData] of jumpserverConnections.entries()) {
+    if (existingData.jumpserverUuid !== jumpserverUuid || !existingData.conn) continue
+
+    if (!isSkippedConn(existingData.conn, skippedConn) && isClientSocketAlive(existingData.conn)) {
+      return existingData.conn
+    }
+  }
+
+  return undefined
+}
+
+// Reuse priority: active SFTP/SSH session first, then JumpServer/shared pooled SSH connection.
+const findReusableConn = (connectionInfo: any, skippedConn?: Client): Client | undefined => {
+  const { sshType, host, port, username } = connectionInfo
+
+  const reusableSftpConn = findReusableSftpConn(connectionInfo, skippedConn)
+  if (reusableSftpConn) return reusableSftpConn
+
+  if (sshType === 'jumpserver') {
+    const reusableJumpServerConn = findReusableJumpServerConn(connectionInfo, skippedConn)
+    if (reusableJumpServerConn) return reusableJumpServerConn
+  }
+
+  if (host && username) {
+    const poolKey = getConnectionPoolKey(host, port || 22, username)
+    const pooled = sshConnectionPool.get(poolKey)
+    if (pooled?.conn && !isSkippedConn(pooled.conn, skippedConn) && isClientSocketAlive(pooled.conn)) return pooled.conn
+  }
+
+  return undefined
+}
+
+export const connectSftpReuseFirst = async (event: any, connectionInfo: any, options?: { skipReusableConn?: Client }): Promise<SftpConnectResult> => {
+  const { id } = connectionInfo
+  const requestId = String(connectionInfo?.sftpRequestId || `${Date.now()}_${Math.random().toString(16).slice(2)}`)
+
+  markPending(id, requestId)
+  const reused = findReusableConn(connectionInfo, options?.skipReusableConn)
+
+  if (reused) {
+    try {
+      await initSftpOnConnection(reused, id)
+
+      const p = getPending(id)
+      if (p?.cancelled) {
+        await closeSftpOnly(id)
+        clearPending(id)
+        return { status: 'cancelled', message: 'cancelled' }
+      }
+
+      const st = connectionStatus.get(id) as any
+      if (st?.sftpAvailable) {
+        clearPending(id)
+        return { status: 'connected', message: 'SFTP ready (reused existing SSH connection)' }
+      }
+
+      // Mark the reused SFTP as unavailable and fall back to a fresh connection below.
+      sftpConnections.delete(id)
+      connectionStatus.set(id, {
+        sftpAvailable: false,
+        sftpError: st?.sftpError || 'reused ssh not available'
+      })
+    } catch (e) {
+      // Reuse failed; keep connect-side state untouched and create a new SFTP connection instead.
+      sftpConnections.delete(id)
+      connectionStatus.set(id, {
+        sftpAvailable: false,
+        sftpError: (e as Error)?.message || 'reused ssh not available'
+      })
+    }
+  }
+
+  clearPending(id)
+  return await connectSftpNew(event, connectionInfo, { skipReusableConn: reused })
+}
+
+// Keep SFTP state in sync when the underlying transport closes unexpectedly.
+const markSftpDead = async (id: string, reason = 'SFTP connection lost') => {
+  const sid = String(id || '')
+  if (!sid) return
+
+  try {
+    const rec = sftpConnections.get(sid) as any
+    if (rec?.sftp) {
+      try {
+        rec.sftp.end()
+      } catch {}
+    }
+  } catch {}
+
+  sftpConnections.delete(sid)
+  connectionStatus.set(sid, {
+    sftpAvailable: false,
+    sftpError: reason
+  })
+}
+
+export const connectSftpNew = async (event: any, connectionInfo: any, options?: { skipReusableConn?: Client }): Promise<SftpConnectResult> => {
+  const { id, sshType } = connectionInfo
+
+  if (sshType === 'jumpserver') {
+    return await connectJumpServerSftpNew(event, connectionInfo, options)
+  }
+
+  const conn = new SSHClient()
+  const { host, port, username, password, privateKey, passphrase, needProxy, proxyConfig, proxyCommand, connIdentToken, asset_type } = connectionInfo
+
+  const packageInfo = getPackageInfo()
+  const identToken = connIdentToken ? `_t=${connIdentToken}` : ''
+  const ident = `${packageInfo.name}_${packageInfo.version}${identToken}`
+  const algorithms = getAlgorithmsByAssetType(asset_type)
+
+  const requestId = String(connectionInfo?.sftpRequestId || `${Date.now()}_${Math.random().toString(16).slice(2)}`)
+  markPending(id, requestId, conn as any)
+
+  // This path creates an SFTP-owned SSH connection when reuse is not possible.
+  const connectConfig: any = {
+    host,
+    port: port || 22,
+    username,
+    keepaliveInterval: 10000,
+    readyTimeout: KeyboardInteractiveTimeout,
+    tryKeyboard: true,
+    ident,
+    algorithms
+  }
+
+  if (privateKey) {
+    connectConfig.privateKey = privateKey
+    if (passphrase) connectConfig.passphrase = passphrase
+  } else if (password) {
+    connectConfig.password = password
+  } else {
+    clearPending(id)
+    return { status: 'error', message: 'No valid authentication method provided' }
+  }
+
+  try {
+    if (proxyCommand) {
+      connectConfig.sock = await createProxyCommandSocket(proxyCommand, host, port || 22)
+      delete connectConfig.host
+      delete connectConfig.port
+    } else if (needProxy) {
+      connectConfig.sock = await createProxySocket(proxyConfig, host, port || 22)
+    }
+  } catch (err: any) {
+    clearPending(id)
+    return { status: 'error', message: `Failed to establish a transport layer tunnel: ${err?.message || String(err)}` }
+  }
+
+  return new Promise((resolve) => {
+    conn.on('keyboard-interactive', (_name, _instructions, _lang, prompts, finish) => {
+      ;(async () => {
+        try {
+          const p = getPending(id)
+          if (p?.cancelled) {
+            conn.end()
+            return resolve({ status: 'cancelled', message: 'cancelled' })
+          }
+          await handleRequestKeyboardInteractive(event, id, prompts, finish)
+        } catch (e: any) {
+          conn.end()
+          clearPending(id)
+          resolve({ status: 'error', message: e?.message || String(e) })
+        }
+      })()
+    })
+
+    conn.on('ready', () => {
+      ;(async () => {
+        sshConnections.set(id, conn)
+        try {
+          const p = getPending(id)
+          if (p?.cancelled) {
+            conn.end()
+            clearPending(id)
+            return resolve({ status: 'cancelled', message: 'cancelled' })
+          }
+
+          await initSftpOnConnection(conn as any, id)
+
+          const p2 = getPending(id)
+          if (p2?.cancelled) {
+            await closeSftpOnly(id)
+            conn.end()
+            clearPending(id)
+            return resolve({ status: 'cancelled', message: 'cancelled' })
+          }
+
+          clearPending(id)
+          const st = connectionStatus.get(id) as any
+          resolve(
+            st?.sftpAvailable
+              ? { status: 'connected', message: 'SFTP ready (new SFTP-only SSH connection)' }
+              : { status: 'error', message: st?.sftpError || 'SFTP init failed' }
+          )
+        } catch (e: any) {
+          clearPending(id)
+          resolve({ status: 'error', message: e?.message || String(e) })
+        }
+      })()
+    })
+
+    conn.on('error', (err: any) => {
+      const p = getPending(id)
+      if (p?.cancelled) {
+        clearPending(id)
+        return resolve({ status: 'cancelled', message: 'cancelled' })
+      }
+      clearPending(id)
+      resolve({ status: 'error', message: `SFTP connection failed: ${err.message}` })
+    })
+
+    conn.on('close', async () => {
+      await markSftpDead(id, 'SFTP connection closed')
+    })
+
+    conn.on('end', async () => {
+      await markSftpDead(id, 'SFTP connection ended')
+    })
+    conn.connect(connectConfig)
+  })
+}
+
+function openShell(conn: any, connectionInfo: any) {
+  return new Promise((resolve, reject) => {
+    conn.shell({ term: connectionInfo.terminalType || 'vt100' }, (err, stream) => {
+      if (err) return reject(err)
+      resolve(stream)
+    })
+  })
+}
+
+const connectJumpServerSftpNew = async (_event: any, connectionInfo: any, options?: { skipReusableConn?: Client }): Promise<SftpConnectResult> => {
+  const { id, host, port, username, password, privateKey, passphrase, needProxy, proxyConfig, proxyCommand, connIdentToken, asset_type } =
+    connectionInfo
+  // Try a live JumpServer connect-side session first, then fall back to an SFTP-owned one.
+  const reusableConn = findReusableJumpServerConn(connectionInfo, options?.skipReusableConn)
+  if (reusableConn) {
+    const requestId = String(connectionInfo?.sftpRequestId || `${Date.now()}_${Math.random().toString(16).slice(2)}`)
+    markPending(id, requestId)
+    await initSftpOnConnection(reusableConn, id)
+
+    const p = getPending(id)
+    if (p?.cancelled) {
+      await closeSftpOnly(id)
+      clearPending(id)
+      return { status: 'cancelled', message: 'cancelled' }
+    }
+
+    clearPending(id)
+    const st = connectionStatus.get(id) as any
+    if (st?.sftpAvailable) {
+      return { status: 'connected', message: 'SFTP ready (reused JumpServer connection)' }
+    }
+  }
+
+  const conn = new SSHClient()
+
+  const packageInfo = getPackageInfo()
+  const identToken = connIdentToken ? `_t=${connIdentToken}` : ''
+  const ident = `${packageInfo.name}_${packageInfo.version}${identToken}`
+  const algorithms = getAlgorithmsByAssetType(asset_type)
+
+  const requestId = String(connectionInfo?.sftpRequestId || `${Date.now()}_${Math.random().toString(16).slice(2)}`)
+  markPending(id, requestId, conn as any)
+
+  const connectConfig: any = {
+    host,
+    port: port || 22,
+    username,
+    keepaliveInterval: 10000,
+    readyTimeout: 180000,
+    tryKeyboard: true,
+    ident,
+    algorithms
+  }
+
+  if (privateKey) {
+    try {
+      connectConfig.privateKey = Buffer.isBuffer(privateKey) ? privateKey : Buffer.from(privateKey)
+      if (passphrase) connectConfig.passphrase = passphrase
+    } catch (err: any) {
+      clearPending(id)
+      return { status: 'error', message: `Private key format error: ${err?.message || String(err)}` }
+    }
+  } else if (password) {
+    connectConfig.password = password
+  } else {
+    clearPending(id)
+    return { status: 'error', message: 'Missing authentication info: private key or password required' }
+  }
+
+  try {
+    if (proxyCommand) {
+      connectConfig.sock = await createProxyCommandSocket(proxyCommand, host, port || 22)
+      delete connectConfig.host
+      delete connectConfig.port
+    } else if (needProxy) {
+      connectConfig.sock = await createProxySocket(proxyConfig, host, port || 22)
+    }
+  } catch (err: any) {
+    clearPending(id)
+    return { status: 'error', message: `Failed to establish a transport layer tunnel: ${err?.message || String(err)}` }
+  }
+
+  return new Promise((resolve) => {
+    let settled = false
+
+    const safeResolve = (data) => {
+      if (settled) return
+      settled = true
+      resolve(data)
+    }
+
+    // Clean only the JumpServer resources created by SFTP itself.
+    const cleanupJumpServerSftpOnlySession = async (reason: string) => {
+      sftpOwnedJumpServerConnections.delete(id)
+      sftpOwnedJumpServerStreams.delete(id)
+      await markSftpDead(id, reason)
+    }
+
+    conn.on('ready', async () => {
+      try {
+        const stream = await openShell(conn, connectionInfo)
+        // Store SFTP-owned JumpServer resources separately from connect-managed sessions.
+        sftpOwnedJumpServerConnections.set(id, conn)
+        sftpOwnedJumpServerStreams.set(id, stream)
+
+        await initSftpOnConnection(conn, id)
+
+        clearPending(id)
+
+        const st = connectionStatus.get(id)
+        safeResolve(
+          st?.sftpAvailable
+            ? { status: 'connected', message: 'SFTP ready (new JumpServer connection)' }
+            : { status: 'error', message: st?.sftpError || 'SFTP init failed' }
+        )
+      } catch (e: any) {
+        clearPending(id)
+        conn.end()
+        safeResolve({ status: 'error', message: e?.message || String(e) })
+      }
+    })
+
+    conn.on('error', (err) => {
+      clearPending(id)
+      conn.end()
+      safeResolve({
+        status: 'error',
+        message: `JumpServer SFTP connection failed: ${err.message}`
+      })
+    })
+
+    conn.on('close', async () => {
+      await cleanupJumpServerSftpOnlySession('SFTP connection closed')
+    })
+
+    conn.on('end', async () => {
+      await cleanupJumpServerSftpOnlySession('SFTP connection ended')
+    })
+
+    conn.connect(connectConfig)
+  })
+}
+
+type PendingSftp = {
+  requestId: string
+  cancelled: boolean
+  conn?: Client
+}
+const pendingSftpConnects = new Map<string, PendingSftp>()
+
+const markPending = (id: string, requestId: string, conn?: Client) => {
+  pendingSftpConnects.set(id, { requestId, cancelled: false, conn })
+}
+const getPending = (id: string) => pendingSftpConnects.get(id)
+const clearPending = (id: string) => pendingSftpConnects.delete(id)
+
+// Resolve sibling file-panel ids to the same underlying SFTP record when needed.
+const findReusableSftpKey = (id: string) => {
+  if (sftpConnections.has(id)) return id
+
+  if (!id) return id
+
+  const prefix = id.substring(0, id.lastIndexOf(':') + 1)
+
+  for (const [existingId] of sftpConnections.entries()) {
+    const sessionPart = existingId.substring(existingId.lastIndexOf(':') + 1)
+    if (existingId.startsWith(prefix) && sessionPart.startsWith('files-')) {
+      return existingId
+    }
+  }
+
+  for (const [existingId] of sftpConnections.entries()) {
+    if (existingId.startsWith(prefix)) {
+      return existingId
+    }
+  }
+
+  return id
+}
+
+export const closeSftpOnly = async (connectionId: string): Promise<{ status: string; message: string }> => {
+  const id = String(connectionId || '')
+  if (!id) return { status: 'error', message: 'missing id' }
+
+  const actualId = findReusableSftpKey(id)
+
+  try {
+    const p = pendingSftpConnects.get(actualId)
+    if (p) {
+      p.cancelled = true
+      try {
+        p.conn?.end()
+      } catch {}
+      clearPending(actualId)
+    }
+
+    const rec = sftpConnections.get(actualId) as any
+    if (rec?.sftp) {
+      try {
+        rec.sftp.end()
+      } catch {}
+    }
+
+    sftpConnections.delete(actualId)
+    connectionStatus.set(actualId, { sftpAvailable: false, sftpError: 'SFTP closed by user' })
+
+    // Only tear down JumpServer resources that were created by SFTP itself.
+    const ownedStream = sftpOwnedJumpServerStreams.get(actualId)
+    if (ownedStream) {
+      try {
+        ownedStream.end()
+      } catch {}
+      sftpOwnedJumpServerStreams.delete(actualId)
+    }
+
+    const ownedConn = sftpOwnedJumpServerConnections.get(actualId)
+    if (ownedConn) {
+      try {
+        ownedConn.end()
+      } catch {}
+      sftpOwnedJumpServerConnections.delete(actualId)
+    }
+
+    return { status: 'closed', message: 'SFTP closed' }
+  } catch (e: any) {
+    return { status: 'error', message: e?.message || String(e) }
+  }
+}
+
+type CopyOrMoveBySftpArgs = {
+  id: string
+  srcPath: string
+  targetPath: string
+  action: 'copy' | 'move'
+}
+
+type SftpCopyOrMoveResult = {
+  status: 'success' | 'error' | 'cancelled'
+  message?: string
+  path?: string
+}
+
+async function sftpStatSafe(sftp: any, p: string): Promise<any | null> {
+  try {
+    return await sftpStat(sftp, p)
+  } catch {
+    return null
+  }
+}
+
+function isRemoteDirectoryStat(st: any) {
+  return !!st?.isDirectory?.() || isRemoteDir(st)
+}
+
+async function resolveRemoteCopyMoveTarget(
+  sftp: any,
+  srcPath: string,
+  targetPath: string
+): Promise<{
+  srcStat: any
+  finalPath: string
+  isDir: boolean
+}> {
+  const normalizedSrc = toPosix(srcPath)
+  const normalizedTarget = toPosix(targetPath)
+
+  const srcStat = await sftpStat(sftp, normalizedSrc)
+  const isDir = isRemoteDirectoryStat(srcStat)
+  const srcBaseName = path.posix.basename(normalizedSrc)
+
+  const targetStat = await sftpStatSafe(sftp, normalizedTarget)
+
+  let candidatePath = normalizedTarget
+
+  if (targetStat && isRemoteDirectoryStat(targetStat)) {
+    candidatePath = path.posix.join(normalizedTarget, srcBaseName)
+  } else if (normalizedTarget.endsWith('/')) {
+    candidatePath = path.posix.join(normalizedTarget, srcBaseName)
+  }
+
+  const parentDir = path.posix.dirname(candidatePath)
+  const baseName = path.posix.basename(candidatePath)
+  const uniqueName = await getUniqueRemoteName(sftp, parentDir, baseName, isDir)
+  const finalPath = path.posix.join(parentDir, uniqueName)
+
+  return {
+    srcStat,
+    finalPath,
+    isDir
+  }
+}
+
+async function copyOrMoveBySftp(event: Electron.IpcMainInvokeEvent, args: CopyOrMoveBySftpArgs): Promise<SftpCopyOrMoveResult> {
+  const { id, srcPath, targetPath, action } = args
+  const sftp = getSftpConnection(id)
+
+  if (!sftp) {
+    return { status: 'error', message: 'Sftp Not connected' }
+  }
+
+  try {
+    const { finalPath, isDir } = await resolveRemoteCopyMoveTarget(sftp, srcPath, targetPath)
+
+    if (action === 'move') {
+      if (toPosix(srcPath) === finalPath) {
+        return { status: 'success', path: finalPath }
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        sftp.rename(toPosix(srcPath), finalPath, (err: any) => {
+          if (err) reject(err)
+          else resolve()
+        })
+      })
+
+      return {
+        status: 'success',
+        path: finalPath
+      }
+    }
+
+    if (isDir) {
+      const res = await transferDirR2R(event, {
+        fromId: id,
+        toId: id,
+        fromDir: toPosix(srcPath),
+        toDir: path.posix.dirname(finalPath),
+        autoRename: false
+      })
+
+      if (res.status === 'success') {
+        return {
+          status: 'success',
+          path: res.remotePath || finalPath
+        }
+      }
+
+      if (res.status === 'cancelled') {
+        return {
+          status: 'cancelled',
+          message: res.message
+        }
+      }
+
+      return {
+        status: 'error',
+        message: res.message || 'Copy directory failed'
+      }
+    }
+
+    const res = await transferFileR2R(event, {
+      fromId: id,
+      toId: id,
+      fromPath: toPosix(srcPath),
+      toPath: finalPath,
+      autoRename: false
+    })
+
+    if (res.status === 'success') {
+      return {
+        status: 'success',
+        path: res.remotePath || finalPath
+      }
+    }
+
+    if (res.status === 'cancelled') {
+      return {
+        status: 'cancelled',
+        message: res.message
+      }
+    }
+
+    return {
+      status: 'error',
+      message: res.message || 'Copy file failed'
+    }
+  } catch (e: any) {
+    return {
+      status: 'error',
+      message: e?.message || String(e)
+    }
+  }
 }

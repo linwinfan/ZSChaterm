@@ -174,6 +174,21 @@ body {
       --bg-color-quinary: rgba(45, 45, 48, var(--custom-opacity, 0.8));
       --command-output-bg: rgba(30, 30, 30, var(--custom-opacity, 0.8));
 
+      // Border colors - use semi-transparent white borders for better visibility on background images
+      --border-color: rgba(255, 255, 255, 0.12);
+      --border-color-light: rgba(255, 255, 255, 0.08);
+      --splitter-color: rgba(255, 255, 255, 0.1);
+
+      // Text colors - higher contrast for readability over background image
+      --text-color: #f5f5f5;
+      --text-color-secondary: #e2e8f0;
+      --text-color-secondary-light: #e2e8f0;
+      --text-color-tertiary: #94a3b8;
+      --text-color-quaternary: #94a3b8;
+      --text-color-quinary: #64748b;
+      --text-color-senary: #475569;
+      --text-color-septenary: #334155;
+
       // Ensure other components that might have hardcoded backgrounds are also transparent
       .ant-layout,
       .ant-layout-sider,
@@ -228,7 +243,6 @@ body {
       .ant-select-dropdown {
         background-color: rgba(37, 37, 38, 0.85) !important;
         backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
 
         .ant-select-item-option {
           background-color: transparent !important;
@@ -248,7 +262,6 @@ body {
       .ant-cascader-dropdown {
         background-color: rgba(37, 37, 38, 0.85) !important;
         backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
         border: 1px solid rgba(60, 60, 60, 0.5) !important;
 
         .ant-cascader-menu {
@@ -277,29 +290,25 @@ body {
 
       // History dropdown menu (AI chat history in Agent mode)
       .history-dropdown-menu {
-        background-color: rgba(37, 37, 38, 0.85) !important;
-        backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
+        background-color: transparent !important;
+        backdrop-filter: blur(10px);
 
         .ant-input {
-          background-color: rgba(30, 30, 30, 0.6) !important;
+          background-color: transparent !important;
         }
 
         .history-search-input {
-          background-color: rgba(30, 30, 30, 0.6) !important;
-
-          :deep(.ant-input) {
-            background-color: rgba(30, 30, 30, 0.6) !important;
-          }
+          background-color: transparent !important;
+          border: 1px solid var(--border-color) !important;
         }
       }
 
       // Ant Design Menu and Dropdown components
       .ant-menu,
       .ant-dropdown-menu {
-        background-color: rgba(37, 37, 38, 0.85) !important;
-        backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
+        background-color: transparent !important;
+        backdrop-filter: blur(10px);
+        border: 1px solid var(--border-color) !important;
 
         .ant-menu-item,
         .ant-dropdown-menu-item {
@@ -315,21 +324,18 @@ body {
       .custom_assets_menu {
         background-color: transparent !important;
         backdrop-filter: none !important;
-        -webkit-backdrop-filter: none !important;
       }
 
       // Extensions menu (inline menu in extensions panel) should be fully transparent
       .custom_extension_menu {
         background-color: transparent !important;
         backdrop-filter: none !important;
-        -webkit-backdrop-filter: none !important;
       }
 
       // User menu (personal info and logout options in left sidebar)
       .user-menu {
         background-color: rgba(37, 37, 38, 0.85) !important;
         backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
 
         .menu-item {
           background-color: transparent !important;
@@ -350,6 +356,21 @@ body {
       --bg-color-quaternary: rgba(226, 232, 240, var(--custom-opacity, 0.8));
       --bg-color-quinary: rgba(248, 250, 252, var(--custom-opacity, 0.8));
       --command-output-bg: rgba(245, 245, 245, var(--custom-opacity, 0.8));
+
+      // Border colors - use semi-transparent dark borders for better visibility on background images
+      --border-color: rgba(0, 0, 0, 0.12);
+      --border-color-light: rgba(0, 0, 0, 0.08);
+      --splitter-color: rgba(0, 0, 0, 0.1);
+
+      // Text colors - darker shades for readability over background image
+      --text-color: #0a0f1a;
+      --text-color-secondary: #1e293b;
+      --text-color-secondary-light: #334155;
+      --text-color-tertiary: #475569;
+      --text-color-quaternary: #64748b;
+      --text-color-quinary: #64748b;
+      --text-color-senary: #94a3b8;
+      --text-color-septenary: #cbd5e1;
 
       .ant-layout,
       .ant-layout-sider,
@@ -404,7 +425,6 @@ body {
       .ant-select-dropdown {
         background-color: rgba(243, 243, 243, 0.85) !important;
         backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
 
         .ant-select-item-option {
           background-color: transparent !important;
@@ -424,7 +444,6 @@ body {
       .ant-cascader-dropdown {
         background-color: rgba(243, 243, 243, 0.85) !important;
         backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
         border: 1px solid rgba(203, 213, 225, 0.5) !important;
 
         .ant-cascader-menu {
@@ -453,29 +472,25 @@ body {
 
       // History dropdown menu (AI chat history in Agent mode)
       .history-dropdown-menu {
-        background-color: rgba(243, 243, 243, 0.85) !important;
-        backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
+        background-color: transparent !important;
+        backdrop-filter: blur(10px);
 
         .ant-input {
-          background-color: rgba(248, 250, 252, 0.6) !important;
+          background-color: transparent !important;
         }
 
         .history-search-input {
-          background-color: rgba(248, 250, 252, 0.6) !important;
-
-          :deep(.ant-input) {
-            background-color: rgba(248, 250, 252, 0.6) !important;
-          }
+          background-color: transparent !important;
+          border: 1px solid var(--border-color) !important;
         }
       }
 
       // Ant Design Menu and Dropdown components
       .ant-menu,
       .ant-dropdown-menu {
-        background-color: rgba(243, 243, 243, 0.85) !important;
-        backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
+        background-color: transparent !important;
+        backdrop-filter: blur(10px);
+        border: 1px solid var(--border-color) !important;
 
         .ant-menu-item,
         .ant-dropdown-menu-item {
@@ -491,14 +506,12 @@ body {
       .custom_assets_menu {
         background-color: transparent !important;
         backdrop-filter: none !important;
-        -webkit-backdrop-filter: none !important;
       }
 
       // Extensions menu (inline menu in extensions panel) should be fully transparent
       .custom_extension_menu {
         background-color: transparent !important;
         backdrop-filter: none !important;
-        -webkit-backdrop-filter: none !important;
       }
 
       // User menu (personal info and logout options in left sidebar)
@@ -704,7 +717,6 @@ body {
 html.theme-dark .ant-dropdown-menu {
   background-color: #252526 !important;
   border: 1px solid #3c3c3c !important;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
 }
 
 html.theme-dark .ant-dropdown-menu-item {
@@ -724,7 +736,6 @@ html.theme-dark .ant-dropdown-menu-item {
 html.theme-dark .ant-cascader-dropdown {
   background-color: #252526 !important;
   border: 1px solid #3c3c3c !important;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
 }
 
 html.theme-dark .ant-cascader-menu {
@@ -757,6 +768,62 @@ html.theme-dark .ant-cascader-menu-item-expand .ant-cascader-menu-item-expand-ic
 .ant-modal-confirm .ant-modal-confirm-title,
 .ant-modal-confirm .ant-modal-confirm-content {
   color: var(--text-color) !important;
+}
+
+.ant-modal-confirm .ant-modal-confirm-btns .ant-btn {
+  color: var(--text-color) !important;
+  border-color: var(--border-color) !important;
+  background-color: var(--bg-color-secondary) !important;
+}
+
+.ant-modal-confirm .ant-modal-confirm-btns .ant-btn-primary {
+  color: #fff !important;
+  background-color: #1890ff !important;
+  border-color: #1890ff !important;
+}
+
+.ant-modal-confirm .ant-modal-confirm-btns .ant-btn-dangerous {
+  color: #fff !important;
+  background-color: #ff4d4f !important;
+  border-color: #ff4d4f !important;
+}
+
+// Popconfirm theme adaptation
+html.theme-dark .ant-popover .ant-popover-inner {
+  background-color: rgba(37, 37, 37, 0.95) !important;
+  backdrop-filter: blur(10px);
+}
+
+html.theme-light .ant-popover .ant-popover-inner {
+  background-color: rgba(243, 243, 243, 0.95) !important;
+  backdrop-filter: blur(10px);
+}
+
+html.theme-dark .ant-popover .ant-popover-arrow::before,
+html.theme-dark .ant-popover .ant-popover-arrow::after {
+  background-color: rgba(37, 37, 37, 0.95) !important;
+}
+
+html.theme-light .ant-popover .ant-popover-arrow::before,
+html.theme-light .ant-popover .ant-popover-arrow::after {
+  background-color: rgba(243, 243, 243, 0.95) !important;
+}
+
+.ant-popover .ant-popconfirm-message-title {
+  color: var(--text-color) !important;
+}
+
+.ant-popover .ant-popconfirm-buttons .ant-btn {
+  color: var(--text-color) !important;
+  border-color: var(--border-color) !important;
+  background-color: var(--bg-color-secondary) !important;
+}
+
+.ant-popover .ant-popconfirm-buttons .ant-btn-primary,
+.ant-popover .ant-popconfirm-buttons .ant-btn-dangerous {
+  color: #fff !important;
+  background-color: #ff4d4f !important;
+  border-color: #ff4d4f !important;
 }
 
 // Light theme dropdown menu styles

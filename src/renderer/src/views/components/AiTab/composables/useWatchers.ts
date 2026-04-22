@@ -3,6 +3,8 @@ import { useSessionState } from './useSessionState'
 import { focusChatInput } from './useTabManagement'
 import { updateGlobalState } from '@renderer/agent/storage/state'
 
+const logger = createRendererLogger('aitab.watchers')
+
 interface WatcherDeps {
   emitStateChange: () => void
   handleTabSwitch: () => void
@@ -33,13 +35,13 @@ export function useWatchers(deps: WatcherDeps) {
       if (!currentTab) {
         return
       }
-
-      if (newValue === 'chat') {
-        if (oldValue === 'agent' && hosts.value.length > 0) {
-          currentTab.agentHosts = [...hosts.value]
-        }
-        hosts.value = []
-      } else if (newValue === 'cmd') {
+      // if (newValue === 'chat') {
+      //   if (oldValue === 'agent' && hosts.value.length > 0) {
+      //     currentTab.agentHosts = [...hosts.value]
+      //   }
+      //   hosts.value = []
+      // } else if
+      if (newValue === 'cmd') {
         if (oldValue === 'agent' && hosts.value.length > 0) {
           currentTab.agentHosts = [...hosts.value]
         }
@@ -53,11 +55,11 @@ export function useWatchers(deps: WatcherDeps) {
         await updateGlobalState('chatSettings', {
           mode: newValue
         })
-        console.log('Updated chatSettings:', newValue)
+        logger.debug('Updated chatSettings')
 
         deps.emitStateChange()
       } catch (error) {
-        console.error('Failed to update chatSettings:', error)
+        logger.error('Failed to update chatSettings', { error: error })
       }
       focusChatInput()
     }

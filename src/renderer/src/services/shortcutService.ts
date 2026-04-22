@@ -3,6 +3,8 @@ import type { ShortcutConfig } from './userConfigStoreService'
 import eventBus from '@/utils/eventBus'
 import { shortcutActions } from '@/config/shortcutActions'
 
+const logger = createRendererLogger('service.shortcut')
+
 export interface ShortcutAction {
   id: string
   name: string
@@ -34,7 +36,7 @@ export class ShortcutService {
   private listener: ((event: KeyboardEvent) => void) | null = null
 
   private constructor() {
-    console.log('ShortcutService constructor is now private.')
+    logger.info('ShortcutService constructor is now private.')
   }
 
   public static get instance(): ShortcutService {
@@ -45,7 +47,7 @@ export class ShortcutService {
   }
 
   public init() {
-    console.log('Initializing ShortcutService...')
+    logger.info('Initializing ShortcutService...')
     this.destroy() // Clean up old state
     this.initializeShortcuts()
   }
@@ -64,6 +66,11 @@ export class ShortcutService {
 
     // Load user-configured shortcuts
     this.loadShortcuts()
+
+    // Listen for remote shortcuts sync to reload bindings
+    eventBus.on('shortcutsSyncApplied', () => {
+      this.loadShortcuts()
+    })
   }
 
   private registerAction(id: string, name: string, handler: () => void, defaultKey: { mac: string; other: string }, nameKey: string) {
@@ -91,7 +98,7 @@ export class ShortcutService {
         this.bindShortcuts()
       }
     } catch (error) {
-      console.error('Failed to load shortcuts:', error)
+      logger.error('Failed to load shortcuts', { error: error })
     }
   }
 
@@ -398,7 +405,7 @@ export class ShortcutService {
 
       return true
     } catch (error) {
-      console.error('Failed to update shortcut:', error)
+      logger.error('Failed to update shortcut', { error: error })
       return false
     }
   }
@@ -423,7 +430,7 @@ export class ShortcutService {
       await userConfigStore.saveConfig({ shortcuts: defaultShortcuts })
       await this.loadShortcuts()
     } catch (error) {
-      console.error('Failed to reset shortcuts:', error)
+      logger.error('Failed to reset shortcuts', { error: error })
     }
   }
 
@@ -479,7 +486,7 @@ export class ShortcutService {
         .replace(/Command/g, '⌘')
         .replace(/Option/g, '⌥')
         .replace(/Alt/g, '⌥')
-        .replace(/Shift/g, 'Shift')
+        .replace(/Shift/g, '⇧')
         .replace(/Control/g, '⌃')
         .replace(/Ctrl/g, '⌃')
     } else {

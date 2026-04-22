@@ -19,7 +19,7 @@ export const userConfigStore = defineStore('userConfig', {
         dataSync: 'disabled',
         feature: 0.0,
         terminalType: 'xterm',
-        theme: 'auto',
+        theme: 'dark',
         background: {
           image: '',
           opacity: 0.15,
@@ -73,7 +73,7 @@ export const userConfigStore = defineStore('userConfig', {
           dataSync: 'disabled',
           feature: 0.0,
           terminalType: 'xterm',
-          theme: 'auto',
+          theme: 'dark',
           background: {
             image: '',
             opacity: 0.15,
@@ -108,6 +108,9 @@ export const userConfigStore = defineStore('userConfig', {
     },
     updateBackgroundMode(mode: string) {
       this.userConfig.background.mode = mode
+    },
+    updateTheme(theme: string) {
+      this.userConfig.theme = theme
     }
   }
 })

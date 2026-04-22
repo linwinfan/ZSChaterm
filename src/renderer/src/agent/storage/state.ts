@@ -5,7 +5,6 @@ import {
   type ApiProvider,
   type BedrockModelId,
   type ModelInfo,
-  type HistoryItem,
   type AutoApprovalSettings,
   type ChatSettings,
   type UserInfo,
@@ -15,11 +14,51 @@ import { GlobalStateKey, SecretKey } from './state-keys'
 import { storageContext } from './storage-context'
 import { getUserInfo } from '@/utils/permission'
 import { userConfigStore } from '@/store/userConfigStore'
+import { markSyncMetaDirty } from '@/services/configSyncManager'
 
 // global
 
+const AI_PREFERENCE_SYNC_KEYS = new Set<GlobalStateKey>([
+  'thinkingBudgetTokens',
+  'reasoningEffort',
+  'autoApprovalSettings',
+  'chatSettings',
+  'needProxy',
+  'proxyConfig',
+  'shellIntegrationTimeout',
+  'experienceExtractionEnabled'
+])
+
+function scheduleAiPreferencesSync(): void {
+  void import('@/services/aiPreferencesSyncService')
+    .then(async ({ aiPreferencesSyncService }) => {
+      await markSyncMetaDirty('aiPreferencesSyncMeta', 1)
+      aiPreferencesSyncService.scheduleUpload()
+    })
+    .catch(() => {
+      // Sync service may not be initialized yet, ignore.
+    })
+}
+
+function scheduleUserRulesSync(): void {
+  void import('@/services/userRulesSyncService')
+    .then(async ({ userRulesSyncService }) => {
+      await markSyncMetaDirty('userRulesSyncMeta', 1)
+      userRulesSyncService.scheduleUpload()
+    })
+    .catch(() => {
+      // Sync service may not be initialized yet, ignore.
+    })
+}
+
 export async function updateGlobalState(key: GlobalStateKey, value: any) {
   await storageContext.globalState.update(key, value)
+  if (AI_PREFERENCE_SYNC_KEYS.has(key)) {
+    scheduleAiPreferencesSync()
+  }
+  if (key === 'userRules') {
+    scheduleUserRulesSync()
+  }
 }
 
 export async function getGlobalState(key: GlobalStateKey) {
@@ -72,18 +111,20 @@ export async function getAllExtensionState() {
     openAiBaseUrl,
     openAiApiKey,
     openAiModelId,
-    //openAiModelInfo,
+    openAiModelInfo,
     //openAiHeaders,
     ollamaModelId,
     ollamaBaseUrl,
     ollamaApiOptionsCtxNum,
     //lmStudioModelId,
     //lmStudioBaseUrl,
-    //anthropicBaseUrl,
     //geminiApiKey,
     //geminiBaseUrl,
     //openAiNativeApiKey,
     deepSeekApiKey,
+    anthropicApiKey,
+    anthropicBaseUrl,
+    anthropicModelId,
     //requestyApiKey,
     //requestyModelId,
     //requestyModelInfo,
@@ -99,7 +140,6 @@ export async function getAllExtensionState() {
     //lastShownAnnouncementId,
     customInstructions,
     userRules,
-    taskHistory,
     autoApprovalSettings,
     //browserSettings,
     chatSettings,
@@ -136,7 +176,8 @@ export async function getAllExtensionState() {
     proxyConfig,
     defaultBaseUrl,
     defaultModelId,
-    defaultApiKey
+    defaultApiKey,
+    defaultModelInfoMap
   ] = await Promise.all([
     getGlobalState('apiProvider') as Promise<ApiProvider | undefined>,
     getGlobalState('apiModelId') as Promise<string | undefined>,
@@ -158,18 +199,20 @@ export async function getAllExtensionState() {
     getGlobalState('openAiBaseUrl') as Promise<string | undefined>,
     getSecret('openAiApiKey') as Promise<string | undefined>,
     getGlobalState('openAiModelId') as Promise<string | undefined>,
-    //getGlobalState('openAiModelInfo') as Promise<ModelInfo | undefined>,
+    getGlobalState('openAiModelInfo') as Promise<Record<string, unknown> | undefined>,
     //getGlobalState('openAiHeaders') as Promise<Record<string, string> | undefined>,
     getGlobalState('ollamaModelId') as Promise<string | undefined>,
     getGlobalState('ollamaBaseUrl') as Promise<string | undefined>,
     getGlobalState('ollamaApiOptionsCtxNum') as Promise<string | undefined>,
     //getGlobalState('lmStudioModelId') as Promise<string | undefined>,
     //getGlobalState('lmStudioBaseUrl') as Promise<string | undefined>,
-    //getGlobalState('anthropicBaseUrl') as Promise<string | undefined>,
     //getSecret('geminiApiKey') as Promise<string | undefined>,
     //getGlobalState('geminiBaseUrl') as Promise<string | undefined>,
     //getSecret('openAiNativeApiKey') as Promise<string | undefined>,
     getSecret('deepSeekApiKey') as Promise<string | undefined>,
+    getSecret('anthropicApiKey') as Promise<string | undefined>,
+    getGlobalState('anthropicBaseUrl') as Promise<string | undefined>,
+    getGlobalState('anthropicModelId') as Promise<string | undefined>,
     //getSecret('requestyApiKey') as Promise<string | undefined>,
     //getGlobalState('requestyModelId') as Promise<string | undefined>,
     //getGlobalState('requestyModelInfo') as Promise<ModelInfo | undefined>,
@@ -185,7 +228,6 @@ export async function getAllExtensionState() {
     //getGlobalState('lastShownAnnouncementId') as Promise<string | undefined>,
     getGlobalState('customInstructions') as Promise<string | undefined>,
     getGlobalState('userRules') as Promise<Array<Rule> | undefined>,
-    getGlobalState('taskHistory') as Promise<HistoryItem[] | undefined>,
     getGlobalState('autoApprovalSettings') as Promise<AutoApprovalSettings | undefined>,
     //getGlobalState('browserSettings') as Promise<BrowserSettings | undefined>,
     getGlobalState('chatSettings') as Promise<ChatSettings | undefined>,
@@ -222,7 +264,8 @@ export async function getAllExtensionState() {
     getGlobalState('proxyConfig') as Promise<ApiConfiguration['proxyConfig'] | undefined>,
     getGlobalState('defaultBaseUrl') as Promise<string | undefined>,
     getGlobalState('defaultModelId') as Promise<string | undefined>,
-    getSecret('defaultApiKey') as Promise<string | undefined>
+    getSecret('defaultApiKey') as Promise<string | undefined>,
+    getGlobalState('defaultModelInfoMap') as Promise<Record<string, { contextWindow?: number; maxTokens?: number }> | undefined>
   ])
 
   let apiProvider: ApiProvider
@@ -285,7 +328,7 @@ export async function getAllExtensionState() {
       openAiBaseUrl,
       openAiApiKey,
       openAiModelId,
-      //openAiModelInfo,
+      openAiModelInfo,
       //openAiHeaders: openAiHeaders || {},
       ollamaModelId,
       ollamaBaseUrl,
@@ -297,6 +340,9 @@ export async function getAllExtensionState() {
       //geminiBaseUrl,
       //openAiNativeApiKey,
       deepSeekApiKey,
+      anthropicApiKey,
+      anthropicBaseUrl,
+      anthropicModelId,
       //requestyApiKey,
       //requestyModelId,
       //requestyModelInfo,
@@ -332,12 +378,12 @@ export async function getAllExtensionState() {
       proxyConfig,
       defaultBaseUrl,
       defaultModelId,
-      defaultApiKey
+      defaultApiKey,
+      defaultModelInfoMap
     },
     //lastShownAnnouncementId,
     customInstructions,
     userRules,
-    taskHistory,
     autoApprovalSettings: autoApprovalSettings || DEFAULT_AUTO_APPROVAL_SETTINGS, // default value can be 0 or empty string
     //browserSettings: { ...DEFAULT_BROWSER_SETTINGS, ...browserSettings }, // this will ensure that older versions of browserSettings (e.g. before remoteBrowserEnabled was added) are merged with the default values (false for remoteBrowserEnabled)
     chatSettings: chatSettings || DEFAULT_CHAT_SETTINGS,
@@ -379,9 +425,13 @@ export async function updateApiConfiguration(apiConfiguration: ApiConfiguration)
     liteLlmApiKey,
     favoritedModelIds,
     deepSeekApiKey,
+    anthropicApiKey,
+    anthropicBaseUrl,
+    anthropicModelId,
     openAiBaseUrl,
     openAiApiKey,
     openAiModelId,
+    openAiModelInfo,
     ollamaModelId,
     ollamaBaseUrl,
     ollamaApiOptionsCtxNum,
@@ -409,7 +459,7 @@ export async function updateApiConfiguration(apiConfiguration: ApiConfiguration)
   await updateGlobalState('openAiBaseUrl', openAiBaseUrl)
   await storeSecret('openAiApiKey', openAiApiKey)
   await updateGlobalState('openAiModelId', openAiModelId)
-  //await updateGlobalState('openAiModelInfo', openAiModelInfo)
+  await updateGlobalState('openAiModelInfo', openAiModelInfo)
   //await updateGlobalState('openAiHeaders', openAiHeaders || {})
   await updateGlobalState('ollamaModelId', ollamaModelId)
   await updateGlobalState('ollamaBaseUrl', ollamaBaseUrl)
@@ -421,6 +471,9 @@ export async function updateApiConfiguration(apiConfiguration: ApiConfiguration)
   //await updateGlobalState('geminiBaseUrl', geminiBaseUrl)
   //await storeSecret('openAiNativeApiKey', openAiNativeApiKey)
   await storeSecret('deepSeekApiKey', deepSeekApiKey)
+  await storeSecret('anthropicApiKey', anthropicApiKey)
+  await updateGlobalState('anthropicBaseUrl', anthropicBaseUrl)
+  await updateGlobalState('anthropicModelId', anthropicModelId)
   //await storeSecret('requestyApiKey', requestyApiKey)
   //await storeSecret('togetherApiKey', togetherApiKey)
   //await storeSecret('qwenApiKey', qwenApiKey)
@@ -471,6 +524,7 @@ export async function resetExtensionState() {
     'geminiApiKey',
     'openAiNativeApiKey',
     'deepSeekApiKey',
+    'anthropicApiKey',
     'requestyApiKey',
     'togetherApiKey',
     'qwenApiKey',

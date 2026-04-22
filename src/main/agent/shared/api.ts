@@ -6,7 +6,7 @@
 
 import { ProxyConfig } from './Proxy'
 
-export type ApiProvider = 'bedrock' | 'litellm' | 'deepseek' | 'default' | 'openai' | 'ollama'
+export type ApiProvider = 'anthropic' | 'bedrock' | 'litellm' | 'deepseek' | 'default' | 'openai' | 'ollama'
 
 export interface ApiHandlerOptions {
   apiModelId?: string
@@ -30,9 +30,13 @@ export interface ApiHandlerOptions {
   defaultBaseUrl?: string
   defaultModelId?: string
   defaultApiKey?: string
+  defaultModelInfoMap?: Record<string, { contextWindow?: number; maxTokens?: number }>
   openAiHeaders?: Record<string, string> // Custom headers for OpenAI requests
   liteLlmModelInfo?: LiteLLMModelInfo
   deepSeekApiKey?: string
+  anthropicApiKey?: string
+  anthropicBaseUrl?: string
+  anthropicModelId?: string
   needProxy?: boolean
   proxyConfig?: ProxyConfig
   openAiBaseUrl?: string
@@ -54,10 +58,12 @@ export type ApiConfiguration = ApiHandlerOptions & {
 // Map API provider to corresponding model ID configuration key
 export const PROVIDER_MODEL_KEY_MAP: Record<string, string> = {
   default: 'defaultModelId',
+  anthropic: 'anthropicModelId',
   litellm: 'liteLlmModelId',
   openai: 'openAiModelId',
   deepseek: 'apiModelId',
-  bedrock: 'apiModelId'
+  bedrock: 'apiModelId',
+  ollama: 'ollamaModelId'
 }
 
 // Models
@@ -280,9 +286,12 @@ export const deepSeekModels = {
   }
 } as const satisfies Record<string, ModelInfo>
 
+export type OpenAiApiFormat = 'chat-completions' | 'responses'
+
 export interface OpenAiCompatibleModelInfo extends ModelInfo {
   temperature?: number
   isR1FormatRequired?: boolean
+  apiFormat?: OpenAiApiFormat
 }
 
 // Azure OpenAI
@@ -299,4 +308,18 @@ export const openAiModelInfoSaneDefaults: OpenAiCompatibleModelInfo = {
   inputPrice: 0,
   outputPrice: 0,
   temperature: 0
+}
+
+// Anthropic Direct API
+// https://docs.anthropic.com/en/api/messages
+export const anthropicDefaultModelId = 'claude-sonnet-4-20250514'
+export const anthropicModelInfoSaneDefaults: ModelInfo = {
+  maxTokens: 8192,
+  contextWindow: 200_000,
+  supportsImages: true,
+  supportsPromptCache: true,
+  inputPrice: 0,
+  outputPrice: 0,
+  cacheWritesPrice: 0,
+  cacheReadsPrice: 0
 }

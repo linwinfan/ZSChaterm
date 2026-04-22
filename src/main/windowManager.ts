@@ -1,14 +1,29 @@
-import { BrowserWindow, shell, session } from 'electron'
+import { BrowserWindow, shell, session, ipcMain } from 'electron'
 import { join } from 'path'
 import { is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { getEdition } from './config/edition'
 
 /**
+ * Result of creating the main window.
+ * `window` is available immediately for IPC registration and other setup.
+ * `contentLoaded` resolves when the renderer page finishes loading.
+ */
+export interface WindowCreationResult {
+  window: BrowserWindow
+  contentLoaded: Promise<void>
+}
+
+/**
  * Create and manage the main BrowserWindow.
  * The latest Cookie URL will be passed back via callback to avoid circular dependencies.
+ *
+ * Returns both the BrowserWindow reference and a Promise that resolves when
+ * the page content finishes loading. This allows callers to proceed with
+ * initialization that only needs the window reference while content loads
+ * in parallel.
  */
-export async function createMainWindow(onCookieUrlChange?: (url: string) => void, shouldPreventClose?: () => boolean): Promise<BrowserWindow> {
+export async function createMainWindow(onCookieUrlChange?: (url: string) => void, shouldPreventClose?: () => boolean): Promise<WindowCreationResult> {
   // Set window title based on edition
   const edition = getEdition()
   const windowTitle = edition === 'cn' ? 'Chaterm CN' : 'Chaterm'
@@ -34,7 +49,6 @@ export async function createMainWindow(onCookieUrlChange?: (url: string) => void
       sandbox: false,
       contextIsolation: true,
       nodeIntegration: false,
-      webSecurity: false, // Allow loading local resources (file://)
       defaultFontFamily: {
         standard: '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif',
         serif: 'serif',
@@ -100,12 +114,12 @@ export async function createMainWindow(onCookieUrlChange?: (url: string) => void
     return { action: 'deny' }
   })
 
-  // Load the dev-server URL in development, or the local HTML file in production
-  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    await mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
-  } else {
-    await mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
-  }
+  // Start loading the renderer content without blocking.
+  // The returned `contentLoaded` promise lets callers await it when needed.
+  const contentLoaded =
+    is.dev && process.env['ELECTRON_RENDERER_URL']
+      ? mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+      : mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
 
   // Listen for URL changes so we can update the Cookie URL via callback
   mainWindow.webContents.on('did-finish-load', () => {
@@ -131,14 +145,26 @@ export async function createMainWindow(onCookieUrlChange?: (url: string) => void
   })
 
   // Disable Command+R (macOS) / Ctrl+R (Windows/Linux) reload shortcut
+  // while preserving Ctrl+R for terminal reverse history search (reverse-i-search)
+  let isTerminalFocused = false
+  ipcMain.on('terminal:focus-changed', (_event, focused: boolean) => {
+    isTerminalFocused = focused
+  })
   mainWindow.webContents.on('before-input-event', (event, input) => {
-    if (input.type === 'keyDown') {
-      const isReloadShortcut = (input.key === 'r' || input.key === 'R') && (input.meta || input.control) && !input.alt && !input.shift
-      if (isReloadShortcut) {
-        event.preventDefault()
+    if (input.type === 'keyDown' && (input.key === 'r' || input.key === 'R') && !input.alt && !input.shift) {
+      if (process.platform === 'darwin') {
+        // On macOS: block Cmd+R (reload), allow Ctrl+R (terminal reverse-i-search)
+        if (input.meta) {
+          event.preventDefault()
+        }
+      } else {
+        // On Windows/Linux: block Ctrl+R only when terminal is not focused
+        if (input.control && !isTerminalFocused) {
+          event.preventDefault()
+        }
       }
     }
   })
 
-  return mainWindow
+  return { window: mainWindow, contentLoaded }
 }

@@ -6,6 +6,8 @@ import eventBus from '@/utils/eventBus'
 import { Notice } from '@/views/components/Notice'
 import { getBastionHostType } from '../../LeftTab/utils/types'
 
+const logger = createRendererLogger('aitab.hostState')
+
 /**
  * Host info for updating hosts
  */
@@ -57,7 +59,7 @@ export const useHostState = () => {
       assetInfo.connection = bastionType || 'personal'
       return assetInfo
     } catch (error) {
-      console.error('Error getting asset information:', error)
+      logger.error('Error getting asset information', { error: error })
       return null
     }
   }
@@ -66,10 +68,10 @@ export const useHostState = () => {
    * Update hosts based on host info
    */
   const updateHosts = (hostInfo: HostInfo | null) => {
-    if (chatTypeValue.value === 'chat') {
-      hosts.value = []
-      return
-    }
+    // if (chatTypeValue.value === 'chat') {
+    //   hosts.value = []
+    //   return
+    // }
 
     if (hostInfo) {
       if (chatTypeValue.value === 'agent' && isSwitchAssetType(hostInfo.assetType)) {

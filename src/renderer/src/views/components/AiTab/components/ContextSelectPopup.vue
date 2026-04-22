@@ -59,8 +59,15 @@
           @click.stop="goToLevel2(item.key)"
           @mouseover="handleMenuMouseOver(displayedOpenedHosts.length + index)"
         >
+          <img
+            v-if="item.svgSrc"
+            :src="item.svgSrc"
+            alt=""
+            class="menu-icon-svg"
+          />
           <component
             :is="item.icon"
+            v-else
             class="menu-icon"
           />
           <span class="menu-label">{{ $t(item.labelKey) }}</span>
@@ -71,70 +78,115 @@
       <!-- Level 2: Hosts List -->
       <div
         v-else-if="currentMenuLevel === 'hosts'"
-        class="select-list"
+        class="hosts-container"
       >
-        <template
-          v-for="(item, index) in filteredHostOptions"
-          :key="item.value"
+        <div
+          class="select-list"
+          :class="{ 'has-footer': chatTypeValue === 'agent' }"
         >
-          <!-- Jumpserver parent node -->
-          <div
-            v-if="isBastionHostType(item.type)"
-            class="select-item select-group"
-            :class="{
-              hovered: hovered === item.value,
-              'keyboard-selected': keyboardSelectedIndex === index,
-              expanded: item.expanded
-            }"
-            @mouseover="handleMouseOver(item.value, index)"
-            @mouseleave="hovered = null"
-            @click="toggleJumpserverExpand(item.key)"
+          <template
+            v-for="(item, index) in filteredHostOptions"
+            :key="item.value"
           >
-            <span class="item-label group-label">{{ item.label }}</span>
-            <span class="group-badge">{{ item.childrenCount || 0 }}</span>
-            <span class="group-toggle">
-              <DownOutlined
-                v-if="item.expanded"
-                class="toggle-icon"
+            <!-- Jumpserver parent node -->
+            <div
+              v-if="isBastionHostType(item.type)"
+              class="select-item select-group"
+              :class="{
+                hovered: hovered === item.value,
+                'keyboard-selected': keyboardSelectedIndex === index,
+                expanded: item.expanded
+              }"
+              @mouseover="handleMouseOver(item.value, index)"
+              @mouseleave="hovered = null"
+              @click="toggleJumpserverExpand(item.key)"
+            >
+              <span class="item-label group-label">
+                {{ item.label }}
+              </span>
+              <span class="group-badge">{{ item.childrenCount || 0 }}</span>
+              <span class="group-toggle">
+                <DownOutlined
+                  v-if="item.expanded"
+                  class="toggle-icon"
+                />
+                <RightOutlined
+                  v-else
+                  class="toggle-icon"
+                />
+              </span>
+            </div>
+            <!-- Normal selectable host items -->
+            <div
+              v-else
+              class="select-item"
+              :class="{
+                hovered: hovered === item.value,
+                'keyboard-selected': keyboardSelectedIndex === index,
+                'select-child': item.level === 1
+              }"
+              :style="{ paddingLeft: item.level === 1 ? '24px' : '6px' }"
+              @mouseover="handleMouseOver(item.value, index)"
+              @mouseleave="hovered = null"
+              @click="onHostClick(item)"
+            >
+              <span class="item-label">
+                {{ item.label
+                }}<span
+                  v-if="item.title"
+                  class="host-item-remark"
+                >
+                  {{ ' ' }}{{ item.title }}
+                </span>
+              </span>
+              <!-- Show check icon for selected hosts -->
+              <CheckOutlined
+                v-if="isHostSelected(item)"
+                class="selected-icon"
               />
-              <RightOutlined
+            </div>
+          </template>
+          <div
+            v-if="hostOptionsLoading && filteredHostOptions.length > 0"
+            class="select-loading"
+          >
+            {{ $t('ai.loading') }}...
+          </div>
+          <div
+            v-if="filteredHostOptions.length === 0 && !hostOptionsLoading"
+            class="select-empty"
+          >
+            {{ $t('ai.noMatchingHosts') }}
+          </div>
+        </div>
+        <!-- Batch action footer (agent mode only) -->
+        <div
+          v-if="chatTypeValue === 'agent'"
+          class="host-batch-footer"
+        >
+          <div class="batch-footer-left">
+            <span
+              class="batch-action-btn"
+              @click.stop="allVisibleHostsSelected ? clearAllHosts() : selectAllHosts()"
+            >
+              <CheckSquareOutlined
+                v-if="allVisibleHostsSelected"
+                class="batch-icon"
+              />
+              <MinusSquareOutlined
                 v-else
-                class="toggle-icon"
+                class="batch-icon"
               />
+              {{ allVisibleHostsSelected ? $t('ai.deselectAll') : $t('ai.selectAll') }}
+            </span>
+            <span
+              v-if="hosts.length > 0"
+              class="batch-action-btn"
+              @click.stop="clearAllHosts()"
+            >
+              {{ $t('ai.clearSelection') }}
             </span>
           </div>
-          <!-- Normal selectable host items -->
-          <div
-            v-else
-            class="select-item"
-            :class="{
-              hovered: hovered === item.value,
-              'keyboard-selected': keyboardSelectedIndex === index,
-              'select-child': item.level === 1
-            }"
-            :style="{ paddingLeft: item.level === 1 ? '24px' : '6px' }"
-            @mouseover="handleMouseOver(item.value, index)"
-            @mouseleave="hovered = null"
-            @click="onHostClick(item)"
-          >
-            <span class="item-label">{{ item.label }}</span>
-            <CheckOutlined
-              v-if="isHostSelected(item)"
-              class="selected-icon"
-            />
-          </div>
-        </template>
-        <div
-          v-if="hostOptionsLoading && filteredHostOptions.length > 0"
-          class="select-loading"
-        >
-          {{ $t('ai.loading') }}...
-        </div>
-        <div
-          v-if="filteredHostOptions.length === 0 && !hostOptionsLoading"
-          class="select-empty"
-        >
-          {{ $t('ai.noMatchingHosts') }}
         </div>
       </div>
 
@@ -180,6 +232,48 @@
           class="select-empty"
         >
           {{ $t('ai.noMatchingDocs') }}
+        </div>
+      </div>
+
+      <!-- Level 2: Skills List -->
+      <div
+        v-else-if="currentMenuLevel === 'skills'"
+        class="select-list"
+      >
+        <div
+          v-for="(skill, index) in filteredSkillsOptions"
+          :key="skill.name"
+          class="select-item"
+          :class="{
+            hovered: hovered === skill.name,
+            'keyboard-selected': keyboardSelectedIndex === index
+          }"
+          @mouseover="handleMouseOver(skill.name, index)"
+          @mouseleave="hovered = null"
+          @click="onSkillClick(skill)"
+        >
+          <img
+            :src="skillsIcon"
+            alt=""
+            class="item-icon-svg"
+          />
+          <span class="item-label">{{ skill.name }}</span>
+          <CheckOutlined
+            v-if="isSkillSelected(skill)"
+            class="selected-icon"
+          />
+        </div>
+        <div
+          v-if="skillsOptionsLoading"
+          class="select-loading"
+        >
+          {{ $t('ai.loading') }}...
+        </div>
+        <div
+          v-if="filteredSkillsOptions.length === 0 && !skillsOptionsLoading"
+          class="select-empty"
+        >
+          {{ $t('ai.noMatchingSkills') }}
         </div>
       </div>
 
@@ -236,8 +330,11 @@ import {
   FileTextOutlined,
   FolderOutlined,
   MessageOutlined,
-  CheckOutlined
+  CheckOutlined,
+  CheckSquareOutlined,
+  MinusSquareOutlined
 } from '@ant-design/icons-vue'
+import skillsIcon from '@/assets/icons/skills.svg'
 import { contextInjectionKey } from '../composables/useContext'
 import type { ContextMenuLevel } from '../types'
 import { isBastionHostType } from '../types'
@@ -269,12 +366,16 @@ const {
   currentMode,
   searchInputRef,
   chatTypeValue,
+  hosts,
   // Hosts
   filteredHostOptions,
   hostOptionsLoading,
   isHostSelected,
   onHostClick,
   toggleJumpserverExpand,
+  selectAllHosts,
+  clearAllHosts,
+  allVisibleHostsSelected,
   // Opened hosts
   displayedOpenedHosts,
   // Docs
@@ -287,6 +388,11 @@ const {
   chatsOptionsLoading,
   isChatSelected,
   onChatClick,
+  // Skills
+  filteredSkillsOptions,
+  skillsOptionsLoading,
+  isSkillSelected,
+  onSkillClick,
   // Handlers
   handleSearchKeyDown,
   handleMouseOver,
@@ -327,7 +433,8 @@ const popupClass = computed(() => ({
 interface MainMenuItem {
   key: Exclude<ContextMenuLevel, 'main'>
   labelKey: string
-  icon: Component
+  icon?: Component
+  svgSrc?: string
 }
 
 const showHostsMenuItem = computed(() => chatTypeValue.value === 'agent')
@@ -338,6 +445,7 @@ const mainMenuItems = computed<MainMenuItem[]>(() => {
     items.push({ key: 'hosts', labelKey: 'ai.hosts', icon: LaptopOutlined })
   }
   items.push({ key: 'docs', labelKey: 'ai.docs', icon: FileTextOutlined })
+  items.push({ key: 'skills', labelKey: 'ai.skills', svgSrc: skillsIcon })
   items.push({ key: 'chats', labelKey: 'ai.pastChats', icon: MessageOutlined })
   return items
 })
@@ -348,6 +456,8 @@ const searchPlaceholder = computed(() => {
       return t('ai.searchHost')
     case 'docs':
       return t('ai.searchDocs')
+    case 'skills':
+      return t('ai.searchSkills')
     case 'chats':
       return t('ai.searchChats')
     default:
@@ -355,15 +465,14 @@ const searchPlaceholder = computed(() => {
   }
 })
 
-// Sync mode with parent and suppress unused var warning for template refs
+// Suppress unused var warnings for template refs
 void props.mode
 void searchInputRef
 </script>
 
 <style lang="less" scoped>
 .context-select-popup {
-  // Use extracted dominant color when available, fallback to default bg-color
-  --popup-bg-color: var(--user-message-sticky-bg-color, var(--bg-color));
+  --popup-bg-color: var(--bg-color);
 
   width: 260px;
   border-radius: 6px;
@@ -374,18 +483,8 @@ void searchInputRef
   position: fixed;
   overflow: hidden;
   background: var(--popup-bg-color);
-
-  // When custom background is enabled, use glassmorphism effect
-  body.has-custom-bg & {
-    background: rgba(37, 37, 37, 0.75);
-    backdrop-filter: blur(12px) saturate(180%);
-    -webkit-backdrop-filter: blur(12px) saturate(180%);
-  }
-
-  // Light theme glassmorphism
-  body.has-custom-bg.theme-light & {
-    background: rgba(241, 245, 249, 0.75);
-  }
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 
   &.is-edit-mode {
     box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
@@ -474,6 +573,15 @@ void searchInputRef
     margin-right: 10px;
   }
 
+  .menu-icon-svg {
+    width: 14px;
+    height: 14px;
+    margin-right: 10px;
+    flex-shrink: 0;
+    // External SVG as img renders with black fill; match Ant icon tint via theme (see theme.less --icon-filter)
+    filter: var(--icon-filter);
+  }
+
   .menu-label {
     flex: 1;
     overflow: hidden;
@@ -500,6 +608,10 @@ void searchInputRef
   padding: 4px 0;
   scrollbar-width: thin;
   scrollbar-color: var(--bg-color-quinary) var(--bg-color-senary);
+
+  &.has-footer {
+    max-height: 184px;
+  }
 
   &::-webkit-scrollbar {
     width: 6px;
@@ -540,11 +652,25 @@ void searchInputRef
     flex-shrink: 0;
   }
 
+  .item-icon-svg {
+    width: 12px;
+    height: 12px;
+    margin-right: 8px;
+    flex-shrink: 0;
+    filter: var(--icon-filter);
+  }
+
   .item-label {
     flex: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .host-item-remark {
+    font-weight: 400;
+    font-size: 10px;
+    color: var(--text-color-secondary);
   }
 
   .selected-icon {
@@ -620,5 +746,48 @@ void searchInputRef
   text-align: center;
   padding: 16px 12px;
   font-size: 12px;
+}
+
+.hosts-container {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.host-batch-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border-color);
+  background: var(--popup-bg-color);
+  flex-shrink: 0;
+
+  .batch-footer-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .batch-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 11px;
+    color: var(--text-color-secondary);
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 3px;
+    transition: all 0.15s;
+
+    &:hover {
+      color: var(--text-color);
+      background: var(--hover-bg-color);
+    }
+
+    .batch-icon {
+      font-size: 12px;
+    }
+  }
 }
 </style>

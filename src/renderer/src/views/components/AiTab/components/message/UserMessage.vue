@@ -2,6 +2,7 @@
   <div
     ref="wrapperRef"
     class="user-message-wrapper"
+    :class="{ 'is-editing': isEditing }"
   >
     <!-- Opaque backdrop (always rendered for sticky positioning) -->
     <div class="user-message-backdrop"></div>
@@ -16,6 +17,8 @@
         :is-active-tab="true"
         mode="edit"
         :initial-content-parts="displayParts"
+        :message-hosts="props.message.hosts || []"
+        :handle-interrupt="props.handleInterrupt"
         :on-confirm-edit="handleConfirmEdit"
       />
     </div>
@@ -49,10 +52,16 @@
             :class="`mention-chip-${part.chipType}`"
           >
             <span
-              v-if="part.chipType === 'doc' || part.chipType === 'chat'"
+              v-if="part.chipType === 'doc' || part.chipType === 'chat' || part.chipType === 'skill'"
               class="mention-icon"
             >
-              <FileTextOutlined v-if="part.chipType === 'doc'" />
+              <img
+                v-if="part.chipType === 'skill'"
+                :src="skillsIcon"
+                alt=""
+                class="mention-icon-svg"
+              />
+              <FileTextOutlined v-else-if="part.chipType === 'doc'" />
               <MessageOutlined v-else />
             </span>
             <span class="mention-label">{{ getChipLabel(part) }}</span>
@@ -66,18 +75,22 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onUnmounted, nextTick } from 'vue'
 import { isElementInAiTab } from '@/utils/domUtils'
-import type { ChatMessage } from '../../types'
+import type { ChatMessage, Host } from '../../types'
 import type { ContentPart } from '@shared/WebviewMessage'
 import InputSendContainer from '../InputSendContainer.vue'
 import { FileTextOutlined, MessageOutlined } from '@ant-design/icons-vue'
 import { getChipLabel } from '../../utils'
 import { useSessionState } from '../../composables/useSessionState'
+import skillsIcon from '@/assets/icons/skills.svg'
 
 interface Props {
   message: ChatMessage
+  handleInterrupt?: () => void
 }
 
-const props = withDefaults(defineProps<Props>(), {})
+const props = withDefaults(defineProps<Props>(), {
+  handleInterrupt: () => {}
+})
 
 const displayParts = computed<ContentPart[]>(() => {
   const parts = props.message.contentParts
@@ -89,7 +102,7 @@ const displayParts = computed<ContentPart[]>(() => {
 
 // Define events
 const emit = defineEmits<{
-  (e: 'truncate-and-send', payload: { message: ChatMessage; contentParts: ContentPart[] }): void
+  (e: 'truncate-and-send', payload: { message: ChatMessage; contentParts: ContentPart[]; hosts?: Host[] }): void
 }>()
 
 // Template refs
@@ -176,10 +189,11 @@ const cancelEditing = () => {
   isMessageEditing.value = false
 }
 
-const handleConfirmEdit = (contentParts: ContentPart[]) => {
+const handleConfirmEdit = (contentParts: ContentPart[], hosts: Host[]) => {
   emit('truncate-and-send', {
     message: props.message,
-    contentParts
+    contentParts,
+    hosts
   })
 
   isEditing.value = false
@@ -234,8 +248,7 @@ onUnmounted(() => {
   // padding: 0px 4px 8px 4px;
   margin: 0px 0px 8px 0px;
 
-  // Sticky backdrop color. Prefer extracted dominant color when available.
-  --user-message-sticky-bg: var(--user-message-sticky-bg-color, var(--bg-color));
+  --user-message-sticky-bg: var(--bg-color);
 
   width: 100%;
   position: relative;
@@ -257,38 +270,22 @@ onUnmounted(() => {
     pointer-events: none;
     z-index: 4;
   }
-
-  // Adjust gradient for glassmorphism effect
-  body.has-custom-bg &::after {
-    background: linear-gradient(to bottom, rgba(37, 37, 37, 0.75) 0%, transparent 100%);
-  }
-
-  body.has-custom-bg.theme-light &::after {
-    background: linear-gradient(to bottom, rgba(241, 245, 249, 0.75) 0%, transparent 100%);
-  }
 }
 
 .user-message-backdrop {
   position: absolute;
-  top: 0;
+  top: -8px;
   left: 0;
   right: 0;
   bottom: 0;
   background-color: var(--user-message-sticky-bg);
+  border-radius: 6px;
   z-index: 1;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
-
-  // Glassmorphism effect when custom background is enabled
-  body.has-custom-bg & {
-    background: rgba(37, 37, 37, 0.75);
-    backdrop-filter: blur(12px) saturate(180%);
-    -webkit-backdrop-filter: blur(12px) saturate(180%);
-  }
-
-  // Light theme glassmorphism
-  body.has-custom-bg.theme-light & {
-    background: rgba(241, 245, 249, 0.75);
-  }
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 2px 8px rgba(0, 0, 0, 0.08);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 
 .user-message-content {
@@ -296,6 +293,9 @@ onUnmounted(() => {
   width: 100%;
   max-height: 84px;
   overflow: hidden;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background-color: var(--hover-bg-color);
 
   // Position relative to allow backdrop to be behind
   position: relative;
@@ -326,8 +326,8 @@ onUnmounted(() => {
   box-sizing: border-box;
   padding: 8px 12px;
 
-  // Visual styles - maintain original appearance
-  background-color: var(--bg-color-secondary);
+  // Visual styles - distinct background to differentiate from AI messages
+  background-color: var(--hover-bg-color);
   color: var(--text-color);
   border-radius: 4px;
   font-size: 12px;
@@ -376,6 +376,12 @@ onUnmounted(() => {
   font-size: 12px;
   line-height: 1;
   color: var(--vscode-charts-blue);
+
+  .mention-icon-svg {
+    width: 12px;
+    height: 12px;
+    filter: var(--icon-filter);
+  }
 }
 
 .mention-chip-doc .mention-icon {
@@ -417,5 +423,8 @@ onUnmounted(() => {
   position: relative;
   z-index: 5;
   width: 100%;
+  background-color: var(--hover-bg-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
 }
 </style>

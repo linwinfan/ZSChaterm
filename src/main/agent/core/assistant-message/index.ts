@@ -17,6 +17,7 @@ export interface TextContent {
 export const toolUseNames = [
   'execute_command',
   'write_to_file',
+  'read_file',
   'ask_followup_question',
   'attempt_completion',
   'new_task',
@@ -29,7 +30,10 @@ export const toolUseNames = [
   'use_mcp_tool',
   'access_mcp_resource',
   'use_skill',
-  'summarize_to_knowledge'
+  'summarize_to_knowledge',
+  'summarize_to_skill',
+  'kb_search',
+  'web_fetch'
 ] as const
 
 // Converts array of tool call names into a union type ("execute_command" | "read_file" | ...)
@@ -38,9 +42,12 @@ export type ToolUseName = (typeof toolUseNames)[number]
 export const toolParamNames = [
   'ip',
   'command',
+  'depositExperience',
   'requires_approval',
   'interactive',
   'path',
+  'file_path',
+  'offset',
   'content',
   'diff',
   'regex',
@@ -74,7 +81,13 @@ export const toolParamNames = [
   'todos',
   'name',
   'file_name',
-  'summary'
+  'summary',
+  'skill_name',
+  'description',
+  'query',
+  'max_results',
+  'extract_mode',
+  'max_chars'
 ] as const
 
 export type ToolParamName = (typeof toolParamNames)[number]

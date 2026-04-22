@@ -147,14 +147,18 @@
 import { ref, onMounted, computed, watch } from 'vue'
 import { notification } from 'ant-design-vue'
 import { marked } from 'marked'
+import { sanitizeHtml } from '@/utils/sanitize'
 import eventBus from '@/utils/eventBus'
 
 import i18n from '@/locales'
 import { listPluginVersions, getPluginIconUrl } from '@/api/plugin/plugin'
+import { convertFileLocalResourceSrc } from '@/utils/convertFileLocalResourceSrc'
 import { usePluginStore } from './usePlugins' //
 
 const api = (window as any).api
 const { t } = i18n.global
+
+const logger = createRendererLogger('extensions')
 
 const props = defineProps({
   pluginInfo: {
@@ -240,13 +244,13 @@ const updateIconSrc = async () => {
     try {
       iconUrl.value = await getPluginIconUrl(item.id, item.version)
     } catch (e) {
-      console.error('load icon failed', e)
+      logger.error('Load icon failed', { error: e })
       iconUrl.value = ''
     }
     return
   }
 
-  iconUrl.value = item.iconUrl ? convertFileSrc(item.iconUrl) : ''
+  iconUrl.value = item.iconUrl ? convertFileLocalResourceSrc(item.iconUrl) : ''
 }
 
 const loadPluginDetails = async () => {
@@ -312,8 +316,8 @@ const loadPluginDetails = async () => {
 }
 watch(
   [pluginId, () => pluginMeta.value?.installedVersion],
-  ([id, installedVersion], [oldId, oldInstalledVersion]) => {
-    console.log('watch details', { id, installedVersion, oldId, oldInstalledVersion })
+  ([id, installedVersion]) => {
+    logger.debug('Plugin details watch triggered', { id: String(id), installedVersion: String(installedVersion) })
     if (!id) return
     loadPluginDetails()
   },
@@ -392,7 +396,7 @@ const renderedReadme = computed(() => {
     gfm: true,
     breaks: true
   })
-  return marked.parse(plugin.value.readme)
+  return sanitizeHtml(marked.parse(plugin.value.readme))
 })
 
 const formatSize = (size?: number | string | null) => {
@@ -419,21 +423,6 @@ const formatSize = (size?: number | string | null) => {
   return `${value} ${units[unitIndex]}`
 }
 
-const convertFileSrc = (path: string | null): string => {
-  if (!path || path.startsWith('http') || path.startsWith('data:')) {
-    return path || ''
-  }
-
-  let cleanPath = path
-  if (path.startsWith('file:///')) {
-    cleanPath = path.slice(8)
-  } else if (path.startsWith('file://')) {
-    cleanPath = path.slice(7)
-  }
-
-  return `local-resource://${cleanPath}`
-}
-
 const getIconSrc = (item: typeof plugin.value) => {
   if (item.id === '' || item.version === '') {
     return ''
@@ -442,7 +431,7 @@ const getIconSrc = (item: typeof plugin.value) => {
     return iconUrl.value
   }
 
-  return convertFileSrc(item.iconUrl)
+  return convertFileLocalResourceSrc(item.iconUrl)
 }
 onMounted(() => {
   loadPluginDetails()

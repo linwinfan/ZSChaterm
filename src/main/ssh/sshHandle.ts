@@ -3,10 +3,9 @@ import { Client } from 'ssh2'
 import type { SFTPWrapper } from 'ssh2'
 import { spawn } from 'child_process'
 import { Duplex } from 'stream'
+import * as net from 'net'
 import type { CommandGenerationContext } from '@shared/WebviewMessage'
-
-// Move the import to after the function definition to avoid circular dependency
-import { detectShellType, ShellType } from './agentHandle'
+const logger = createLogger('ssh')
 
 function safeAppPath(): string {
   try {
@@ -29,7 +28,7 @@ try {
     packageInfo = JSON.parse(fs.readFileSync(fallbackPath, 'utf8'))
   }
 } catch (error) {
-  console.error('Failed to read package.json:', error)
+  logger.warn('Failed to read package.json', { event: 'ssh.config', error: error })
   // Provide a default packageInfo object if both paths fail
   packageInfo = { name: 'chaterm', version: 'unknown' }
 }
@@ -44,14 +43,23 @@ import {
   jumpserverMarkedCommands,
   jumpserverConnectionStatus,
   jumpserverLastCommand,
-  createJumpServerExecStream
+  createJumpServerExecStream,
+  executeCommandOnJumpServerExec,
+  jumpserverSessionPids
 } from './jumpserverHandle'
 import path from 'path'
 import fs from 'fs'
 import { SSHAgentManager } from './ssh-agent/ChatermSSHAgent'
+import { randomUUID } from 'crypto'
 import { getAlgorithmsByAssetType } from './algorithms'
 import { connectBastionByType, shellBastionSession, resizeBastionSession, writeBastionSession, disconnectBastionSession } from './bastionPlugin'
+
 import { connectRdp } from './rdp'
+import { shouldSkipPostConnectProbe } from './postConnectProbePolicy'
+import { sftpConnectionInfoMap } from './sftpTransfer'
+
+// Maximum buffer size before forcing an immediate flush (prevents unbounded growth during bulk output)
+const MAX_BUFFER_SIZE = 64 * 1024 // 64KB
 
 // Hybrid buffer strategy configuration
 const FLUSH_CONFIG = {
@@ -88,12 +96,19 @@ interface ReusableConnection {
   port: number
   username: string
   hasMfaAuth: boolean // Flag indicating whether MFA authentication has been completed
+  isWakeupConnection?: boolean // Whether this pool record is from wakeup flow
+  wakeupTabId?: string // Unique wakeup tab identifier (xshell-xxx)
+  createdAt: number // Used to pick the newest reusable wakeup connection
 }
-const sshConnectionPool = new Map<string, ReusableConnection>()
+export const sshConnectionPool = new Map<string, ReusableConnection>()
 
 // Generate unique key for connection pool
-const getConnectionPoolKey = (host: string, port: number, username: string): string => {
+export const getConnectionPoolKey = (host: string, port: number, username: string): string => {
   return `${host}:${port}:${username}`
+}
+
+export const getWakeupConnectionPoolKey = (host: string, port: number, username: string, wakeupTabId: string): string => {
+  return `${getConnectionPoolKey(host, port, username)}:wakeup:${wakeupTabId}`
 }
 
 interface SftpConnectionInfo {
@@ -118,8 +133,586 @@ const markedCommands = new Map()
 const KeyboardInteractiveAttempts = new Map()
 export const connectionStatus = new Map()
 
+export const sshSessionPids = new Map<string, number>()
+
+type TunnelType = 'local_forward' | 'remote_forward' | 'dynamic_socks'
+
+type SshTunnelStartPayload = {
+  connectionId: string
+  tunnelId: string
+  type: TunnelType
+  localPort: number
+  remotePort?: number
+}
+
+type SshTunnelStopPayload = {
+  tunnelId: string
+}
+
+interface ActiveSshTunnel {
+  tunnelId: string
+  connectionId: string
+  type: TunnelType
+  localPort: number
+  remotePort?: number
+  server?: net.Server
+  sockets: Set<net.Socket>
+  streams: Set<Duplex>
+  remoteTcpHandler?: (details: any, accept: () => Duplex | undefined, reject: () => void) => void
+}
+
+const sshTunnels = new Map<string, ActiveSshTunnel>()
+const sshTunnelIdsByConnection = new Map<string, Set<string>>()
+const SSH_LOCALHOST = 'localhost'
+const LOOPBACK_IPV4 = '127.0.0.1'
+const LOOPBACK_IPV6 = '::1'
+
+const addTunnelConnectionIndex = (connectionId: string, tunnelId: string) => {
+  if (!connectionId || !tunnelId) return
+  if (!sshTunnelIdsByConnection.has(connectionId)) {
+    sshTunnelIdsByConnection.set(connectionId, new Set())
+  }
+  sshTunnelIdsByConnection.get(connectionId)?.add(tunnelId)
+}
+
+const removeTunnelConnectionIndex = (connectionId: string, tunnelId: string) => {
+  const set = sshTunnelIdsByConnection.get(connectionId)
+  if (!set) return
+  set.delete(tunnelId)
+  if (set.size === 0) {
+    sshTunnelIdsByConnection.delete(connectionId)
+  }
+}
+
+const closeTunnelResources = (tunnel: ActiveSshTunnel) => {
+  tunnel.server?.close()
+  tunnel.server = undefined
+
+  for (const socket of tunnel.sockets) {
+    try {
+      socket.destroy()
+    } catch {}
+  }
+  tunnel.sockets.clear()
+
+  for (const stream of tunnel.streams) {
+    try {
+      stream.destroy()
+    } catch {}
+  }
+  tunnel.streams.clear()
+}
+
+const cleanupTunnel = async (tunnelId: string): Promise<void> => {
+  const tunnel = sshTunnels.get(tunnelId)
+  if (!tunnel) return
+
+  const conn = sshConnections.get(tunnel.connectionId) as Client | undefined
+
+  if (tunnel.type === 'remote_forward' && conn && tunnel.remotePort) {
+    if (tunnel.remoteTcpHandler) {
+      conn.off('tcp connection', tunnel.remoteTcpHandler as any)
+      tunnel.remoteTcpHandler = undefined
+    }
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        try {
+          conn.unforwardIn(SSH_LOCALHOST, tunnel.remotePort as number, () => resolve())
+        } catch {
+          resolve()
+        }
+      }),
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 1500)
+      })
+    ])
+  }
+
+  closeTunnelResources(tunnel)
+  sshTunnels.delete(tunnelId)
+  removeTunnelConnectionIndex(tunnel.connectionId, tunnelId)
+}
+
+const cleanupTunnelsByConnection = async (connectionId: string): Promise<void> => {
+  const tunnelIds = sshTunnelIdsByConnection.get(connectionId)
+  if (!tunnelIds || tunnelIds.size === 0) return
+  for (const tunnelId of [...tunnelIds]) {
+    await cleanupTunnel(tunnelId)
+  }
+}
+
+const createTunnelEntry = (payload: SshTunnelStartPayload): ActiveSshTunnel => {
+  return {
+    tunnelId: payload.tunnelId,
+    connectionId: payload.connectionId,
+    type: payload.type,
+    localPort: payload.localPort,
+    remotePort: payload.remotePort,
+    sockets: new Set<net.Socket>(),
+    streams: new Set<Duplex>()
+  }
+}
+
+const isIpv6LoopbackUnavailable = (err: unknown): boolean => {
+  const code = String((err as NodeJS.ErrnoException | undefined)?.code || '')
+  return code === 'EAFNOSUPPORT' || code === 'EADDRNOTAVAIL'
+}
+
+const listenServer = (server: net.Server, options: net.ListenOptions): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    const onError = (err: Error) => {
+      server.off('listening', onListening)
+      reject(err)
+    }
+    const onListening = () => {
+      server.off('error', onError)
+      resolve()
+    }
+    server.once('error', onError)
+    server.once('listening', onListening)
+    server.listen(options)
+  })
+}
+
+const listenLocalServer = (server: net.Server, port: number): Promise<void> => {
+  return listenServer(server, { port, host: LOOPBACK_IPV6, ipv6Only: false }).catch(async (err) => {
+    if (!isIpv6LoopbackUnavailable(err)) {
+      throw err
+    }
+    await listenServer(server, { port, host: LOOPBACK_IPV4 })
+  })
+}
+
+const startLocalForwardTunnel = async (conn: Client, tunnel: ActiveSshTunnel): Promise<void> => {
+  const remotePort = tunnel.remotePort
+  if (!remotePort) {
+    throw new Error('remotePort is required for local_forward tunnel')
+  }
+
+  const server = net.createServer((socket) => {
+    tunnel.sockets.add(socket)
+    socket.once('close', () => tunnel.sockets.delete(socket))
+
+    const srcHost = socket.remoteAddress || '127.0.0.1'
+    const srcPort = socket.remotePort || 0
+    conn.forwardOut(srcHost, srcPort, SSH_LOCALHOST, remotePort, (err, stream) => {
+      if (err || !stream) {
+        socket.destroy()
+        return
+      }
+
+      const sshStream = stream as unknown as Duplex
+      tunnel.streams.add(sshStream)
+      sshStream.once('close', () => tunnel.streams.delete(sshStream))
+
+      socket.pipe(sshStream).pipe(socket)
+
+      socket.on('error', () => sshStream.destroy())
+      sshStream.on('error', () => socket.destroy())
+    })
+  })
+
+  tunnel.server = server
+  await listenLocalServer(server, tunnel.localPort)
+}
+
+const startRemoteForwardTunnel = async (conn: Client, tunnel: ActiveSshTunnel): Promise<void> => {
+  const remotePort = tunnel.remotePort
+  if (!remotePort) {
+    throw new Error('remotePort is required for remote_forward tunnel')
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    conn.forwardIn(SSH_LOCALHOST, remotePort, (err) => {
+      if (err) {
+        reject(err)
+        return
+      }
+      resolve()
+    })
+  })
+
+  const tcpHandler = (details: any, accept: () => Duplex | undefined, reject: () => void) => {
+    if (details?.destPort !== remotePort) {
+      return
+    }
+
+    const sshStream = accept()
+    if (!sshStream) {
+      reject()
+      return
+    }
+
+    tunnel.streams.add(sshStream)
+    sshStream.once('close', () => tunnel.streams.delete(sshStream))
+
+    const localSocket = net.connect({ host: SSH_LOCALHOST, port: tunnel.localPort })
+    tunnel.sockets.add(localSocket)
+    localSocket.once('close', () => tunnel.sockets.delete(localSocket))
+
+    localSocket.pipe(sshStream).pipe(localSocket)
+
+    localSocket.on('error', () => sshStream.destroy())
+    sshStream.on('error', () => localSocket.destroy())
+  }
+
+  tunnel.remoteTcpHandler = tcpHandler
+  conn.on('tcp connection', tcpHandler as any)
+}
+
+type SocksParseResult =
+  | { status: 'incomplete' }
+  | { status: 'error'; replyCode: number }
+  | { status: 'ok'; host: string; port: number; consumed: number }
+
+const formatIPv6FromBuffer = (buf: Buffer): string => {
+  const blocks: string[] = []
+  for (let i = 0; i < 16; i += 2) {
+    blocks.push(buf.readUInt16BE(i).toString(16))
+  }
+  return blocks.join(':')
+}
+
+const parseSocks5ConnectRequest = (buffer: Buffer): SocksParseResult => {
+  if (buffer.length < 4) return { status: 'incomplete' }
+
+  const ver = buffer[0]
+  const cmd = buffer[1]
+  const atyp = buffer[3]
+  if (ver !== 0x05) return { status: 'error', replyCode: 0x01 }
+  if (cmd !== 0x01) return { status: 'error', replyCode: 0x07 }
+
+  let offset = 4
+  let host = ''
+
+  if (atyp === 0x01) {
+    if (buffer.length < offset + 4 + 2) return { status: 'incomplete' }
+    host = `${buffer[offset]}.${buffer[offset + 1]}.${buffer[offset + 2]}.${buffer[offset + 3]}`
+    offset += 4
+  } else if (atyp === 0x03) {
+    if (buffer.length < offset + 1) return { status: 'incomplete' }
+    const domainLength = buffer[offset]
+    offset += 1
+    if (buffer.length < offset + domainLength + 2) return { status: 'incomplete' }
+    host = buffer.subarray(offset, offset + domainLength).toString('utf8')
+    offset += domainLength
+  } else if (atyp === 0x04) {
+    if (buffer.length < offset + 16 + 2) return { status: 'incomplete' }
+    host = formatIPv6FromBuffer(buffer.subarray(offset, offset + 16))
+    offset += 16
+  } else {
+    return { status: 'error', replyCode: 0x08 }
+  }
+
+  const port = buffer.readUInt16BE(offset)
+  offset += 2
+
+  return {
+    status: 'ok',
+    host,
+    port,
+    consumed: offset
+  }
+}
+
+const startDynamicSocksTunnel = async (conn: Client, tunnel: ActiveSshTunnel): Promise<void> => {
+  const server = net.createServer((socket) => {
+    tunnel.sockets.add(socket)
+    socket.once('close', () => tunnel.sockets.delete(socket))
+
+    let stage: 'greeting' | 'request' | 'proxy' | 'connecting' = 'greeting'
+    let pending = Buffer.alloc(0)
+
+    const writeFailureReply = (replyCode: number) => {
+      socket.write(Buffer.from([0x05, replyCode, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
+    }
+
+    const handleData = (chunk: Buffer) => {
+      if (stage === 'connecting') {
+        pending = Buffer.concat([pending, chunk])
+        return
+      }
+
+      pending = Buffer.concat([pending, chunk])
+
+      if (stage === 'greeting') {
+        if (pending.length < 2) return
+        const nMethods = pending[1]
+        if (pending.length < 2 + nMethods) return
+        const methods = pending.subarray(2, 2 + nMethods)
+        if (!methods.includes(0x00)) {
+          socket.end(Buffer.from([0x05, 0xff]))
+          return
+        }
+        socket.write(Buffer.from([0x05, 0x00]))
+        pending = pending.subarray(2 + nMethods)
+        stage = 'request'
+      }
+
+      if (stage !== 'request') return
+
+      const parsed = parseSocks5ConnectRequest(pending)
+      if (parsed.status === 'incomplete') return
+      if (parsed.status === 'error') {
+        writeFailureReply(parsed.replyCode)
+        socket.destroy()
+        return
+      }
+
+      const rest = pending.subarray(parsed.consumed)
+      pending = Buffer.alloc(0)
+      stage = 'connecting'
+
+      const srcHost = socket.remoteAddress || '127.0.0.1'
+      const srcPort = socket.remotePort || 0
+
+      conn.forwardOut(srcHost, srcPort, parsed.host, parsed.port, (err, stream) => {
+        if (err || !stream) {
+          writeFailureReply(0x01)
+          socket.destroy()
+          return
+        }
+
+        const sshStream = stream as unknown as Duplex
+        tunnel.streams.add(sshStream)
+        sshStream.once('close', () => tunnel.streams.delete(sshStream))
+        stage = 'proxy'
+
+        socket.off('data', handleData)
+        socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
+
+        if (rest.length > 0) {
+          sshStream.write(rest)
+        }
+        if (pending.length > 0) {
+          sshStream.write(pending)
+          pending = Buffer.alloc(0)
+        }
+
+        socket.pipe(sshStream).pipe(socket)
+
+        socket.on('error', () => sshStream.destroy())
+        sshStream.on('error', () => socket.destroy())
+      })
+    }
+
+    socket.on('data', handleData)
+  })
+
+  tunnel.server = server
+  await listenLocalServer(server, tunnel.localPort)
+}
+
+const startSshTunnel = async (payload: SshTunnelStartPayload): Promise<{ success: boolean; error?: string }> => {
+  const connectionId = String(payload.connectionId || '')
+  const tunnelId = String(payload.tunnelId || '')
+  const type = payload.type
+  const localPort = Number(payload.localPort)
+  const remotePort = payload.remotePort === undefined ? undefined : Number(payload.remotePort)
+
+  if (!connectionId || !tunnelId) {
+    return { success: false, error: 'Invalid tunnel parameters' }
+  }
+  if (!Number.isInteger(localPort) || localPort <= 0 || localPort > 65535) {
+    return { success: false, error: 'Invalid local port' }
+  }
+  if (
+    (type === 'local_forward' || type === 'remote_forward') &&
+    (!Number.isInteger(remotePort) || (remotePort as number) <= 0 || (remotePort as number) > 65535)
+  ) {
+    return { success: false, error: 'Invalid remote port' }
+  }
+
+  const conn = sshConnections.get(connectionId) as Client | undefined
+  if (!conn) {
+    return { success: false, error: 'SSH connection not found' }
+  }
+
+  const existing = sshTunnels.get(tunnelId)
+  if (existing) {
+    await cleanupTunnel(tunnelId)
+  }
+
+  const tunnel = createTunnelEntry({
+    ...payload,
+    localPort,
+    remotePort
+  })
+
+  try {
+    if (type === 'local_forward') {
+      await startLocalForwardTunnel(conn, tunnel)
+    } else if (type === 'remote_forward') {
+      await startRemoteForwardTunnel(conn, tunnel)
+    } else {
+      await startDynamicSocksTunnel(conn, tunnel)
+    }
+
+    sshTunnels.set(tunnelId, tunnel)
+    addTunnelConnectionIndex(connectionId, tunnelId)
+    logger.info('SSH tunnel started', {
+      event: 'ssh.tunnel.start',
+      connectionId,
+      tunnelId,
+      type,
+      localPort,
+      remotePort
+    })
+    return { success: true }
+  } catch (error) {
+    closeTunnelResources(tunnel)
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    logger.error('SSH tunnel start failed', {
+      event: 'ssh.tunnel.start.error',
+      connectionId,
+      tunnelId,
+      type,
+      error: errorMessage
+    })
+    return { success: false, error: errorMessage }
+  }
+}
+
+// Track how a shell session ended so renderer can decide whether to auto reconnect.
+type ShellCloseReason = 'manual' | 'network' | 'unknown'
+
+type ShellCloseInfoPayload = {
+  reason: ShellCloseReason
+  isNetworkDisconnect: boolean
+  errorCode?: string
+  errorMessage?: string
+}
+
+const manualDisconnectSessions = new Set<string>()
+// Per-session close metadata consumed once when shell close is emitted to renderer.
+const lastConnectionErrorBySession = new Map<string, { errorCode?: string; errorMessage?: string; isNetwork: boolean }>()
+const pendingShellCloseInfoBySession = new Map<string, ShellCloseInfoPayload>()
+
+// Known socket/network error codes that indicate network interruption.
+const NETWORK_ERROR_CODES = new Set([
+  'ETIMEDOUT',
+  'ECONNRESET',
+  'ECONNABORTED',
+  'EPIPE',
+  'ENETDOWN',
+  'ENETUNREACH',
+  'EHOSTDOWN',
+  'EHOSTUNREACH',
+  'ECONNREFUSED'
+])
+
+// Message pattern fallback for errors that do not expose a stable error code.
+const NETWORK_ERROR_PATTERNS = [
+  /timed out/i,
+  /keepalive/i,
+  /connection lost/i,
+  /connection reset/i,
+  /socket hang up/i,
+  /network is unreachable/i,
+  /not reachable/i,
+  /broken pipe/i
+]
+
+// Classify whether an SSH/connect error is likely caused by network break.
+const isLikelyNetworkDisconnect = (err: any): boolean => {
+  const code = String(err?.code || err?.errno || '').toUpperCase()
+  const message = String(err?.message || '')
+
+  if (code && NETWORK_ERROR_CODES.has(code)) {
+    return true
+  }
+
+  return NETWORK_ERROR_PATTERNS.some((pattern) => pattern.test(message))
+}
+
+// Cache close reason so shell close IPC can report a precise disconnect reason.
+const setPendingShellCloseInfo = (sessionId: string, info: ShellCloseInfoPayload) => {
+  if (!sessionId) return
+  pendingShellCloseInfoBySession.set(sessionId, info)
+  logger.info('Pending shell close info updated', {
+    event: 'ssh.shell.close.pending',
+    connectionId: sessionId,
+    reason: info.reason,
+    isNetworkDisconnect: info.isNetworkDisconnect,
+    errorCode: info.errorCode,
+    errorMessage: info.errorMessage
+  })
+}
+
+// Record the latest connection failure for later close/end event classification.
+const recordSessionConnectionError = (sessionId: string, err: any) => {
+  if (!sessionId) return
+  const errorCode = String(err?.code || err?.errno || '').toUpperCase() || undefined
+  const errorMessage = String(err?.message || '').trim() || undefined
+  const isNetwork = isLikelyNetworkDisconnect(err)
+
+  lastConnectionErrorBySession.set(sessionId, {
+    errorCode,
+    errorMessage,
+    isNetwork
+  })
+
+  setPendingShellCloseInfo(sessionId, {
+    reason: isNetwork ? 'network' : 'unknown',
+    isNetworkDisconnect: isNetwork,
+    errorCode,
+    errorMessage
+  })
+
+  logger.info('Session connection error recorded', {
+    event: 'ssh.session.error.recorded',
+    connectionId: sessionId,
+    errorCode,
+    errorMessage,
+    isNetworkDisconnect: isNetwork
+  })
+}
+
+// Clear reconnect-related transient state for a session.
+const clearSessionConnectionState = (sessionId: string) => {
+  if (!sessionId) return
+  manualDisconnectSessions.delete(sessionId)
+  lastConnectionErrorBySession.delete(sessionId)
+  pendingShellCloseInfoBySession.delete(sessionId)
+}
+
+// Consume close metadata once to prevent duplicate reconnect decisions.
+const consumeShellCloseInfo = (sessionId: string): ShellCloseInfoPayload => {
+  if (!sessionId) {
+    return { reason: 'unknown', isNetworkDisconnect: false }
+  }
+
+  if (manualDisconnectSessions.has(sessionId)) {
+    clearSessionConnectionState(sessionId)
+    return {
+      reason: 'manual',
+      isNetworkDisconnect: false
+    }
+  }
+
+  const pending = pendingShellCloseInfoBySession.get(sessionId)
+  if (pending) {
+    pendingShellCloseInfoBySession.delete(sessionId)
+    lastConnectionErrorBySession.delete(sessionId)
+    return pending
+  }
+
+  const lastError = lastConnectionErrorBySession.get(sessionId)
+  if (lastError) {
+    lastConnectionErrorBySession.delete(sessionId)
+    return {
+      reason: lastError.isNetwork ? 'network' : 'unknown',
+      isNetworkDisconnect: lastError.isNetwork,
+      errorCode: lastError.errorCode,
+      errorMessage: lastError.errorMessage
+    }
+  }
+
+  return { reason: 'unknown', isNetworkDisconnect: false }
+}
+
 // Set KeyboardInteractive authentication timeout (milliseconds)
-const KeyboardInteractiveTimeout = 300000 // 5 minutes timeout
+export const KeyboardInteractiveTimeout = 300000 // 5 minutes timeout
 const MaxKeyboardInteractiveAttempts = 5 // Max KeyboardInteractive attempts
 
 const EventEmitter = require('events')
@@ -128,13 +721,43 @@ const connectionEvents = new EventEmitter()
 // Cache
 export const keyboardInteractiveOpts = new Map<string, string[]>()
 
-export const getReusableSshConnection = (host: string, port: number, username: string) => {
-  const poolKey = getConnectionPoolKey(host, port, username)
-  const reusableConn = sshConnectionPool.get(poolKey)
-  if (!reusableConn || !reusableConn.hasMfaAuth) {
+const pickLatestReusablePoolEntry = (entries: Array<[string, ReusableConnection]>): [string, ReusableConnection] | null => {
+  if (entries.length === 0) return null
+
+  let selected = entries[0]
+  for (const current of entries) {
+    if ((current[1].createdAt || 0) > (selected[1].createdAt || 0)) {
+      selected = current
+    }
+  }
+  return selected
+}
+
+export const getReusableSshConnection = (host: string, port: number, username: string, options?: { wakeupTabId?: string }) => {
+  const normalizedPort = port || 22
+  const requestedWakeupTabId = typeof options?.wakeupTabId === 'string' ? options.wakeupTabId.trim() : ''
+  const matchedEntries: Array<[string, ReusableConnection]> = []
+
+  for (const [key, entry] of sshConnectionPool) {
+    if (!entry?.hasMfaAuth) continue
+    if (entry.host !== host || entry.port !== normalizedPort || entry.username !== username) continue
+    matchedEntries.push([key, entry])
+  }
+
+  if (matchedEntries.length === 0) {
     return null
   }
 
+  // Non-wakeup requests must only hit non-wakeup pool entries.
+  // Wakeup requests (wakeupTabId provided) must only hit exact wakeup entries.
+  const selectedEntries = requestedWakeupTabId
+    ? matchedEntries.filter(([, entry]) => entry.isWakeupConnection && entry.wakeupTabId === requestedWakeupTabId)
+    : matchedEntries.filter(([, entry]) => !entry.isWakeupConnection)
+
+  const selected = pickLatestReusablePoolEntry(selectedEntries)
+  if (!selected) return null
+
+  const [poolKey, reusableConn] = selected
   const client = reusableConn.conn as Client | undefined
   if (!client || (client as any)?._sock?.destroyed) {
     sshConnectionPool.delete(poolKey)
@@ -151,6 +774,61 @@ export const registerReusableSshSession = (poolKey: string, sessionId: string) =
   const reusableConn = sshConnectionPool.get(poolKey)
   if (reusableConn) {
     reusableConn.sessions.add(sessionId)
+  }
+}
+
+// ============================================================================
+// Wakeup Agent Reuse — Pool Entry & Lookup
+// ============================================================================
+// Technical route (wakeup connection pooling for agent reuse):
+//
+//   Xshell wakeup -> renderer openTerminalFromXshellWakeup -> currentClickServer(node)
+//   -> sshConnect.vue sets wakeupSource on connectionInfo
+//   -> handleAttemptConnection conn.on('ready') detects wakeupSource
+//   -> saves connection to sshConnectionPool with hasMfaAuth:true
+//   -> agent later calls findWakeupConnectionInfoByHost(hostIP) to locate the pooled connection
+//
+// Why not SSH exec: Wakeup bastion servers intercept exec channels as tunnels;
+// command arguments are ignored. Only conn.shell() + marker extraction works.
+//
+// Key constraint: wakeup connections use password auth (not keyboard-interactive),
+// so the pool-save condition checks `connectionInfo.wakeupSource` in addition to
+// the original `keyboardInteractiveOpts.has(id)` check.
+// ============================================================================
+
+// Find a wakeup (MFA-authed) connection in the pool by host IP.
+// Returns { host, port, username } so the agent can build a ConnectionInfo
+// when the asset UUID is not in the database (wakeup-created tabs).
+export const findWakeupConnectionInfoByHost = (
+  host: string,
+  options?: { wakeupTabId?: string }
+): { host: string; port: number; username: string; wakeupTabId?: string } | null => {
+  const requestedWakeupTabId = typeof options?.wakeupTabId === 'string' ? options.wakeupTabId.trim() : ''
+  const matchedEntries: Array<[string, ReusableConnection]> = []
+
+  for (const [key, entry] of sshConnectionPool) {
+    if (!entry.hasMfaAuth || !entry.isWakeupConnection || entry.host !== host) continue
+
+    const client = entry.conn as Client | undefined
+    if (!client || (client as any)?._sock?.destroyed) {
+      sshConnectionPool.delete(key)
+      continue
+    }
+    matchedEntries.push([key, entry])
+  }
+
+  if (matchedEntries.length === 0) return null
+
+  const exactWakeupEntries = requestedWakeupTabId ? matchedEntries.filter(([, entry]) => entry.wakeupTabId === requestedWakeupTabId) : []
+  const selected = pickLatestReusablePoolEntry(exactWakeupEntries.length > 0 ? exactWakeupEntries : matchedEntries)
+  if (!selected) return null
+
+  const [, entry] = selected
+  return {
+    host: entry.host,
+    port: entry.port,
+    username: entry.username,
+    wakeupTabId: entry.wakeupTabId
   }
 }
 
@@ -243,8 +921,8 @@ export const handleRequestKeyboardInteractive = (event, id, prompts, finish) => 
   })
 }
 
-export const attemptSecondaryConnection = async (event, connectionInfo, ident) => {
-  const { id, host, port, username, password, privateKey, passphrase, needProxy, proxyConfig, asset_type } = connectionInfo
+export const attemptSecondaryConnection = async (event, connectionInfo, existingConn?: Client) => {
+  const { id, asset_type } = connectionInfo
 
   // Check if this is a network switch connection
   const isSwitch = asset_type?.startsWith('person-switch-')
@@ -265,173 +943,82 @@ export const attemptSecondaryConnection = async (event, connectionInfo, ident) =
     return
   }
 
-  const conn = new Client()
-  const algorithms = getAlgorithmsByAssetType(asset_type)
-  const connectConfig: any = {
-    host,
-    port: port || 22,
-    username,
-    keepaliveInterval: 10000,
-    readyTimeout: KeyboardInteractiveTimeout,
-    ident: ident,
-    algorithms
-  }
-
-  if (privateKey) {
-    connectConfig.privateKey = privateKey
-    if (passphrase) connectConfig.passphrase = passphrase
-  } else if (password) {
-    connectConfig.password = password
-  }
-
-  if (needProxy) {
-    console.log('proxyConfig:', proxyConfig)
-    connectConfig.sock = await createProxySocket(proxyConfig, host, port)
-  }
-
-  // Send initialization command result
-  const readyResult: {
-    hasSudo?: boolean
-    commandList?: string[]
-  } = {}
-
-  let execCount = 0
-  const totalCounts = 2
-  const hasOpt = keyboardInteractiveOpts.has(id)
-  const sendReadyData = (stopCount) => {
-    execCount++
-    if (execCount === totalCounts || stopCount) {
-      event.sender.send(`ssh:connect:data:${id}`, readyResult)
-      if (hasOpt) {
-        keyboardInteractiveOpts.delete(id)
-      }
+  if (shouldSkipPostConnectProbe(connectionInfo)) {
+    const readyResult = {
+      hasSudo: false,
+      commandList: []
     }
-  }
-
-  if (hasOpt) {
-    connectConfig.tryKeyboard = true
-    conn.on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
-      const cached = keyboardInteractiveOpts.get(id)
-      finish(cached || [])
+    event.sender.send(`ssh:connect:data:${id}`, readyResult)
+    if (keyboardInteractiveOpts.has(id)) {
+      keyboardInteractiveOpts.delete(id)
+    }
+    logger.info('Skip post-connect probe for wakeup/direct session', {
+      event: 'ssh.connect.probe.skip',
+      connectionId: id,
+      source: connectionInfo?.wakeupSource || connectionInfo?.source || 'unknown'
     })
+    return
   }
 
-  const sftpAsync = (conn) => {
-    return new Promise<void>((resolve) => {
-      conn.sftp((err, sftp) => {
-        if (err || !sftp) {
-          console.log(`SFTPCheckError [${id}]`, err)
-          connectionStatus.set(id, {
-            sftpAvailable: false,
-            sftpError: err?.message || 'SFTP object is empty'
-          })
-          sftpConnections.set(id, { isSuccess: false, error: `sftp init error: "${err?.message || 'SFTP object is empty'}"` })
-          resolve()
-        } else {
-          console.log(`startSftp [${id}]`)
-          sftp.readdir('.', (readDirErr) => {
-            if (readDirErr) {
-              console.log(`SFTPCheckFailed [${id}]`)
-              connectionStatus.set(id, {
-                sftpAvailable: false,
-                sftpError: readDirErr.message
-              })
-              sftp.end()
-            } else {
-              console.log(`SFTPCheckSuccess [${id}]`)
-              sftpConnections.set(id, { isSuccess: true, sftp: sftp })
-              connectionStatus.set(id, { sftpAvailable: true })
-            }
-            resolve()
-          })
-        }
-      })
-    })
-  }
+  const readyResult: { hasSudo?: boolean; commandList?: string[] } = {}
+  if (existingConn) {
+    try {
+      await initSftpOnConnection(existingConn, id, connectionInfo)
+    } catch {
+      connectionStatus.set(id, { sftpAvailable: false, sftpError: 'SFTP connection failed' })
+    }
 
-  conn
-    .on('ready', async () => {
-      // Perform sftp check
-      try {
-        await sftpAsync(conn)
-      } catch (e) {
-        connectionStatus.set(id, {
-          sftpAvailable: false,
-          sftpError: 'SFTP connection failed'
-        })
-      }
-
-      // Perform cmd check
-      try {
+    // cmd list
+    const cmdCheck = () =>
+      new Promise<void>((resolve) => {
         let stdout = ''
         let stderr = ''
-        conn.exec(
+        existingConn.exec(
           'sh -c \'if command -v bash >/dev/null 2>&1; then bash -lc "compgen -A builtin; compgen -A command"; bash -ic "compgen -A alias" 2>/dev/null; else IFS=:; for d in $PATH; do [ -d "$d" ] || continue; for f in "$d"/*; do [ -x "$f" ] && printf "%s\\n" "${f##*/}"; done; done; fi\' | sort -u',
           (err, stream) => {
             if (err) {
               readyResult.commandList = []
-              sendReadyData(false)
-            } else {
-              stream
-                .on('data', (data: Buffer) => {
-                  stdout += data.toString('utf8')
-                })
-                .stderr.on('data', (data: Buffer) => {
-                  stderr += data.toString('utf8')
-                })
-                .on('close', () => {
-                  if (stderr) {
-                    readyResult.commandList = []
-                  } else {
-                    readyResult.commandList = stdout.split('\n').filter(Boolean)
-                  }
-                  sendReadyData(false)
-                })
+              resolve()
+              return
             }
+            stream
+              .on('data', (data: Buffer) => (stdout += data.toString('utf8')))
+              .stderr.on('data', (data: Buffer) => (stderr += data.toString('utf8')))
+            stream.on('close', () => {
+              readyResult.commandList = stderr ? [] : stdout.split('\n').filter(Boolean)
+              resolve()
+            })
           }
         )
-      } catch (e) {
-        readyResult.commandList = []
-        sendReadyData(false)
-      }
+      })
 
-      // Perform sudo check
-      try {
-        conn.exec('sudo -n true 2>/dev/null && echo true || echo false', (err, stream) => {
+    // sudo check
+    const sudoCheck = () =>
+      new Promise<void>((resolve) => {
+        existingConn.exec('sudo -n true 2>/dev/null && echo true || echo false', (err, stream) => {
           if (err) {
             readyResult.hasSudo = false
-            sendReadyData(false)
-          } else {
-            stream
-              .on('data', (data: Buffer) => {
-                const result = data.toString('utf8').trim()
-                readyResult.hasSudo = result === 'true'
-              })
-              .stderr.on('data', () => {
-                readyResult.hasSudo = false
-              })
-              .on('close', () => {
-                sendReadyData(false)
-              })
+            resolve()
+            return
           }
+          stream
+            .on('data', (data: Buffer) => {
+              readyResult.hasSudo = data.toString('utf8').trim() === 'true'
+            })
+            .stderr.on('data', () => {
+              readyResult.hasSudo = false
+            })
+          stream.on('close', () => resolve())
         })
-      } catch (e) {
-        readyResult.hasSudo = false
-        sendReadyData(false)
-      }
-    })
-    .on('error', (err) => {
-      sftpConnections.set(id, { isSuccess: false, error: `sftp connection error: "${err.message}"` })
-      readyResult.hasSudo = false
-      readyResult.commandList = []
-      sendReadyData(true)
-      connectionStatus.set(id, {
-        sftpAvailable: false,
-        sftpError: err.message
       })
-    })
-  sshConnections.set(id + '-second', conn) // Save connection object
-  conn.connect(connectConfig)
+
+    await Promise.allSettled([cmdCheck(), sudoCheck()])
+    event.sender.send(`ssh:connect:data:${id}`, readyResult)
+    if (keyboardInteractiveOpts.has(id)) {
+      keyboardInteractiveOpts.delete(id)
+    }
+    return
+  }
 }
 
 function splitCommand(cmd: string): string[] {
@@ -537,40 +1124,54 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
     proxyCommand
   } = connectionInfo
   retryCount++
+  clearSessionConnectionState(id)
+
+  logger.info('Starting SSH connection attempt', {
+    event: 'ssh.connect.start',
+    connectionId: id,
+    port: port || 22,
+    attempt: retryCount
+  })
 
   connectionStatus.set(id, { isVerified: false }) // Update connection status
   const identToken = connIdentToken ? `_t=${connIdentToken}` : ''
   const ident = `${packageInfo.name}_${packageInfo.version}` + identToken
 
-  // Check connection reuse pool: only attempt reuse when using keyboard-interactive authentication
-  const poolKey = getConnectionPoolKey(host, port || 22, username)
-  const reusableConn = sshConnectionPool.get(poolKey)
+  const isWakeupConnectionRequest = !!connectionInfo.wakeupSource
+  const shouldBypassPoolReuse = connectionInfo?.disablePoolReuse === true || connectionInfo?.wakeupNewTab === true || isWakeupConnectionRequest
 
-  if (reusableConn && reusableConn.hasMfaAuth) {
-    console.log(`[SSH Reuse] Detected reusable MFA connection: ${poolKey}`)
+  // Check connection reuse pool unless this request explicitly disables reuse.
+  if (!shouldBypassPoolReuse) {
+    const reusable = getReusableSshConnection(host, port || 22, username, {
+      wakeupTabId: connectionInfo?.wakeupTabId
+    })
+    if (reusable) {
+      logger.info('Detected reusable MFA connection', { event: 'ssh.reuse', connectionId: id })
 
-    // Use existing connection
-    const conn = reusableConn.conn
+      // Use existing connection
+      const conn = reusable.conn
 
-    // Mark current session as connected
-    sshConnections.set(id, conn)
-    connectionStatus.set(id, { isVerified: true })
-    reusableConn.sessions.add(id)
+      // Mark current session as connected
+      sshConnections.set(id, conn)
+      connectionStatus.set(id, { isVerified: true })
+      registerReusableSshSession(reusable.poolKey, id)
 
-    // Trigger connection success event
-    connectionEvents.emit(`connection-status-changed:${id}`, { isVerified: true })
+      // Trigger connection success event
+      connectionEvents.emit(`connection-status-changed:${id}`, { isVerified: true })
 
-    // Execute secondary connection (sudo check, SFTP, etc.)
-    attemptSecondaryConnection(event, connectionInfo, ident)
+      // Execute secondary connection (sudo check, SFTP, etc.)
+      attemptSecondaryConnection(event, connectionInfo, conn)
 
-    console.log(`[SSH Reuse] Successfully reused connection, skipping MFA authentication`)
-    resolve({ status: 'connected', message: 'Connection successful (reused)' })
-    return
+      logger.info('Successfully reused MFA connection', { event: 'ssh.reuse.success', connectionId: id })
+      resolve({ status: 'connected', message: 'Connection successful (reused)' })
+      return
+    }
   }
 
   const conn = new Client()
 
   conn.on('ready', () => {
+    clearSessionConnectionState(id)
     sshConnections.set(id, conn) // Save connection object
     connectionStatus.set(id, { isVerified: true })
     connectionEvents.emit(`connection-status-changed:${id}`, { isVerified: true })
@@ -578,11 +1179,19 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
     // Check if keyboard-interactive authentication was used
     // Must check before attemptSecondaryConnection as it will clear keyboardInteractiveOpts
     const hasKeyboardInteractive = keyboardInteractiveOpts.has(id)
+    const isWakeupConnection = !!connectionInfo.wakeupSource
+    const wakeupTabId = typeof connectionInfo?.wakeupTabId === 'string' ? connectionInfo.wakeupTabId.trim() : ''
+    const shouldSaveToPool = hasKeyboardInteractive || isWakeupConnection
 
-    // If keyboard-interactive authentication was used, immediately save to connection pool for future reuse
-    if (hasKeyboardInteractive) {
-      const poolKey = getConnectionPoolKey(host, port || 22, username)
-      console.log(`[SSH Connection Pool] Saving MFA authenticated connection: ${poolKey}`)
+    // Save to connection pool for future agent reuse when:
+    // 1. keyboard-interactive (MFA/OTP) authentication was used, OR
+    // 2. this is a wakeup connection (password auth but needs agent reuse)
+    if (shouldSaveToPool) {
+      const poolKey =
+        isWakeupConnection && wakeupTabId
+          ? getWakeupConnectionPoolKey(host, port || 22, username, wakeupTabId)
+          : getConnectionPoolKey(host, port || 22, username)
+      logger.info('Saving connection to pool', { event: 'ssh.pool.save', reason: isWakeupConnection ? 'wakeup' : 'keyboard-interactive' })
 
       sshConnectionPool.set(poolKey, {
         conn: conn,
@@ -590,33 +1199,42 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
         host: host,
         port: port || 22,
         username: username,
-        hasMfaAuth: true
+        hasMfaAuth: true,
+        isWakeupConnection: isWakeupConnection,
+        wakeupTabId: isWakeupConnection ? wakeupTabId || undefined : undefined,
+        createdAt: Date.now()
       })
 
       // Listen for connection close event to clean up connection pool
       conn.on('close', () => {
-        console.log(`[SSH Connection Pool] Connection closed, cleaning up reuse pool: ${poolKey}`)
+        logger.info('Pooled connection closed, cleaning up', { event: 'ssh.pool.cleanup' })
         sshConnectionPool.delete(poolKey)
       })
 
       conn.on('error', (err) => {
-        console.error(`[SSH Connection Pool] Connection error, cleaning up reuse pool: ${poolKey}`, err.message)
+        logger.error('Pooled connection error, cleaning up', { event: 'ssh.pool.error', error: err.message })
         sshConnectionPool.delete(poolKey)
       })
     }
 
     // Execute secondary connection (this will clear keyboardInteractiveOpts, so must be placed after the check)
-    attemptSecondaryConnection(event, connectionInfo, ident)
+    attemptSecondaryConnection(event, connectionInfo, conn)
 
+    logger.info('SSH connection established', {
+      event: 'ssh.connect.success',
+      connectionId: id,
+      port: port || 22
+    })
     resolve({ status: 'connected', message: 'Connection successful' })
   })
 
   conn.on('error', (err) => {
+    recordSessionConnectionError(id, err)
     connectionStatus.set(id, { isVerified: false })
 
     connectionEvents.emit(`connection-status-changed:${id}`, { isVerified: false })
     if (err.level === 'client-authentication' && KeyboardInteractiveAttempts.has(id)) {
-      console.log('Authentication failed. Retrying...')
+      logger.info('Authentication failed, retrying', { event: 'ssh.auth.retry', connectionId: id, retryCount })
 
       if (retryCount < MaxKeyboardInteractiveAttempts) {
         handleAttemptConnection(event, connectionInfo, resolve, reject, retryCount)
@@ -624,7 +1242,7 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
         reject(new Error('Maximum retries reached, authentication failed'))
       }
     } else {
-      console.log('Connection error:', err)
+      logger.error('SSH connection error', { event: 'ssh.error', connectionId: id, error: err.message })
       reject(new Error(err.message))
     }
   })
@@ -636,6 +1254,7 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
     port: port || 22,
     username,
     keepaliveInterval: 10000, // Keep connection alive
+    keepaliveCountMax: 3,
     tryKeyboard: true, // Enable keyboard interactive authentication
     readyTimeout: KeyboardInteractiveTimeout, // Connection timeout, 30 seconds
     algorithms
@@ -656,7 +1275,7 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
       await handleRequestKeyboardInteractive(event, id, prompts, finish)
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err)
-      console.log('SSH keyboard-interactive error:', errorMessage)
+      logger.warn('SSH keyboard-interactive error', { event: 'ssh.keyboard-interactive.error', connectionId: id, error: errorMessage })
 
       // Only close connection when max retries exceeded, user cancelled, or timeout
       if (errorMessage.includes('Maximum authentication attempts') || errorMessage.includes('cancelled') || errorMessage.includes('timed out')) {
@@ -696,9 +1315,71 @@ const handleAttemptConnection = async (event, connectionInfo, resolve, reject, r
     }
     conn.connect(connectConfig) // Attempt to connect
   } catch (err) {
-    console.error('Connection configuration error:', err)
+    logger.error('Connection configuration error', { event: 'ssh.config.error', error: err })
     reject(new Error(`Connection configuration error: ${err}`))
   }
+
+  // Classify unexpected transport close and preserve reason for renderer reconnect logic.
+  conn.on('close', () => {
+    void cleanupTunnelsByConnection(id)
+
+    if (manualDisconnectSessions.has(id)) {
+      logger.info('SSH connection close ignored (manual disconnect)', {
+        event: 'ssh.conn.close.manual',
+        connectionId: id
+      })
+      return
+    }
+
+    const existing = pendingShellCloseInfoBySession.get(id)
+    if (existing) {
+      return
+    }
+
+    const lastError = lastConnectionErrorBySession.get(id)
+    setPendingShellCloseInfo(id, {
+      reason: lastError?.isNetwork ? 'network' : 'unknown',
+      isNetworkDisconnect: !!lastError?.isNetwork,
+      errorCode: lastError?.errorCode,
+      errorMessage: lastError?.errorMessage || 'SSH connection closed'
+    })
+    logger.info('SSH connection close captured', {
+      event: 'ssh.conn.close',
+      connectionId: id,
+      hasLastError: !!lastError
+    })
+  })
+
+  // Some network drops surface as "end"; handle it the same as "close".
+  conn.on('end', () => {
+    void cleanupTunnelsByConnection(id)
+
+    if (manualDisconnectSessions.has(id)) {
+      logger.info('SSH connection end ignored (manual disconnect)', {
+        event: 'ssh.conn.end.manual',
+        connectionId: id
+      })
+      return
+    }
+
+    const existing = pendingShellCloseInfoBySession.get(id)
+    if (existing) {
+      return
+    }
+
+    const lastError = lastConnectionErrorBySession.get(id)
+    setPendingShellCloseInfo(id, {
+      reason: lastError?.isNetwork ? 'network' : 'unknown',
+      isNetworkDisconnect: !!lastError?.isNetwork,
+      errorCode: lastError?.errorCode,
+      errorMessage: lastError?.errorMessage || 'SSH connection ended'
+    })
+    logger.info('SSH connection end captured', {
+      event: 'ssh.conn.end',
+      connectionId: id,
+      hasLastError: !!lastError
+    })
+  })
 }
 export const getUniqueRemoteName = async (sftp: SFTPWrapper, remoteDir: string, originalName: string, isDir: boolean): Promise<string> => {
   const list = await new Promise<{ filename: string; longname: string; attrs: any }[]>((resolve, reject) => {
@@ -722,16 +1403,44 @@ export const getUniqueRemoteName = async (sftp: SFTPWrapper, remoteDir: string, 
   return finalName
 }
 
+const findReusableSftpRecord = (id: string): any => {
+  const direct = sftpConnections.get(id)
+  if (direct) return direct
+
+  if (!id) return null
+
+  const prefix = id.substring(0, id.lastIndexOf(':') + 1)
+
+  for (const [existingId, existingRecord] of sftpConnections.entries()) {
+    const sessionPart = existingId.substring(existingId.lastIndexOf(':') + 1)
+    if (existingId.startsWith(prefix) && sessionPart.startsWith('files-')) {
+      return existingRecord
+    }
+  }
+
+  for (const [existingId, existingRecord] of sftpConnections.entries()) {
+    if (existingId.startsWith(prefix)) {
+      return existingRecord
+    }
+  }
+
+  return null
+}
+
 export const getSftpConnection = (id: string): any => {
-  const sftpConnectionInfo = sftpConnections.get(id)
+  const sftpConnectionInfo = findReusableSftpRecord(id)
 
   if (!sftpConnectionInfo) {
-    console.log('Sftp connection not found')
+    logger.debug('SFTP connection not found', { event: 'ssh.sftp.notfound', connectionId: id })
     return null
   }
 
   if (!sftpConnectionInfo.isSuccess || !sftpConnectionInfo.sftp) {
-    console.log(`SFTP not available: ${sftpConnectionInfo.error || 'Unknown error'}`)
+    logger.debug('SFTP not available', {
+      event: 'ssh.sftp.unavailable',
+      connectionId: id,
+      error: sftpConnectionInfo.error || 'Unknown error'
+    })
     return null
   }
 
@@ -744,17 +1453,18 @@ export const cleanSftpConnection = (id) => {
     const sftp = getSftpConnection(id)
     sftp.end()
     sftpConnections.delete(id)
-    if (sshConnections.get(id + '-second')) {
-      const connSec = sshConnections.get(id + '-second')
-      connSec.end()
-      sshConnections.delete(id + '-second')
-    }
+    // if (sshConnections.get(id + '-second')) {
+    //   const connSec = sshConnections.get(id + '-second')
+    //   connSec.end()
+    //   sshConnections.delete(id + '-second')
+    // }
   }
 }
 
 export const registerSSHHandlers = () => {
   // Handle connection
   ipcMain.handle('ssh:connect', async (_event, connectionInfo) => {
+
     const { sshType, asset_type } = connectionInfo
     console.log('[ssh:connect] Received connection request:', { sshType, asset_type, host: connectionInfo.host })
 
@@ -771,6 +1481,20 @@ export const registerSSHHandlers = () => {
       console.log('[ssh:connect] RDP handler returned:', rdpResult)
       return { status: 'connected', ...rdpResult }
     }
+    //const { sshType } = connectionInfo
+    logger.info('Received SSH connect request', {
+      event: 'ssh.connect.request',
+      connectionId: connectionInfo?.id,
+      sshType: sshType || 'ssh',
+      port: connectionInfo?.port || 22,
+      source: connectionInfo?.source || 'unknown',
+      wakeupSource: connectionInfo?.wakeupSource || 'unknown',
+      disablePostConnectProbe: connectionInfo?.disablePostConnectProbe === true,
+      needProxy: connectionInfo?.needProxy === true,
+      hasProxyCommand: !!connectionInfo?.proxyCommand,
+      hasPassword: typeof connectionInfo?.password === 'string' && connectionInfo.password.length > 0,
+      hasPrivateKey: typeof connectionInfo?.privateKey === 'string' && connectionInfo.privateKey.length > 0
+    })
 
     if (sshType === 'jumpserver') {
       // Route to JumpServer connection
@@ -778,6 +1502,11 @@ export const registerSSHHandlers = () => {
         const result = await handleJumpServerConnection(connectionInfo, _event)
         return result
       } catch (error: unknown) {
+        logger.error('JumpServer connection request failed', {
+          event: 'ssh.connect.jumpserver.error',
+          connectionId: connectionInfo?.id,
+          error: error
+        })
         return buildErrorResponse(error)
       }
     }
@@ -794,6 +1523,33 @@ export const registerSSHHandlers = () => {
     })
   })
 
+  ipcMain.handle('ssh:tunnel:start', async (_event, payload: SshTunnelStartPayload) => {
+    return startSshTunnel(payload)
+  })
+
+  ipcMain.handle('ssh:tunnel:stop', async (_event, payload: SshTunnelStopPayload) => {
+    const tunnelId = String(payload?.tunnelId || '')
+    if (!tunnelId) {
+      return { success: false, error: 'Invalid tunnelId' }
+    }
+    try {
+      await cleanupTunnel(tunnelId)
+      logger.info('SSH tunnel stopped', {
+        event: 'ssh.tunnel.stop',
+        tunnelId
+      })
+      return { success: true }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      logger.error('SSH tunnel stop failed', {
+        event: 'ssh.tunnel.stop.error',
+        tunnelId,
+        error: errorMessage
+      })
+      return { success: false, error: errorMessage }
+    }
+  })
+
   ipcMain.handle('ssh:sftp:conn:check', async (_event, { id }) => {
     if (connectionStatus.has(id)) {
       const status = connectionStatus.get(id)
@@ -802,7 +1558,7 @@ export const registerSSHHandlers = () => {
     return false
   })
 
-  ipcMain.handle('ssh:shell', async (event, { id, terminalType }) => {
+  ipcMain.handle('ssh:shell', async (event, { id, terminalType, cols, rows }) => {
     // Check if it's a JumpServer connection
     if (jumpserverConnections.has(id)) {
       // Use JumpServer shell handling
@@ -814,14 +1570,16 @@ export const registerSSHHandlers = () => {
       // Clear old listeners
       stream.removeAllListeners('data')
 
-      let buffer = ''
+      let bufferChunks: string[] = []
+      let bufferLength = 0
       let flushTimer: NodeJS.Timeout | null = null
       let rawChunks: Buffer[] = []
       let rawBytes = 0
       const flushBuffer = () => {
-        if (!buffer && rawBytes === 0) return
-        const chunk = buffer
-        buffer = ''
+        if (!bufferLength && rawBytes === 0) return
+        const chunk = bufferChunks.join('')
+        bufferChunks = []
+        bufferLength = 0
         const raw = rawBytes ? Buffer.concat(rawChunks, rawBytes) : undefined
 
         rawChunks = []
@@ -831,19 +1589,24 @@ export const registerSSHHandlers = () => {
       }
 
       const scheduleFlush = () => {
-        // Clear existing timer to prevent multiple timers
-        if (flushTimer) {
-          clearTimeout(flushTimer)
+        // Force immediate flush when buffer exceeds max size to prevent unbounded growth
+        if (bufferLength >= MAX_BUFFER_SIZE) {
+          if (flushTimer) {
+            clearTimeout(flushTimer)
+            flushTimer = null
+          }
+          flushBuffer()
+          return
         }
 
-        const delay = getDelayByBufferSize(buffer.length)
-
-        if (delay === 0) {
-          // Send immediately for small data (likely user input)
-          flushBuffer()
-        } else {
-          // Schedule delayed flush for larger data
-          flushTimer = setTimeout(flushBuffer, delay)
+        // Only start a new timer if one is not already pending (prevents timer starvation)
+        if (!flushTimer) {
+          const delay = getDelayByBufferSize(bufferLength)
+          if (delay === 0) {
+            flushBuffer()
+          } else {
+            flushTimer = setTimeout(flushBuffer, delay)
+          }
         }
       }
 
@@ -856,8 +1619,9 @@ export const registerSSHHandlers = () => {
         if (dataStr.includes('[Host]>') && lastCommand && exitCommands.includes(lastCommand)) {
           jumpserverLastCommand.delete(id)
           stream.write('q\r', (err) => {
-            if (err) console.error(`[JumpServer ${id}] Failed to send "q":`, err)
-            else console.log(`[JumpServer ${id}] Sent "q" to terminate session.`)
+            if (err)
+              logger.error('Failed to send quit command to JumpServer', { event: 'jumpserver.quit.error', connectionId: id, error: err.message })
+            else logger.debug('Sent quit command to JumpServer session', { event: 'jumpserver.quit', connectionId: id })
             stream.end()
             const connData = jumpserverConnections.get(id)
             connData?.conn?.end()
@@ -896,7 +1660,8 @@ export const registerSSHHandlers = () => {
           // Only add to shared buffer for non-marked data
           rawChunks.push(data)
           rawBytes += data.length
-          buffer += dataStr
+          bufferChunks.push(dataStr)
+          bufferLength += dataStr.length
           scheduleFlush()
         }
       })
@@ -907,7 +1672,7 @@ export const registerSSHHandlers = () => {
 
       stream.on('close', () => {
         flushBuffer()
-        console.log(`JumpServer shell stream closed for id=${id}`)
+        logger.debug('JumpServer shell stream closed', { event: 'jumpserver.stream.close', connectionId: id })
         event.sender.send(`ssh:shell:close:${id}`)
         jumpserverShellStreams.delete(id)
       })
@@ -932,18 +1697,27 @@ export const registerSSHHandlers = () => {
 
     const isConnected = () => conn && conn['_sock'] && !conn['_sock'].destroyed
 
+    // Build pty options with initial window size when available
+    const ptyOpts: Record<string, unknown> = { term: termType }
+    if (cols && rows) {
+      ptyOpts.cols = cols
+      ptyOpts.rows = rows
+    }
+
     const handleStream = (stream, method: 'shell' | 'exec') => {
       shellStreams.set(id, stream)
 
-      let buffer = ''
+      let bufferChunks: string[] = []
+      let bufferLength = 0
       let flushTimer: NodeJS.Timeout | null = null
       let rawChunks: Buffer[] = []
       let rawBytes = 0
       const flushBuffer = () => {
-        if (!buffer && rawBytes === 0) return
+        if (!bufferLength && rawBytes === 0) return
 
-        const chunk = buffer
-        buffer = ''
+        const chunk = bufferChunks.join('')
+        bufferChunks = []
+        bufferLength = 0
 
         const raw = rawBytes ? Buffer.concat(rawChunks, rawBytes) : undefined
 
@@ -954,19 +1728,24 @@ export const registerSSHHandlers = () => {
       }
 
       const scheduleFlush = () => {
-        // Clear existing timer to prevent multiple timers
-        if (flushTimer) {
-          clearTimeout(flushTimer)
+        // Force immediate flush when buffer exceeds max size to prevent unbounded growth
+        if (bufferLength >= MAX_BUFFER_SIZE) {
+          if (flushTimer) {
+            clearTimeout(flushTimer)
+            flushTimer = null
+          }
+          flushBuffer()
+          return
         }
 
-        const delay = getDelayByBufferSize(buffer.length)
-
-        if (delay === 0) {
-          // Send immediately for small data (likely user input)
-          flushBuffer()
-        } else {
-          // Schedule delayed flush for larger data
-          flushTimer = setTimeout(flushBuffer, delay)
+        // Only start a new timer if one is not already pending (prevents timer starvation)
+        if (!flushTimer) {
+          const delay = getDelayByBufferSize(bufferLength)
+          if (delay === 0) {
+            flushBuffer()
+          } else {
+            flushTimer = setTimeout(flushBuffer, delay)
+          }
         }
       }
 
@@ -996,7 +1775,8 @@ export const registerSSHHandlers = () => {
           // Only add to shared buffer for non-marked data
           rawChunks.push(data)
           rawBytes += data.length
-          buffer += chunk
+          bufferChunks.push(chunk)
+          bufferLength += chunk.length
           scheduleFlush()
         }
       })
@@ -1005,10 +1785,23 @@ export const registerSSHHandlers = () => {
         event.sender.send(`ssh:shell:stderr:${id}`, data.toString('utf8'))
       })
 
+      stream.on('error', (err) => {
+        recordSessionConnectionError(id, err)
+      })
+
       stream.on('close', () => {
         flushBuffer()
-        console.log(`Shell stream closed for id=${id} (${method})`)
-        event.sender.send(`ssh:shell:close:${id}`)
+        const closeInfo = consumeShellCloseInfo(id)
+        logger.info('Shell stream closed', {
+          event: 'ssh.stream.close',
+          connectionId: id,
+          method,
+          closeReason: closeInfo.reason,
+          isNetworkDisconnect: closeInfo.isNetworkDisconnect,
+          errorCode: closeInfo.errorCode,
+          errorMessage: closeInfo.errorMessage
+        })
+        event.sender.send(`ssh:shell:close:${id}`, closeInfo)
         shellStreams.delete(id)
       })
     }
@@ -1021,11 +1814,11 @@ export const registerSSHHandlers = () => {
 
       conn.exec(cmd, { pty: true }, (execErr, execStream) => {
         if (execErr) {
-          console.warn(`[${id}] exec(${cmd}) Failed: ${execErr.message}`)
+          logger.warn('Shell exec fallback failed', { event: 'ssh.exec.failed', connectionId: id, cmd, error: execErr.message })
           return tryExecFallback(rest, resolve, reject)
         }
 
-        console.info(`[${id}] use exec(${cmd}) Successfully started the terminal`)
+        logger.info('Terminal started via exec fallback', { event: 'ssh.exec.success', connectionId: id, cmd })
         handleStream(execStream, 'exec')
         resolve({ status: 'success', message: `The terminal has been started（exec:${cmd}）` })
       })
@@ -1037,13 +1830,13 @@ export const registerSSHHandlers = () => {
       setTimeout(() => {
         if (!isConnected()) return reject(new Error('The connection has been disconnected after a delay'))
 
-        conn.shell({ term: termType }, (err, stream) => {
+        conn.shell(ptyOpts, (err, stream) => {
           if (err) {
-            console.warn(`[${id}] shell() start error: ${err.message}`)
+            logger.warn('Shell start error, falling back to exec', { event: 'ssh.shell.error', connectionId: id, error: err.message })
             return tryExecFallback(fallbackExecs, resolve, reject)
           }
 
-          console.info(`[${id}] shell() Successfully started`)
+          logger.info('Shell started successfully', { event: 'ssh.shell.success', connectionId: id })
           handleStream(stream, 'shell')
           resolve({ status: 'success', message: 'Shell has started' })
         })
@@ -1123,7 +1916,7 @@ export const registerSSHHandlers = () => {
           stream.write(data)
         }
       } else {
-        console.warn('Attempting to write to non-existent JumpServer stream:', id)
+        logger.warn('Attempting to write to non-existent JumpServer stream', { event: 'jumpserver.write.notfound', connectionId: id })
       }
       return
     }
@@ -1135,7 +1928,6 @@ export const registerSSHHandlers = () => {
     // Default SSH handling
     const stream = shellStreams.get(id)
     if (stream) {
-      // console.log(`ssh:shell:write (default) raw data: "${data}"`)
       // For default SSH connections, don't detect exit commands, let terminal handle exit naturally
       if (markedCommands.has(id)) {
         markedCommands.delete(id)
@@ -1160,7 +1952,7 @@ export const registerSSHHandlers = () => {
         stream.write(data)
       }
     } else {
-      console.warn('Attempting to write to non-existent stream:', id)
+      logger.warn('Attempting to write to non-existent stream', { event: 'ssh.write.notfound', connectionId: id })
     }
   })
 
@@ -1207,88 +1999,7 @@ export const registerSSHHandlers = () => {
       }
     }
 
-    return new Promise((resolve) => {
-      const timestamp = Date.now()
-      const marker = `__CHATERM_EXEC_END_${timestamp}__`
-      const exitCodeMarker = `__CHATERM_EXIT_CODE_${timestamp}__`
-      let outputBuffer = ''
-      let timeoutHandle: NodeJS.Timeout
-
-      // Output listener
-      const dataHandler = (data: Buffer) => {
-        outputBuffer += data.toString('utf8')
-
-        // End marker detected
-        if (outputBuffer.includes(marker)) {
-          cleanup()
-
-          try {
-            // Extract output content (remove command echo and markers)
-            const lines = outputBuffer.split('\n')
-
-            // Find command line position (command echo)
-            const commandIndex = lines.findIndex((line) => line.trim().includes(cmd.trim()))
-
-            // Find end marker position
-            const markerIndex = lines.findIndex((line) => line.includes(marker))
-
-            // Extract command output (between command line and marker)
-            const outputLines = lines.slice(commandIndex + 1, markerIndex)
-            const stdout = outputLines.join('\n').trim()
-
-            // Extract exit code (from content after exitCodeMarker)
-            const exitCodePattern = new RegExp(`${exitCodeMarker}(\\d+)`)
-            const exitCodeMatch = outputBuffer.match(exitCodePattern)
-            const exitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : 0
-
-            resolve({
-              success: exitCode === 0,
-              stdout,
-              stderr: '',
-              exitCode,
-              exitSignal: undefined
-            })
-          } catch (parseError) {
-            // Return raw output on parse failure
-            resolve({
-              success: false,
-              error: `Failed to parse command output: ${parseError}`,
-              stdout: outputBuffer,
-              stderr: '',
-              exitCode: undefined,
-              exitSignal: undefined
-            })
-          }
-        }
-      }
-
-      // Cleanup function
-      const cleanup = () => {
-        execStream.removeListener('data', dataHandler)
-        clearTimeout(timeoutHandle)
-      }
-
-      // Timeout protection (30 seconds)
-      timeoutHandle = setTimeout(() => {
-        cleanup()
-        resolve({
-          success: false,
-          error: 'Command execution timeout (30s)',
-          stdout: outputBuffer,
-          stderr: '',
-          exitCode: undefined,
-          exitSignal: undefined
-        })
-      }, 30000)
-
-      // Register listener
-      execStream.on('data', dataHandler)
-
-      // Send command (capture exit code)
-      // Use bash trick: command; echo marker; echo exitcode_marker$?
-      const fullCommand = `${cmd}; echo "${marker}"; echo "${exitCodeMarker}$?"\r`
-      execStream.write(fullCommand)
-    })
+    return executeCommandOnJumpServerExec(execStream, cmd)
   }
 
   ipcMain.handle('ssh:conn:exec', async (_event, { id, cmd }) => {
@@ -1376,7 +2087,70 @@ export const registerSSHHandlers = () => {
     })
   })
 
+  ipcMain.handle('ssh:fork-session', async (_event, { sourceConnectionId, newConnectionId, host, port, username }) => {
+    logger.info('Received SSH fork-session request', {
+      event: 'ssh.fork-session.start',
+      sourceConnectionId,
+      newConnectionId
+    })
+
+    const conn = sshConnections.get(sourceConnectionId)
+    if (!conn) {
+      logger.warn('Source connection not found for fork', { event: 'ssh.fork-session.notfound', sourceConnectionId })
+      return { status: 'error', message: 'Source connection not found' }
+    }
+
+    // Verify the underlying socket is still alive
+    if (conn._sock && conn._sock.destroyed) {
+      logger.warn('Source connection socket is destroyed', { event: 'ssh.fork-session.destroyed', sourceConnectionId })
+      return { status: 'error', message: 'Source connection is no longer active' }
+    }
+
+    // Register the new session with the same underlying connection
+    sshConnections.set(newConnectionId, conn)
+    connectionStatus.set(newConnectionId, { isVerified: true })
+
+    // Register in connection pool for proper reference counting on disconnect
+    let foundInPool = false
+    sshConnectionPool.forEach((value) => {
+      if (value.conn === conn) {
+        value.sessions.add(newConnectionId)
+        foundInPool = true
+      }
+    })
+
+    if (!foundInPool) {
+      // Create a new pool entry for tracking; hasMfaAuth=false prevents getReusableSshConnection from reusing it
+      const poolKey = getConnectionPoolKey(host, port || 22, username)
+      const forkPoolKey = `fork:${poolKey}:${Date.now()}`
+      sshConnectionPool.set(forkPoolKey, {
+        conn,
+        sessions: new Set([sourceConnectionId, newConnectionId]),
+        host,
+        port: port || 22,
+        username,
+        hasMfaAuth: false,
+        isWakeupConnection: false,
+        createdAt: Date.now()
+      })
+    }
+
+    logger.info('SSH fork-session successful', {
+      event: 'ssh.fork-session.success',
+      sourceConnectionId,
+      newConnectionId
+    })
+    return { status: 'connected' }
+  })
+
   ipcMain.handle('ssh:disconnect', async (_event, { id }) => {
+    logger.info('Received SSH disconnect request', {
+      event: 'ssh.disconnect.start',
+      connectionId: id
+    })
+
+    await cleanupTunnelsByConnection(id)
+
     // Check if it's a JumpServer connection
     if (jumpserverConnections.has(id)) {
       const stream = jumpserverShellStreams.get(id)
@@ -1388,7 +2162,7 @@ export const registerSSHHandlers = () => {
       // Clean up exec stream
       const execStream = jumpserverExecStreams.get(id)
       if (execStream) {
-        console.log(`Cleaning up JumpServer exec stream: ${id}`)
+        logger.debug('Cleaning up JumpServer exec stream', { event: 'jumpserver.exec.cleanup', connectionId: id })
         execStream.end()
         jumpserverExecStreams.delete(id)
       }
@@ -1408,17 +2182,28 @@ export const registerSSHHandlers = () => {
 
         // Only close underlying connection when no other sessions are using it
         if (!isConnStillInUse) {
-          console.log(`[JumpServer] All sessions closed, releasing underlying connection: ${id}`)
+          logger.info('All JumpServer sessions closed, releasing underlying connection', { event: 'jumpserver.disconnect', connectionId: id })
           connToClose.end()
         } else {
-          console.log(`[JumpServer] Session disconnected, but underlying connection still in use by other sessions: ${id}`)
+          logger.debug('JumpServer session disconnected, underlying connection still in use', {
+            event: 'jumpserver.disconnect.partial',
+            connectionId: id
+          })
         }
         cleanSftpConnection(id)
         jumpserverConnections.delete(id)
         jumpserverConnectionStatus.delete(id)
+        logger.info('JumpServer session disconnected', {
+          event: 'ssh.disconnect.jumpserver.success',
+          connectionId: id
+        })
         return { status: 'success', message: 'JumpServer connection disconnected' }
       }
 
+      logger.warn('JumpServer disconnect requested for non-existent connection', {
+        event: 'ssh.disconnect.jumpserver.notfound',
+        connectionId: id
+      })
       return { status: 'warning', message: 'No active JumpServer connection' }
     }
 
@@ -1428,6 +2213,16 @@ export const registerSSHHandlers = () => {
     }
 
     // Default SSH handling
+    manualDisconnectSessions.add(id)
+    logger.info('Mark session as manual disconnect', {
+      event: 'ssh.disconnect.manual.mark',
+      connectionId: id
+    })
+    setPendingShellCloseInfo(id, {
+      reason: 'manual',
+      isNetworkDisconnect: false
+    })
+
     const stream = shellStreams.get(id)
     if (stream) {
       stream.end()
@@ -1454,7 +2249,7 @@ export const registerSSHHandlers = () => {
 
         // If no other sessions are using this connection, close connection and clean up pool
         if ((reusableConn as ReusableConnection).sessions.size === 0) {
-          console.log(`[SSH Connection Pool] All sessions closed, releasing connection: ${poolKey}`)
+          logger.info('All SSH pool sessions closed, releasing connection', { event: 'ssh.pool.release' })
           conn.end()
           sshConnectionPool.delete(poolKey)
         }
@@ -1465,8 +2260,18 @@ export const registerSSHHandlers = () => {
       cleanSftpConnection(id)
       sshConnections.delete(id)
       sftpConnections.delete(id)
+      clearSessionConnectionState(id)
+      logger.info('SSH connection disconnected', {
+        event: 'ssh.disconnect.success',
+        connectionId: id
+      })
       return { status: 'success', message: 'Disconnected' }
     }
+    clearSessionConnectionState(id)
+    logger.warn('SSH disconnect requested for non-existent connection', {
+      event: 'ssh.disconnect.notfound',
+      connectionId: id
+    })
     return { status: 'warning', message: 'No active connection' }
   })
 
@@ -1526,11 +2331,11 @@ export const registerSSHHandlers = () => {
     const manager = SSHAgentManager.getInstance()
 
     try {
-      const result = await manager.enableAgent(enabled)
-      console.log('SSH Agent enabled:', result.SSH_AUTH_SOCK)
+      await manager.enableAgent(enabled)
+      logger.info('SSH Agent enabled', { event: 'ssh.agent.enabled' })
       return { success: true }
     } catch (error: any) {
-      console.error('Error in agent:enable-and-configure:', error)
+      logger.error('SSH Agent enable failed', { event: 'ssh.agent.error', error: error?.message })
       return { success: false }
     }
   })
@@ -1541,7 +2346,7 @@ export const registerSSHHandlers = () => {
       const keyId = await manager.addKey(keyData, passphrase, comment)
       return { success: true, keyId }
     } catch (error: any) {
-      console.error('Error in agent:add-key:', error)
+      logger.error('SSH Agent add-key failed', { event: 'ssh.agent.addkey.error', error: error?.message })
       return { success: false, error: error.message }
     }
   })
@@ -1551,7 +2356,7 @@ export const registerSSHHandlers = () => {
       const removeStatus = manager.removeKey(keyId)
       return { success: removeStatus }
     } catch (error: any) {
-      console.error('Error in agent:add-key:', error)
+      logger.error('SSH Agent add-key failed', { event: 'ssh.agent.addkey.error', error: error?.message })
       return { success: false, error: error.message }
     }
   })
@@ -1561,7 +2366,7 @@ export const registerSSHHandlers = () => {
       const keyIdMapList = manager.listKeys()
       return { success: true, keys: keyIdMapList }
     } catch (error: any) {
-      console.error('Error in agent:add-key:', error)
+      logger.error('SSH Agent add-key failed', { event: 'ssh.agent.addkey.error', error: error?.message })
       return { success: false, error: error.message }
     }
   })
@@ -1605,11 +2410,11 @@ export const registerSSHHandlers = () => {
   ipcMain.handle('zmodem:openStream', (_event, savePath) => {
     try {
       const stream = fs.createWriteStream(savePath)
-      const streamId = Math.random().toString(36).slice(2)
+      const streamId = randomUUID()
       activeStreams.set(streamId, stream)
       return streamId
     } catch (err) {
-      console.error('Failed to open stream:', err)
+      logger.error('Failed to open zmodem stream', { event: 'ssh.zmodem.error', error: err })
       return null
     }
   })
@@ -1628,20 +2433,179 @@ export const registerSSHHandlers = () => {
       activeStreams.delete(streamId)
     }
   })
+
+  ipcMain.handle('ssh:shell-pid-set', async (_event, { id }) => {
+    const jumpserverData = jumpserverConnections.get(id)
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+    if (jumpserverData) {
+      await sleep(1500)
+
+      let execStream: any
+      try {
+        execStream = await createJumpServerExecStream(id)
+      } catch {
+        logger.info('Get jumpserver exec stream error')
+        return
+      }
+
+      const pidResult = await executeCommandOnJumpServerExec(execStream, 'echo "__PID__$$\\n__PPID__$PPID"').catch(() => null)
+      logger.info('Get jumpserver pid result', { pidResult })
+
+      if (!pidResult?.success || !pidResult.stdout) return
+
+      const pidMatch = pidResult.stdout.match(/__PID__(\d+)/)
+      const ppidMatch = pidResult.stdout.match(/__PPID__(\d+)/)
+      if (!pidMatch || !ppidMatch) return
+
+      const execPid = parseInt(pidMatch[1])
+      const ppid = parseInt(ppidMatch[1])
+      const psCmd = `ps -o pid=,comm= -p $(ps -o pid= --ppid ${ppid} 2>/dev/null || ps -o pid= -p $(pgrep -P ${ppid} 2>/dev/null) 2>/dev/null) 2>/dev/null`
+
+      for (let i = 0; i < 5; i++) {
+        await new Promise((r) => setTimeout(r, 300))
+        const psResult = await executeCommandOnJumpServerExec(execStream, psCmd).catch(() => null)
+        if (!psResult?.success || !psResult.stdout) continue
+
+        const shellPid =
+          psResult.stdout
+            .replace(/\u001b\[[?]?\d*[a-zA-Z]/g, '')
+            .replace(/\r/g, '')
+            .trim()
+            .split('\n')
+            .map((line) => {
+              const [pid, comm] = line.trim().split(/\s+/)
+              return { pid: parseInt(pid), comm }
+            })
+            .filter((p) => !isNaN(p.pid) && p.pid !== execPid && /bash|sh|zsh|fish|dash|ksh|tcsh|csh/.test(p.comm))
+            .map((p) => p.pid)[0] ?? null
+
+        if (shellPid) {
+          jumpserverSessionPids.set(id, shellPid)
+          logger.info('Shell PID saved', { event: 'ssh.pid.saved', connectionId: id, shellPid })
+          break
+        }
+      }
+      return
+    }
+    const conn = sshConnections.get(id)
+    if (!conn) return
+
+    conn.exec('echo "__PID__$$\\n__PPID__$PPID"', (err, stream) => {
+      if (err) return
+      let output = ''
+      stream.on('data', (data) => (output += data.toString()))
+      stream.on('close', async () => {
+        const pidMatch = output.match(/__PID__(\d+)/)
+        const ppidMatch = output.match(/__PPID__(\d+)/)
+        if (!pidMatch || !ppidMatch) return
+
+        const execPid = parseInt(pidMatch[1])
+        const ppid = parseInt(ppidMatch[1])
+
+        const psCmd = `ps -o pid=,comm= -p $(ps -o pid= --ppid ${ppid} 2>/dev/null || ps -o pid= -p $(pgrep -P ${ppid} 2>/dev/null) 2>/dev/null) 2>/dev/null`
+        for (let i = 0; i < 5; i++) {
+          await new Promise((r) => setTimeout(r, 300))
+          await new Promise<void>((resolve) => {
+            conn.exec(psCmd, (err, stream) => {
+              if (err) return resolve()
+              let out = ''
+              stream.on('data', (data) => (out += data.toString()))
+              stream.on('close', () => {
+                const shellPid =
+                  out
+                    .trim()
+                    .split('\n')
+                    .map((line) => {
+                      const [pid, comm] = line.trim().split(/\s+/)
+                      return { pid: parseInt(pid), comm }
+                    })
+                    .filter((p) => !isNaN(p.pid) && p.pid !== execPid && /bash|sh|zsh|fish|dash|ksh|tcsh|csh/.test(p.comm))
+                    .map((p) => p.pid)[0] ?? null
+
+                if (shellPid) {
+                  sshSessionPids.set(id, shellPid)
+                  logger.info('Shell PID saved', { event: 'ssh.pid.saved', connectionId: id, shellPid })
+                }
+                resolve()
+              })
+            })
+          })
+          if (sshSessionPids.has(id)) break
+        }
+      })
+    })
+  })
+  ipcMain.handle('ssh:cwd:get', async (_event, { id }: { id: string }) => {
+    const isJump = jumpserverConnections.has(id)
+    const shellPid = isJump ? jumpserverSessionPids.get(id) : sshSessionPids.get(id)
+
+    if (!shellPid) {
+      return { success: false, cwd: null, reason: 'shellPid_missing' }
+    }
+
+    const cmd =
+      'pid=' +
+      shellPid +
+      '; while :; do child=$(grep -l "^PPid:[[:space:]]*${pid}$" /proc/[0-9]*/status 2>/dev/null | head -1 | cut -d/ -f3); [ -z "$child" ] && break; pid=$child; done; result=$(readlink /proc/$pid/cwd 2>/dev/null); if [ -z "$result" ]; then result=$(sudo -n readlink /proc/$pid/cwd 2>/dev/null); fi; echo "$result"'
+    let result: any
+    if (jumpserverShellStreams.has(id)) {
+      result = await executeCommandOnJumpServerAsset(id, cmd)
+    } else {
+      const conn = sshConnections.get(id)
+      if (!conn) return { success: false, cwd: null, reason: `no_ssh_conn:${id}` }
+
+      result = await new Promise((resolve) => {
+        conn.exec(cmd, (err, stream) => {
+          if (err) return resolve({ success: false, stdout: '', stderr: err.message, exitCode: 255 })
+          const out: Buffer[] = []
+          const errOut: Buffer[] = []
+          stream.on('data', (c) => out.push(c))
+          stream.stderr.on('data', (c) => errOut.push(c))
+          stream.on('close', (code: number) => {
+            resolve({
+              success: code === 0,
+              stdout: Buffer.concat(out).toString('utf8'),
+              stderr: Buffer.concat(errOut).toString('utf8'),
+              exitCode: code
+            })
+          })
+        })
+      })
+    }
+
+    const stdoutRaw = String(result?.stdout ?? '')
+
+    const stdoutNoAnsi = stdoutRaw.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+
+    const lines = stdoutNoAnsi
+      .replace(/\r/g, '\n')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    const cwd = lines.length ? lines[lines.length - 1] : null
+
+    if (!cwd) {
+      return {
+        success: false,
+        cwd: null,
+        reason: `cwd_unavailable`,
+        shellPid,
+        debug: { isJump, exitCode: result?.exitCode, stdoutRaw, stderr: String(result?.stderr ?? '') }
+      }
+    }
+
+    return { success: true, cwd, shellPid }
+  })
 }
 
 const getSystemInfo = async (id: string): Promise<CommandGenerationContext> => {
-  let conn = sshConnections.get(id)
-  if (!conn) {
-    const connData = jumpserverConnections.get(id)
-    conn = connData?.conn
-  }
-  if (!conn) {
-    throw new Error('No active SSH connection found')
-  }
+  // Import here to avoid circular dependency
+  const { detectShellType, ShellType } = await import('./agentHandle')
 
   // Detect shell type to use appropriate system info script
   const shellType = await detectShellType(id)
+  //const systemInfoScript = `uname -a | sed 's/^/OS_VERSION:/' && echo "DEFAULT_SHELL:$SHELL" && echo "HOME_DIR:$HOME" && hostname | sed 's/^/HOSTNAME:/' && whoami | sed 's/^/USERNAME:/' && (sudo -n true 2>/dev/null && echo "SUDO_CHECK:has sudo permission" || echo "SUDO_CHECK:no sudo permission")`
 
   // Platform-specific system information scripts
   const systemInfoScripts = {
@@ -1667,6 +2631,62 @@ const getSystemInfo = async (id: string): Promise<CommandGenerationContext> => {
     return 'unknown'
   }
 
+  const parseSystemInfoOutput = (output: string): CommandGenerationContext => {
+    const lines = output.trim().split('\n')
+    const result: CommandGenerationContext = {
+      platform: 'unknown',
+      shell: 'bash',
+      osVersion: '',
+      hostname: '',
+      username: '',
+      homeDir: '',
+      sudoPermission: false
+    }
+
+    lines.forEach((line) => {
+      if (line.startsWith('OS_VERSION:')) {
+        result.osVersion = line.replace('OS_VERSION:', '')
+      } else if (line.startsWith('DEFAULT_SHELL:')) {
+        result.shell = line.replace('DEFAULT_SHELL:', '')
+      } else if (line.startsWith('HOME_DIR:')) {
+        result.homeDir = line.replace('HOME_DIR:', '')
+      } else if (line.startsWith('HOSTNAME:')) {
+        result.hostname = line.replace('HOSTNAME:', '')
+      } else if (line.startsWith('USERNAME:')) {
+        result.username = line.replace('USERNAME:', '')
+      } else if (line.startsWith('SUDO_CHECK:')) {
+        result.sudoPermission = line.includes('has sudo permission')
+      }
+    })
+
+    result.platform = inferPlatformFromOsVersion(result.osVersion || '')
+    if (!result.shell) {
+      result.shell = 'bash'
+    }
+
+    return result
+  }
+
+  const isJumpServerConnection = jumpserverConnections.has(id) || jumpserverShellStreams.has(id)
+
+  if (isJumpServerConnection) {
+    const execStream = await createJumpServerExecStream(id)
+    const execResult = await executeCommandOnJumpServerExec(execStream, systemInfoScript)
+    if (!execResult.stdout?.trim()) {
+      throw new Error(execResult.error || 'Failed to get system info from JumpServer exec stream')
+    }
+    return parseSystemInfoOutput(execResult.stdout)
+  }
+
+  let conn = sshConnections.get(id)
+  if (!conn) {
+    const connData = jumpserverConnections.get(id)
+    conn = connData?.conn
+  }
+  if (!conn) {
+    throw new Error('No active SSH connection found')
+  }
+
   return new Promise((resolve, reject) => {
     const ptyConfig = { pty: shellType !== ShellType.POWERSHELL }
     conn.exec(systemInfoScript, ptyConfig, (err, stream) => {
@@ -1689,41 +2709,89 @@ const getSystemInfo = async (id: string): Promise<CommandGenerationContext> => {
         if (stderr) {
           return reject(new Error(stderr))
         }
-
-        const lines = stdout.trim().split('\n')
-        const result: CommandGenerationContext = {
-          platform: 'unknown',
-          shell: 'bash',
-          osVersion: '',
-          hostname: '',
-          username: '',
-          homeDir: '',
-          sudoPermission: false
-        }
-
-        lines.forEach((line) => {
-          if (line.startsWith('OS_VERSION:')) {
-            result.osVersion = line.replace('OS_VERSION:', '')
-          } else if (line.startsWith('DEFAULT_SHELL:')) {
-            result.shell = line.replace('DEFAULT_SHELL:', '')
-          } else if (line.startsWith('HOME_DIR:')) {
-            result.homeDir = line.replace('HOME_DIR:', '')
-          } else if (line.startsWith('HOSTNAME:')) {
-            result.hostname = line.replace('HOSTNAME:', '')
-          } else if (line.startsWith('USERNAME:')) {
-            result.username = line.replace('USERNAME:', '')
-          } else if (line.startsWith('SUDO_CHECK:')) {
-            result.sudoPermission = line.includes('has sudo permission')
-          }
-        })
-
-        result.platform = inferPlatformFromOsVersion(result.osVersion || '', result.shell || '')
-        if (!result.shell) {
-          result.shell = 'bash'
-        }
-
-        resolve(result)
+        resolve(parseSystemInfoOutput(stdout))
       })
     })
+  })
+}
+
+export const pickReconnectConnectionInfo = (connectionInfo: any) => {
+  if (!connectionInfo?.id) return null
+
+  return {
+    id: connectionInfo.id,
+    sshType: connectionInfo.sshType,
+    host: connectionInfo.host,
+    port: connectionInfo.port,
+    username: connectionInfo.username,
+    password: connectionInfo.password,
+    privateKey: connectionInfo.privateKey,
+    passphrase: connectionInfo.passphrase,
+    needProxy: connectionInfo.needProxy,
+    proxyConfig: connectionInfo.proxyConfig,
+    proxyCommand: connectionInfo.proxyCommand,
+    connIdentToken: connectionInfo.connIdentToken,
+    asset_type: connectionInfo.asset_type,
+    assetUuid: connectionInfo.assetUuid,
+    targetIp: connectionInfo.targetIp,
+    terminalType: connectionInfo.terminalType
+  }
+}
+
+export const initSftpOnConnection = (conn: Client, connectionId: string, connectionInfo: any): Promise<void> => {
+  return new Promise<void>((resolve) => {
+    try {
+      conn.sftp((err, sftp) => {
+        if (err || !sftp) {
+          logger.error(`SFTP check error `, { event: 'ssh.shell.sftp', connectionId: connectionId, error: err })
+
+          connectionStatus.set(connectionId, {
+            sftpAvailable: false,
+            sftpError: err?.message || 'SFTP object is empty'
+          })
+
+          sftpConnections.set(connectionId, {
+            isSuccess: false,
+            error: `sftp init error: "${err?.message || 'SFTP object is empty'}"`
+          })
+
+          resolve()
+          return
+        }
+
+        logger.info(`start SFTP `, { event: 'ssh.sftp.start', connectionId: connectionId })
+        sftp.readdir('.', (readDirErr) => {
+          if (readDirErr) {
+            logger.error(`SFTP check failed `, { event: 'ssh.shell.sftp', connectionId: connectionId, error: readDirErr.message })
+
+            connectionStatus.set(connectionId, {
+              sftpAvailable: false,
+              sftpError: readDirErr.message
+            })
+
+            try {
+              sftp.end()
+            } catch {}
+          } else {
+            logger.info(`SFTP check success`, { event: 'ssh.sftp.check', connectionId: connectionId })
+            sftpConnections.set(connectionId, { isSuccess: true, sftp })
+            connectionStatus.set(connectionId, { sftpAvailable: true })
+            const picked = pickReconnectConnectionInfo(connectionInfo)
+            if (picked) {
+              sftpConnectionInfoMap.set(String(connectionId), picked)
+            }
+          }
+          resolve()
+        })
+      })
+    } catch (e: any) {
+      const msg = e?.message || String(e)
+      connectionStatus.set(connectionId, {
+        sftpAvailable: false,
+        sftpError: msg
+      })
+      sftpConnections.set(connectionId, { isSuccess: false, error: `sftp exception: "${msg}"` })
+      resolve()
+    }
   })
 }

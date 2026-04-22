@@ -78,14 +78,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
-import 'xterm/css/xterm.css'
+import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
+import '@xterm/xterm/css/xterm.css'
 import { notification } from 'ant-design-vue'
 import { userConfigStore } from '@/services/userConfigStoreService'
 import eventBus from '@/utils/eventBus'
 import { captureExtensionUsage, ExtensionNames, ExtensionStatus } from '@/utils/telemetry'
 import { useI18n } from 'vue-i18n'
 
+const logger = createRendererLogger('settings.extensions')
 const { t } = useI18n()
 
 const userConfig = ref({
@@ -98,6 +99,7 @@ const userConfig = ref({
 })
 
 const keywordHighlightConfigLoading = ref(false)
+const isApplying = ref(false)
 
 const loadSavedConfig = async () => {
   try {
@@ -110,7 +112,7 @@ const loadSavedConfig = async () => {
       }
     }
   } catch (error) {
-    console.error('Failed to load config:', error)
+    logger.error('Failed to load config', { error: error })
     notification.error({
       message: t('user.loadConfigFailed'),
       description: t('user.loadConfigFailedDescription')
@@ -131,7 +133,7 @@ const saveConfig = async () => {
 
     await userConfigStore.saveConfig(configToStore)
   } catch (error) {
-    console.error('Failed to save config:', error)
+    logger.error('Failed to save config', { error: error })
     notification.error({
       message: t('user.error'),
       description: t('user.saveConfigFailedDescription')
@@ -142,6 +144,7 @@ const saveConfig = async () => {
 watch(
   () => userConfig.value,
   async (newValue, oldValue) => {
+    if (isApplying.value) return
     if (oldValue && newValue.aliasStatus !== oldValue.aliasStatus) {
       return
     }
@@ -151,8 +154,17 @@ watch(
   { deep: true }
 )
 
+const reloadConfigOnSync = async () => {
+  await loadSavedConfig()
+}
+
 onMounted(async () => {
   await loadSavedConfig()
+  eventBus.on('userConfigSyncApplied', reloadConfigOnSync)
+})
+
+onBeforeUnmount(() => {
+  eventBus.off('userConfigSyncApplied', reloadConfigOnSync)
 })
 
 const handleAutoCompleteChange = async (checked) => {
@@ -181,7 +193,7 @@ const handleAliasStatusChange = async (checked) => {
     const status = checked ? ExtensionStatus.ENABLED : ExtensionStatus.DISABLED
     await captureExtensionUsage(ExtensionNames.ALIAS, status)
   } catch (error) {
-    console.error('Failed to save alias status:', error)
+    logger.error('Failed to save alias status', { error: error })
     notification.error({
       message: t('user.error'),
       description: t('user.saveAliasStatusFailed')
@@ -204,7 +216,7 @@ const openKeywordHighlightConfig = async () => {
     // Open tab via eventBus
     eventBus.emit('open-user-tab', 'keywordHighlightEditor')
   } catch (error) {
-    console.error('Failed to open keyword highlight config editor:', error)
+    logger.error('Failed to open keyword highlight config editor', { error: error })
     notification.error({
       message: t('user.error'),
       description: t('user.openConfigFailed')

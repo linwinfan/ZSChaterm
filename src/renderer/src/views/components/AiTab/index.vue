@@ -131,6 +131,7 @@
                 <UserMessage
                   v-if="pair.user"
                   :message="pair.user.message"
+                  :handle-interrupt="handleCancel"
                   @truncate-and-send="handleTruncateAndSend"
                 />
 
@@ -138,7 +139,21 @@
                   v-for="{ message, historyIndex } in pair.assistants"
                   :key="message.id"
                 >
+                  <!-- Context truncation notice - standalone system message -->
                   <div
+                    v-if="message.say === 'context_truncated'"
+                    class="context-truncated-notice"
+                    :class="{ 'is-compressing': isContextTruncationInProgress(message) }"
+                  >
+                    <span class="context-truncated-line" />
+                    <span class="context-truncated-content">
+                      <CompressOutlined class="context-truncated-icon" />
+                      <span>{{ getContextTruncationNotice(message) }}</span>
+                    </span>
+                    <span class="context-truncated-line" />
+                  </div>
+                  <div
+                    v-else
                     class="assistant-message-container"
                     data-testid="ai-message"
                     :class="{
@@ -185,17 +200,34 @@
                             />
                           </template>
                         </a-button>
-                        <a-button
-                          type="text"
-                          class="feedback-btn summarize-btn"
-                          size="small"
-                          :title="$t('ai.summarizeToKnowledge')"
-                          @click="handleSummarizeToKnowledge(message)"
-                        >
-                          <template #icon>
-                            <BookOutlined />
-                          </template>
-                        </a-button>
+                        <a-tooltip :title="$t('ai.summarizeToKnowledge')">
+                          <a-button
+                            type="text"
+                            class="feedback-btn summarize-btn"
+                            size="small"
+                            @click="handleSummarizeToKnowledge(message)"
+                          >
+                            <template #icon>
+                              <BookOutlined />
+                            </template>
+                          </a-button>
+                        </a-tooltip>
+                        <a-tooltip :title="$t('ai.summarizeToSkill')">
+                          <a-button
+                            type="text"
+                            class="feedback-btn summarize-btn"
+                            size="small"
+                            @click="handleSummarizeToSkill(message)"
+                          >
+                            <template #icon>
+                              <img
+                                :src="skillsIcon"
+                                alt="skills"
+                                class="custom-icon"
+                              />
+                            </template>
+                          </a-button>
+                        </a-tooltip>
                       </div>
                     </div>
                     <MarkdownRenderer
@@ -206,6 +238,7 @@
                       :ask="message.ask"
                       :say="message.say"
                       :partial="message.partial"
+                      :message-content-parts="message.contentParts"
                       :executed-command="message.executedCommand"
                       :host-id="message.hostId"
                       :host-name="message.hostName"
@@ -222,6 +255,7 @@
                       :ask="message.ask"
                       :say="message.say"
                       :partial="message.partial"
+                      :message-content-parts="message.contentParts"
                       :executed-command="message.executedCommand"
                       :host-id="message.hostId"
                       :host-name="message.hostName"
@@ -571,23 +605,25 @@
                       <SearchOutlined style="color: #666" />
                     </template>
                   </a-input>
-                  <a-button
-                    size="small"
-                    class="favorites-button"
-                    type="text"
-                    @click="showOnlyFavorites = !showOnlyFavorites"
-                  >
-                    <template #icon>
-                      <StarFilled
-                        v-if="showOnlyFavorites"
-                        style="color: #faad14"
-                      />
-                      <StarOutlined
-                        v-else
-                        style="color: #999999"
-                      />
-                    </template>
-                  </a-button>
+                  <a-tooltip :title="$t('ai.favorites')">
+                    <a-button
+                      size="small"
+                      class="favorites-button"
+                      type="text"
+                      @click="showOnlyFavorites = !showOnlyFavorites"
+                    >
+                      <template #icon>
+                        <StarFilled
+                          v-if="showOnlyFavorites"
+                          style="color: #faad14"
+                        />
+                        <StarOutlined
+                          v-else
+                          class="star-outline-icon"
+                        />
+                      </template>
+                    </a-button>
+                  </a-tooltip>
                 </div>
                 <div class="history-virtual-list-container">
                   <template
@@ -753,6 +789,7 @@ import {
   CheckCircleOutlined,
   CheckOutlined,
   CloseOutlined,
+  CompressOutlined,
   CopyOutlined,
   DeleteOutlined,
   DislikeOutlined,
@@ -775,6 +812,7 @@ import i18n from '@/locales'
 import eventBus from '@/utils/eventBus'
 import historyIcon from '@/assets/icons/history.svg'
 import plusIcon from '@/assets/icons/plus.svg'
+import skillsIcon from '@/assets/icons/skills.svg'
 
 interface TabInfo {
   id: string
@@ -847,7 +885,8 @@ const {
   handleFeedback,
   getMessageFeedback,
   handleTruncateAndSend,
-  handleSummarizeToKnowledge
+  handleSummarizeToKnowledge,
+  handleSummarizeToSkill
 } = useChatMessages(scrollToBottom, clearTodoState, markLatestMessageWithTodoUpdate, currentTodos, checkModelConfig)
 
 // Command interactions
@@ -971,6 +1010,40 @@ const {
 // i18n
 const { t } = i18n.global
 const favoriteLabel = computed(() => t('ai.favorite'))
+
+type ContextTruncationStatus = 'compressing' | 'completed'
+
+interface ContextTruncationNoticeMessage {
+  text?: string
+  content?: string | MessageContent
+  partial?: boolean
+}
+
+const parseContextTruncationStatus = (message: ContextTruncationNoticeMessage): ContextTruncationStatus => {
+  const rawText = typeof message.content === 'string' ? message.content : message.text
+  if (!rawText) {
+    return message.partial ? 'compressing' : 'completed'
+  }
+
+  try {
+    const parsed = JSON.parse(rawText) as { status?: ContextTruncationStatus }
+    if (parsed.status === 'compressing' || parsed.status === 'completed') {
+      return parsed.status
+    }
+  } catch {
+    // Keep compatibility with legacy persisted plain-text messages.
+  }
+
+  return message.partial ? 'compressing' : 'completed'
+}
+
+const isContextTruncationInProgress = (message: ContextTruncationNoticeMessage): boolean => {
+  return parseContextTruncationStatus(message) === 'compressing'
+}
+
+const getContextTruncationNotice = (message: ContextTruncationNoticeMessage): string => {
+  return isContextTruncationInProgress(message) ? t('ai.contextTruncating') : t('ai.contextTruncated')
+}
 
 // Event bus listeners
 useEventBusListeners({

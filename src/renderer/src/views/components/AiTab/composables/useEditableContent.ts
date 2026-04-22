@@ -1,9 +1,10 @@
 import { ref, nextTick, type Ref } from 'vue'
-import type { ContentPart, ContextDocRef, ContextPastChatRef, ImageContentPart, ContextCommandRef } from '@shared/WebviewMessage'
+import type { ContentPart, ContextDocRef, ContextPastChatRef, ImageContentPart, ContextCommandRef, ContextSkillRef } from '@shared/WebviewMessage'
 import type { ChatOption, DocOption } from '../types'
 import { getChipLabel } from '../utils'
 import FileTextOutlinedSvg from '@ant-design/icons-svg/es/asn/FileTextOutlined'
 import MessageOutlinedSvg from '@ant-design/icons-svg/es/asn/MessageOutlined'
+import skillsIconSrc from '@/assets/icons/skills.svg'
 
 // ============================================================================
 // Types
@@ -97,7 +98,10 @@ export interface UseEditableContentOptions {
   handleSendClick: (type: string) => void
   handleAddContextClick: (triggerEl?: HTMLElement | null, mode?: 'create' | 'edit') => void
   handleShowCommandPopup?: (triggerEl?: HTMLElement | null) => void
-  handleChipClick?: (chipType: 'doc' | 'chat' | 'command', ref: ContextDocRef | ContextPastChatRef | ContextCommandRef) => void
+  handleChipClick?: (
+    chipType: 'doc' | 'chat' | 'command' | 'skill',
+    ref: ContextDocRef | ContextPastChatRef | ContextCommandRef | ContextSkillRef
+  ) => void
   shouldBlockEnterSend?: () => boolean
 }
 
@@ -142,6 +146,36 @@ export function useEditableContent(options: UseEditableContentOptions) {
     }
 
     return null
+  }
+
+  /**
+   * Determine whether a slash just inserted before the caret should trigger the command popup.
+   * We only trigger when the slash is a standalone token: both sides are whitespace or boundaries.
+   *
+   * Note: This is intentionally conservative; if we cannot reliably inspect neighbors, do not trigger.
+   */
+  const shouldTriggerCommandPopupForSlash = (): boolean => {
+    const selection = window.getSelection()
+    if (!selection || selection.rangeCount === 0) return false
+
+    const range = selection.getRangeAt(0)
+    const editableEl = editableRef.value
+    if (!editableEl || !editableEl.contains(range.startContainer)) return false
+
+    if (range.startContainer.nodeType !== Node.TEXT_NODE) return false
+    const textNode = range.startContainer as Text
+    const text = textNode.data
+    const offset = range.startOffset
+
+    // Caret should be positioned right after the inserted '/'.
+    if (offset <= 0 || offset > text.length) return false
+    if (text[offset - 1] !== '/') return false
+
+    const beforeChar = offset - 2 >= 0 ? text[offset - 2] : null
+    const afterChar = offset < text.length ? text[offset] : null
+
+    const isBoundaryOrWs = (ch: string | null) => ch === null || /\s/.test(ch)
+    return isBoundaryOrWs(beforeChar) && isBoundaryOrWs(afterChar)
   }
 
   // ============================================================================
@@ -243,9 +277,16 @@ export function useEditableContent(options: UseEditableContentOptions) {
     }
   }
 
+  const setSkillChipAttributes = (chip: HTMLElement, ref: ContextSkillRef) => {
+    chip.setAttribute('data-skill-name', ref.skillName)
+    if (ref.description) {
+      chip.setAttribute('data-description', ref.description)
+    }
+  }
+
   const createChipElement = (
-    chipType: 'doc' | 'chat' | 'command',
-    chipRef: ContextDocRef | ContextPastChatRef | ContextCommandRef,
+    chipType: 'doc' | 'chat' | 'command' | 'skill',
+    chipRef: ContextDocRef | ContextPastChatRef | ContextCommandRef | ContextSkillRef,
     label: string
   ): HTMLElement => {
     const chip = document.createElement('span')
@@ -261,14 +302,27 @@ export function useEditableContent(options: UseEditableContentOptions) {
       setChatChipAttributes(chip, chipRef as ContextPastChatRef)
     } else if (chipType === 'command') {
       setCommandChipAttributes(chip, chipRef as ContextCommandRef)
+    } else if (chipType === 'skill') {
+      setSkillChipAttributes(chip, chipRef as ContextSkillRef)
     }
 
-    // Create icon element (only for doc and chat chips, command chips display text only)
-    if (chipType === 'doc' || chipType === 'chat') {
+    // Create icon element (only for doc, chat, and skill chips; command chips display text only)
+    if (chipType === 'doc' || chipType === 'chat' || chipType === 'skill') {
       const iconSpan = document.createElement('span')
       iconSpan.className = 'mention-icon'
-      const iconSvg = createIconSvg(chipType === 'doc' ? FileTextOutlinedSvg : MessageOutlinedSvg)
-      iconSpan.appendChild(iconSvg)
+
+      if (chipType === 'skill') {
+        const img = document.createElement('img')
+        img.src = skillsIconSrc
+        img.width = 12
+        img.height = 12
+        img.className = 'mention-icon-svg'
+        img.setAttribute('aria-hidden', 'true')
+        iconSpan.appendChild(img)
+      } else {
+        const iconSvg = createIconSvg(chipType === 'doc' ? FileTextOutlinedSvg : MessageOutlinedSvg)
+        iconSpan.appendChild(iconSvg)
+      }
       chip.appendChild(iconSpan)
     }
 
@@ -357,6 +411,13 @@ export function useEditableContent(options: UseEditableContentOptions) {
     }
   }
 
+  const parseSkillChipElement = (el: HTMLElement): ContextSkillRef => {
+    return {
+      skillName: el.dataset.skillName || '',
+      description: el.dataset.description || undefined
+    }
+  }
+
   const parseChipElement = (el: HTMLElement, parts: ContentPart[]) => {
     if (el.dataset.chipType === 'doc') {
       parts.push({ type: 'chip', chipType: 'doc', ref: parseKbChipElement(el) })
@@ -364,6 +425,8 @@ export function useEditableContent(options: UseEditableContentOptions) {
       parts.push({ type: 'chip', chipType: 'chat', ref: parseChatChipElement(el) })
     } else if (el.dataset.chipType === 'command') {
       parts.push({ type: 'chip', chipType: 'command', ref: parseCommandChipElement(el) })
+    } else if (el.dataset.chipType === 'skill') {
+      parts.push({ type: 'chip', chipType: 'skill', ref: parseSkillChipElement(el) })
     }
   }
 
@@ -656,6 +719,44 @@ export function useEditableContent(options: UseEditableContentOptions) {
   }
 
   /**
+   * Insert a skill chip at the current cursor position.
+   * @param ref - The skill reference with skillName and optional description
+   * @param label - Display label for the chip
+   */
+  const insertSkillChip = (ref: ContextSkillRef, label: string) => {
+    if (!editableRef.value) return
+    restoreSelection()
+
+    let range = getEditableRange()
+    if (!range) {
+      moveCaretToEnd()
+      range = getEditableRange()
+    }
+    if (!range) return
+
+    const selection = window.getSelection()
+    if (!selection) return
+    removeAtSymbolBeforeCursor(range)
+
+    const chip = createChipElement('skill', ref, label)
+    range.deleteContents()
+    range.insertNode(chip)
+
+    // Add spacer after chip and move cursor after it
+    const spacer = document.createTextNode(' ')
+    chip.after(spacer)
+
+    const newRange = document.createRange()
+    newRange.setStart(spacer, 1)
+    newRange.collapse(true)
+    selection.removeAllRanges()
+    selection.addRange(newRange)
+
+    saveSelection()
+    syncDraftPartsFromEditable()
+  }
+
+  /**
    * Remove slash character before cursor position.
    */
   const removeSlashBeforeCursor = (range: Range) => {
@@ -695,6 +796,7 @@ export function useEditableContent(options: UseEditableContentOptions) {
       setTimeout(() => {
         // Only open when actual '/' was inserted (IME may insert '、' etc. for the same key).
         if (getCharBeforeCaret() !== '/') return
+        if (!shouldTriggerCommandPopupForSlash()) return
         saveSelection()
         handleShowCommandPopup(editableRef.value)
       }, 0)
@@ -740,6 +842,9 @@ export function useEditableContent(options: UseEditableContentOptions) {
     if (chip.dataset.chipType === 'command') {
       handleChipClick?.('command', parseCommandChipElement(chip))
     }
+    if (chip.dataset.chipType === 'skill') {
+      handleChipClick?.('skill', parseSkillChipElement(chip))
+    }
   }
 
   return {
@@ -769,6 +874,7 @@ export function useEditableContent(options: UseEditableContentOptions) {
     insertImageAtCursor,
     insertCommandChip,
     insertCommandChipWithPath,
+    insertSkillChip,
 
     // DOM creation (exposed for potential external use)
     createChipElement,

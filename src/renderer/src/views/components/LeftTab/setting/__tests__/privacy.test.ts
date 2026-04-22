@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { mount, VueWrapper } from '@vue/test-utils'
+import { mount, VueWrapper, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import PrivacyComponent from '../privacy.vue'
@@ -19,6 +19,26 @@ import { notification } from 'ant-design-vue'
 import { userConfigStore } from '@/services/userConfigStoreService'
 import { dataSyncService } from '@/services/dataSyncService'
 import { getPrivacyPolicyUrl } from '@/utils/edition'
+
+const {
+  mockUserConfigGetConfig,
+  mockUserConfigSaveConfig,
+  mockDeactivateAccount,
+  mockRouterPush,
+  mockDeleteInfo,
+  mockChatSyncDisable,
+  mockChatSyncReset,
+  mockShortcutInit
+} = vi.hoisted(() => ({
+  mockUserConfigGetConfig: vi.fn(),
+  mockUserConfigSaveConfig: vi.fn(),
+  mockDeactivateAccount: vi.fn(),
+  mockRouterPush: vi.fn(),
+  mockDeleteInfo: vi.fn(),
+  mockChatSyncDisable: vi.fn(),
+  mockChatSyncReset: vi.fn(),
+  mockShortcutInit: vi.fn()
+}))
 
 // Test constants
 const DEFAULT_CONFIG = {
@@ -29,11 +49,21 @@ const DEFAULT_CONFIG = {
 
 const PRIVACY_URL = 'https://example.com/privacy'
 
+// Mock window.api
+const mockWindowApi = {
+  sendToMain: vi.fn(),
+  kvGet: vi.fn()
+}
+
+;(globalThis as any).window = (globalThis as any).window || {}
+;(globalThis as any).window.api = mockWindowApi
+
 // Mock ant-design-vue components
 vi.mock('ant-design-vue', () => ({
   notification: {
     success: vi.fn(),
-    error: vi.fn()
+    error: vi.fn(),
+    config: vi.fn()
   }
 }))
 
@@ -88,43 +118,92 @@ const mockTranslations: Record<string, string> = {
 
 const mockT = (key: string) => mockTranslations[key] || key
 
-vi.mock('vue-i18n', () => ({
-  useI18n: () => ({
-    t: mockT
-  })
-}))
+vi.mock('vue-i18n', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('vue-i18n')>()
+  return {
+    ...actual,
+    useI18n: () => ({
+      t: mockT
+    })
+  }
+})
 
 // Mock userConfigStore service
-vi.mock('@/services/userConfigStoreService', () => ({
-  userConfigStore: {
-    getConfig: vi.fn(),
-    saveConfig: vi.fn()
+vi.mock('@/services/userConfigStoreService', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/userConfigStoreService')>()
+  return {
+    ...actual,
+    userConfigStore: {
+      getConfig: mockUserConfigGetConfig,
+      saveConfig: mockUserConfigSaveConfig
+    },
+    remoteApplyGuard: {
+      isApplying: false
+    }
   }
-}))
+})
 
 // Mock dataSyncService
 vi.mock('@/services/dataSyncService', () => ({
   dataSyncService: {
     enableDataSync: vi.fn(),
-    disableDataSync: vi.fn()
+    disableDataSync: vi.fn(),
+    getInitializationStatus: vi.fn(() => false),
+    reset: vi.fn()
   }
 }))
 
 // Mock edition utils
-vi.mock('@/utils/edition', () => ({
-  getPrivacyPolicyUrl: vi.fn(() => PRIVACY_URL)
-}))
+vi.mock('@/utils/edition', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/utils/edition')>()
+  return {
+    ...actual,
+    getPrivacyPolicyUrl: vi.fn(() => PRIVACY_URL)
+  }
+})
 
 // Mock permission utils
 vi.mock('@/utils/permission', () => ({
-  getUserInfo: vi.fn(() => ({ uid: 'test-uid' }))
+  getUserInfo: vi.fn(() => ({ uid: '123' })),
+  removeToken: vi.fn()
 }))
 
-// Mock window.api
-const mockWindowApi = {
-  sendToMain: vi.fn(),
-  kvGet: vi.fn()
-}
+vi.mock('@/api/user/user', () => ({
+  deactivateAccount: mockDeactivateAccount
+}))
+
+vi.mock('vue-router', () => ({
+  useRouter: () => ({
+    push: mockRouterPush
+  }),
+  createRouter: vi.fn(() => ({
+    replace: vi.fn(),
+    push: vi.fn(),
+    onError: vi.fn(),
+    beforeEach: vi.fn(),
+    afterEach: vi.fn()
+  })),
+  createWebHashHistory: vi.fn()
+}))
+
+vi.mock('@/store', () => ({
+  userInfoStore: () => ({
+    deleteInfo: mockDeleteInfo
+  })
+}))
+
+vi.mock('@/services/chatSyncService', () => ({
+  chatSyncService: {
+    disable: mockChatSyncDisable,
+    reset: mockChatSyncReset
+  }
+}))
+
+vi.mock('@/services/shortcutService', () => ({
+  shortcutService: {
+    init: mockShortcutInit
+  }
+}))
 
 describe('Privacy Component', () => {
   let wrapper: VueWrapper<any>
@@ -132,9 +211,11 @@ describe('Privacy Component', () => {
 
   // Helper function to wait for component updates
   const waitForUpdates = async (count = 2) => {
+    await flushPromises()
     for (let i = 0; i < count; i++) {
       await nextTick()
     }
+    await flushPromises()
   }
 
   // Helper function to create component wrapper
@@ -170,6 +251,21 @@ describe('Privacy Component', () => {
             template:
               '<div class="a-collapse-panel"><div class="ant-collapse-header"><slot name="header" /></div><div class="ant-collapse-content"><slot /></div></div>',
             props: ['header']
+          },
+          'a-button': {
+            template: '<button class="a-button" @click="$emit(\'click\', $event)"><slot /></button>',
+            props: ['danger', 'loading'],
+            emits: ['click']
+          },
+          'a-modal': {
+            template: '<div v-if="open" class="a-modal"><slot /></div>',
+            props: ['open', 'title', 'okText', 'cancelText', 'confirmLoading', 'okButtonProps'],
+            emits: ['update:open', 'ok', 'cancel']
+          },
+          'a-input': {
+            template: '<input class="a-input" :value="value" @input="$emit(\'update:value\', $event.target.value)" />',
+            props: ['value'],
+            emits: ['update:value']
           }
         },
         mocks: {
@@ -205,8 +301,11 @@ describe('Privacy Component', () => {
     vi.clearAllMocks()
 
     // Setup default mock return values
-    ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue(DEFAULT_CONFIG)
-    ;(userConfigStore.saveConfig as ReturnType<typeof vi.fn>).mockResolvedValue(undefined)
+    mockUserConfigGetConfig.mockResolvedValue(DEFAULT_CONFIG)
+    mockUserConfigSaveConfig.mockResolvedValue(undefined)
+    mockDeactivateAccount.mockResolvedValue({ code: 200 })
+    mockRouterPush.mockResolvedValue(undefined)
+    mockChatSyncDisable.mockResolvedValue(true)
     ;(dataSyncService.enableDataSync as ReturnType<typeof vi.fn>).mockResolvedValue(true)
     ;(dataSyncService.disableDataSync as ReturnType<typeof vi.fn>).mockResolvedValue(true)
     mockWindowApi.sendToMain.mockResolvedValue(undefined)
@@ -240,7 +339,7 @@ describe('Privacy Component', () => {
     })
 
     it('should initialize with default values when no config is saved', async () => {
-      ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue(null)
+      mockUserConfigGetConfig.mockResolvedValue(null)
 
       wrapper = createWrapper()
       await waitForUpdates()
@@ -253,7 +352,7 @@ describe('Privacy Component', () => {
 
     it('should handle config load errors gracefully', async () => {
       const error = new Error('Load failed')
-      ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockRejectedValue(error)
+      mockUserConfigGetConfig.mockRejectedValue(error)
 
       wrapper = createWrapper()
       await waitForUpdates()
@@ -270,7 +369,7 @@ describe('Privacy Component', () => {
         dataSync: 'disabled',
         telemetry: 'disabled'
       }
-      ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue(savedConfig)
+      mockUserConfigGetConfig.mockResolvedValue(savedConfig)
       // Mock kvGet to return the same config
       mockWindowApi.kvGet.mockResolvedValue({
         value: JSON.stringify({ dataSync: 'disabled' })
@@ -284,7 +383,7 @@ describe('Privacy Component', () => {
     })
 
     it('should use default values when saved config has missing fields', async () => {
-      ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      mockUserConfigGetConfig.mockResolvedValue({
         secretRedaction: 'enabled'
         // dataSync and telemetry are missing
       })
@@ -296,6 +395,23 @@ describe('Privacy Component', () => {
       expect(vm.userConfig.secretRedaction).toBe('enabled')
       expect(vm.userConfig.dataSync).toBe('enabled') // default
       expect(vm.userConfig.telemetry).toBe('unset') // default for telemetry
+    })
+
+    it('should not treat merged default disabled as an explicit data sync preference', async () => {
+      mockUserConfigGetConfig.mockResolvedValue({
+        secretRedaction: 'enabled',
+        dataSync: 'disabled',
+        telemetry: 'enabled'
+      })
+      mockWindowApi.kvGet.mockResolvedValue({
+        value: JSON.stringify({})
+      })
+
+      wrapper = createWrapper()
+      await waitForUpdates()
+
+      const vm = wrapper.vm as any
+      expect(vm.userConfig.dataSync).toBe('enabled')
     })
   })
 
@@ -491,7 +607,7 @@ describe('Privacy Component', () => {
 
     it('should handle save config errors and show notification', async () => {
       const error = new Error('Save failed')
-      ;(userConfigStore.saveConfig as ReturnType<typeof vi.fn>).mockRejectedValue(error)
+      mockUserConfigSaveConfig.mockRejectedValue(error)
 
       const vm = wrapper.vm as any
       vm.userConfig.secretRedaction = 'disabled'
@@ -621,7 +737,7 @@ describe('Privacy Component', () => {
 
   describe('Edge Cases', () => {
     it('should handle empty config object with defaults', async () => {
-      ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+      mockUserConfigGetConfig.mockResolvedValue({})
 
       wrapper = createWrapper()
       await waitForUpdates()
@@ -634,7 +750,7 @@ describe('Privacy Component', () => {
     })
 
     it('should handle null config gracefully', async () => {
-      ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue(null)
+      mockUserConfigGetConfig.mockResolvedValue(null)
 
       wrapper = createWrapper()
       await waitForUpdates()
@@ -647,7 +763,7 @@ describe('Privacy Component', () => {
     })
 
     it('should handle undefined config values with defaults', async () => {
-      ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      mockUserConfigGetConfig.mockResolvedValue({
         secretRedaction: undefined,
         dataSync: undefined,
         telemetry: undefined
@@ -733,7 +849,7 @@ describe('Privacy Component', () => {
         dataSync: 'enabled',
         telemetry: 'enabled'
       }
-      ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue(initialConfig)
+      mockUserConfigGetConfig.mockResolvedValue(initialConfig)
 
       wrapper = createWrapper()
       await waitForUpdates()
@@ -752,7 +868,7 @@ describe('Privacy Component', () => {
         secretRedaction: 'enabled',
         dataSync: 'disabled'
       }
-      ;(userConfigStore.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue(initialConfig)
+      mockUserConfigGetConfig.mockResolvedValue(initialConfig)
 
       wrapper = createWrapper()
       await waitForUpdates()
@@ -766,6 +882,24 @@ describe('Privacy Component', () => {
       expect(userConfigStore.getConfig).toHaveBeenCalled()
       expect(dataSyncService.enableDataSync).toHaveBeenCalled()
       expect(userConfigStore.saveConfig).toHaveBeenCalled()
+      expect(notification.success).toHaveBeenCalled()
+    })
+
+    it('should deactivate account and redirect to login', async () => {
+      wrapper = createWrapper()
+      await waitForUpdates()
+
+      const vm = wrapper.vm as any
+      vm.openDeactivateModal()
+      vm.deactivateConfirmationInput = vm.deactivateAccountConfirmKeyword
+      await nextTick()
+
+      await vm.handleDeactivateAccount()
+
+      expect(mockDeactivateAccount).toHaveBeenCalledWith({ uid: 123 })
+      expect(mockDeleteInfo).toHaveBeenCalled()
+      expect(mockShortcutInit).toHaveBeenCalled()
+      expect(mockRouterPush).toHaveBeenCalledWith('/login')
       expect(notification.success).toHaveBeenCalled()
     })
   })

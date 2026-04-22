@@ -3,6 +3,8 @@ import { useRoute } from 'vue-router'
 import { waitForAppUnlock } from '@/components/global/app-lock'
 import { useVersionPromptStore } from '@/store/versionPromptStore'
 
+const logger = createRendererLogger('composable.versionPrompt')
+
 const FETCH_DELAY_MS = 1200
 
 export function useVersionPrompt() {
@@ -20,7 +22,7 @@ export function useVersionPrompt() {
       await promptStore.loadPrompt()
       hasLoaded.value = true
     } catch (error) {
-      console.error('[VersionPrompt] Failed to load, will retry on next navigation', error)
+      logger.error('[VersionPrompt] Failed to load, will retry on next navigation', { error: error })
     }
   }
 

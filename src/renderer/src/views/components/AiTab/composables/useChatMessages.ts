@@ -2,16 +2,18 @@ import { ref, onMounted, watch, isProxy, toRaw } from 'vue'
 import { v4 as uuidv4 } from 'uuid'
 import { notification } from 'ant-design-vue'
 import eventBus from '@/utils/eventBus'
-import type { ChatMessage } from '../types'
+
+import type { ChatMessage, Host } from '../types'
 import type { Todo } from '@/types/todo'
 import type { ChatTab } from './useSessionState'
 import type { ExtensionMessage } from '@shared/ExtensionMessage'
-import type { ContentPart, WebviewMessage } from '@shared/WebviewMessage'
+import type { ContentPart, ToolResultPayload, WebviewMessage } from '@shared/WebviewMessage'
 import { createNewMessage, parseMessageContent, pickHostInfo, isSwitchAssetType } from '../utils'
 import { Notice } from '@/views/components/Notice'
 import { useSessionState } from './useSessionState'
 import { getGlobalState, updateGlobalState } from '@renderer/agent/storage/state'
 import i18n from '@/locales'
+const logger = createRendererLogger('ai.chatMessages')
 const { t } = i18n.global
 let globalIpcListenerInitialized = false
 
@@ -66,7 +68,7 @@ export function useChatMessages(
     for (let i = chatHistory.length - 1; i >= 0; i--) {
       const message = chatHistory[i]
       if (message.role === 'assistant' && message.partial === true && message.type === 'ask' && message.ask === 'command') {
-        console.log('🗑️ Removing partial command message:', message.id, 'with timestamp:', message.ts)
+        logger.info('Removing partial command message', { data: { id: message.id, ts: message.ts } })
         chatHistory.splice(i, 1)
         break
       }
@@ -88,6 +90,9 @@ export function useChatMessages(
         if (part.chipType === 'command') {
           return part.ref.command
         }
+        if (part.chipType === 'skill') {
+          return `@skill:${part.ref.skillName}`
+        }
 
         const taskName = part.ref.title || ''
         return taskName ? `@${part.ref.taskId}_${taskName}` : `@${part.ref.taskId}`
@@ -100,7 +105,9 @@ export function useChatMessages(
     sendType: string,
     tabId?: string,
     truncateAtMessageTs?: number,
-    contentParts?: ContentPart[]
+    contentParts?: ContentPart[],
+    overrideHosts?: Host[],
+    toolResult?: ToolResultPayload
   ) => {
     try {
       const targetTab = tabId ? chatTabs.value.find((tab) => tab.id === tabId) : currentTab.value
@@ -110,7 +117,8 @@ export function useChatMessages(
       }
 
       const session = targetTab.session
-      const targetHosts = targetTab.hosts || []
+      // Use overrideHosts if provided, otherwise use targetTab.hosts
+      const targetHosts = overrideHosts || targetTab.hosts || []
 
       const hostsArray = targetHosts.map((h) => ({
         host: h.host,
@@ -133,7 +141,7 @@ export function useChatMessages(
         message = {
           type: 'askResponse',
           askResponse: 'yesButtonClicked',
-          text: userContent,
+          ...(toolResult ? { toolResult } : { text: userContent }),
           hosts: hostsArray,
           contentParts
         }
@@ -151,13 +159,14 @@ export function useChatMessages(
       const messageWithTabId: WebviewMessage = {
         ...message,
         tabId: tabId || currentChatId.value,
-        taskId: tabId || currentChatId.value
+        taskId: tabId || currentChatId.value,
+        modelName: targetTab.modelValue || undefined
       }
-      console.log('[DEBUG] Send message to main process:', messageWithTabId)
+      logger.debug('Send message to main process', { data: messageWithTabId })
       await window.api.sendToMain(messageWithTabId)
       // console.log('Main process response:', response)
     } catch (error) {
-      console.error('Failed to send message to main process:', error)
+      logger.error('Failed to send message to main process', { error: error })
     }
   }
 
@@ -209,14 +218,14 @@ export function useChatMessages(
       return 'SEND_ERROR'
     }
 
-    if (hosts.value.length === 0 && chatTypeValue.value !== 'chat') {
-      notification.error({
-        message: t('ai.getAssetInfoFailed'),
-        description: t('ai.pleaseConnectAsset'),
-        duration: 3
-      })
-      return 'ASSET_ERROR'
-    }
+    // if (hosts.value.length === 0 && chatTypeValue.value !== 'chat') {
+    //   notification.error({
+    //     message: t('ai.getAssetInfoFailed'),
+    //     description: t('ai.pleaseConnectAsset'),
+    //     duration: 3
+    //   })
+    //   return 'ASSET_ERROR'
+    // }
 
     if (sendType === 'send' && currentTodos.value.length > 0) {
       if (currentSession.value) {
@@ -235,7 +244,9 @@ export function useChatMessages(
     sendType: string,
     tabId?: string,
     truncateAtMessageTs?: number,
-    contentParts?: ContentPart[]
+    contentParts?: ContentPart[],
+    overrideHosts?: Host[],
+    toolResult?: ToolResultPayload
   ) => {
     const targetTab = tabId ? chatTabs.value.find((tab: ChatTab) => tab.id === tabId) : currentTab.value
 
@@ -247,7 +258,7 @@ export function useChatMessages(
     session.isCancelled = false
     // Strip Vue proxies before IPC to avoid structured clone failures.
     contentParts = contentParts ? contentParts.map((part) => (isProxy(part) ? (toRaw(part) as ContentPart) : part)) : undefined
-    await sendMessageToMain(userContent, sendType, tabId, truncateAtMessageTs, contentParts)
+    await sendMessageToMain(userContent, sendType, tabId, truncateAtMessageTs, contentParts, overrideHosts, toolResult)
 
     const userMessage: ChatMessage = {
       id: uuidv4(),
@@ -258,6 +269,13 @@ export function useChatMessages(
       ask: '',
       say: '',
       ts: 0
+    }
+
+    // Set hosts: use overrideHosts if provided, otherwise use targetTab.hosts
+    if (overrideHosts) {
+      userMessage.hosts = overrideHosts
+    } else if (targetTab.hosts && targetTab.hosts.length > 0) {
+      userMessage.hosts = targetTab.hosts
     }
 
     if (sendType === 'commandSend') {
@@ -287,10 +305,11 @@ export function useChatMessages(
       message.partialMessage.ts,
       false
     )
+    newAssistantMessage.contentParts = message.partialMessage.contentParts
 
     cleanupPartialCommandMessages(session.chatHistory)
     session.chatHistory.push(newAssistantMessage)
-    console.log('showRetryButton for tab', targetTab.id)
+    logger.info('showRetryButton for tab', { data: targetTab.id })
     session.showRetryButton = true
     session.responseLoading = false
   }
@@ -305,7 +324,7 @@ export function useChatMessages(
       const data = JSON.parse(partial.text || '{}')
       const { fileName, summary } = data
       if (!fileName || !summary) {
-        console.log(' Missing fileName or summary')
+        logger.info('Missing fileName or summary')
         return
       }
 
@@ -335,9 +354,53 @@ export function useChatMessages(
         knowledgeSummaryRelPaths.delete(key)
       }
     } catch (error) {
-      console.error(' Failed to save knowledge:', error)
+      logger.error('Failed to save knowledge', { error: error })
       notification.error({
         message: t('ai.knowledgeSaveFailed'),
+        description: error instanceof Error ? error.message : String(error),
+        duration: 5
+      })
+    }
+  }
+
+  const skillSummaryCreated = new Map<number, boolean>()
+
+  /**
+   * Handle skill_summary streaming: create skill when streaming completes
+   */
+  const handleSkillSummary = async (partial: any) => {
+    try {
+      // Only create skill when streaming is complete
+      if (partial.partial) {
+        return
+      }
+
+      const data = JSON.parse(partial.text || '{}')
+      const { skillName, description, content } = data
+      if (!skillName || !description || !content) {
+        logger.info('Missing skillName, description, or content')
+        return
+      }
+
+      const key = partial.ts ?? 0
+      if (skillSummaryCreated.get(key)) {
+        return
+      }
+      skillSummaryCreated.set(key, true)
+
+      await window.api.createSkill({ name: skillName, description }, content)
+
+      notification.success({
+        message: t('ai.skillCreated'),
+        description: skillName,
+        duration: 5
+      })
+
+      skillSummaryCreated.delete(key)
+    } catch (error) {
+      logger.error('Failed to create skill', { error: error })
+      notification.error({
+        message: t('ai.skillCreateFailed'),
         description: error instanceof Error ? error.message : String(error),
         duration: 5
       })
@@ -347,17 +410,17 @@ export function useChatMessages(
   const processMainMessage = async (message: ExtensionMessage) => {
     const targetTabId = message?.tabId ?? message?.taskId
     if (!targetTabId) {
-      console.error('AiTab: Ignoring message for no target tab:', message.type)
+      logger.error('Ignoring message for no target tab', { data: message.type })
       return
     }
 
     const targetTab = chatTabs.value.find((tab) => tab.id === targetTabId)
     if (!targetTab) {
-      console.warn('AiTab: Ignoring message for deleted tab:', targetTabId)
+      logger.warn('Ignoring message for deleted tab', { detail: targetTabId })
       return
     }
 
-    console.log('Received main process message:', message.type, message)
+    logger.info('Received main process message', { data: { type: message.type } })
 
     const session = targetTab.session
     const isActiveTab = targetTabId === currentChatId.value
@@ -365,7 +428,7 @@ export function useChatMessages(
     const previousPartialMessage = session.lastPartialMessage
 
     if (message?.type === 'partialMessage' && session.isCancelled) {
-      console.log('AiTab: Ignoring partial message because task is cancelled')
+      logger.info('Ignoring partial message because task is cancelled')
       return
     }
 
@@ -385,6 +448,15 @@ export function useChatMessages(
 
       if (partial.say === 'knowledge_summary') {
         await handleKnowledgeSummary(partial)
+        session.lastPartialMessage = message
+        if (isActiveTab) {
+          scrollToBottom()
+        }
+        return
+      }
+
+      if (partial.say === 'skill_summary') {
+        await handleSkillSummary(partial)
         session.lastPartialMessage = message
         if (isActiveTab) {
           scrollToBottom()
@@ -436,6 +508,10 @@ export function useChatMessages(
           newAssistantMessage.content = parseMessageContent(partial.text)
         }
 
+        if (partial.contentParts) {
+          newAssistantMessage.contentParts = partial.contentParts
+        }
+
         if (partial.mcpToolCall) {
           newAssistantMessage.mcpToolCall = partial.mcpToolCall
         }
@@ -453,6 +529,9 @@ export function useChatMessages(
         lastMessageInChat.ask = partial.type === 'ask' ? (partial.ask ?? '') : ''
         lastMessageInChat.say = partial.type === 'say' ? (partial.say ?? '') : ''
         lastMessageInChat.partial = partial.partial
+        if (partial.contentParts) {
+          lastMessageInChat.contentParts = partial.contentParts
+        }
 
         if (partial.mcpToolCall) {
           lastMessageInChat.mcpToolCall = partial.mcpToolCall
@@ -491,6 +570,11 @@ export function useChatMessages(
     } else if (message?.type === 'state') {
       const chatermMessages = message.state?.chatermMessages ?? []
       const lastStateChatermMessages = chatermMessages.at(-1)
+      // Cache chatermMessages so contextUsage remains stable when
+      // partialMessage overwrites lastStreamMessage during streaming.
+      if (chatermMessages.length > 0) {
+        session.lastStateChatermMessages = chatermMessages
+      }
       const isWaitingForUserResponse =
         lastStateChatermMessages?.type === 'ask' ||
         lastStateChatermMessages?.say === 'command_blocked' ||
@@ -505,7 +589,7 @@ export function useChatMessages(
         session.responseLoading = false
       }
     } else if (message?.type === 'todoUpdated') {
-      console.log('AiTab: Received todoUpdated message', message)
+      logger.info('Received todoUpdated message', { data: message })
 
       if (Array.isArray(message.todos) && message.todos.length > 0) {
         markLatestMessageWithTodoUpdate(session.chatHistory, message.todos as Todo[])
@@ -515,12 +599,12 @@ export function useChatMessages(
       if (isActiveTab) {
         scrollToBottom()
       }
-    } else if (message?.type === 'chatTitleGenerated') {
-      console.log('AiTab: Received chatTitleGenerated message', message)
+    } else if (message?.type === 'taskTitleUpdated') {
+      logger.info('Received taskTitleUpdated message', { data: message })
 
-      if (message.chatTitle && message.taskId) {
-        targetTab.title = message.chatTitle
-        console.log('Updated chat title to:', message.chatTitle)
+      if (message.title && message.taskId) {
+        targetTab.title = message.title
+        logger.info('Updated chat title', { data: message.title })
       }
     }
 
@@ -536,7 +620,7 @@ export function useChatMessages(
 
     window.api.onMainMessage((message: any) => {
       processMainMessage(message).catch((error) => {
-        console.error('Failed to process main process message:', error)
+        logger.error('Failed to process main process message', { error: error })
       })
     })
   }
@@ -583,7 +667,7 @@ export function useChatMessages(
   /**
    * Handle edit and resend from UserMessage
    */
-  const handleTruncateAndSend = async ({ message, contentParts }: { message: ChatMessage; contentParts: ContentPart[] }) => {
+  const handleTruncateAndSend = async ({ message, contentParts, hosts }: { message: ChatMessage; contentParts: ContentPart[]; hosts?: Host[] }) => {
     if (!currentSession.value) return
 
     const chatHistory = currentSession.value.chatHistory
@@ -597,7 +681,7 @@ export function useChatMessages(
 
     // Build plain text content with @absPath for chips
     const newContent = buildPlainTextFromParts(contentParts)
-    await sendMessageWithContent(newContent, 'send', undefined, truncateAtMessageTs, contentParts)
+    await sendMessageWithContent(newContent, 'send', undefined, truncateAtMessageTs, contentParts, hosts)
   }
 
   /**
@@ -621,6 +705,25 @@ export function useChatMessages(
     await sendMessageWithContent('/summary-to-doc', 'send', undefined, undefined, [commandChipPart])
   }
 
+  /**
+   * Handle summarize to skill button click.
+   * Sends a command chip that will be replaced with full prompt in the backend.
+   * @param message - Optional message to summarize up to (when clicking button on specific message)
+   */
+  const handleSummarizeToSkill = async (message?: ChatMessage) => {
+    const commandChipPart: ContentPart = {
+      type: 'chip',
+      chipType: 'command',
+      ref: {
+        command: '/summary-to-skill',
+        label: '/Summary to Skill',
+        summarizeUpToTs: message?.ts
+      }
+    }
+
+    await sendMessageWithContent('/summary-to-skill', 'send', undefined, undefined, [commandChipPart])
+  }
+
   return {
     markdownRendererRefs,
     isCurrentChatMessage,
@@ -637,6 +740,7 @@ export function useChatMessages(
     cleanupPartialCommandMessages,
     isLocalHost,
     handleTruncateAndSend,
-    handleSummarizeToKnowledge
+    handleSummarizeToKnowledge,
+    handleSummarizeToSkill
   }
 }

@@ -1,4 +1,6 @@
-import type { ContentPart, ContextRefs } from '@shared/WebviewMessage'
+import type { ContentPart, ContextRefs, Host } from '@shared/WebviewMessage'
+
+export type { Host }
 
 export interface MessageContent {
   question: string
@@ -40,6 +42,7 @@ export interface ChatMessage {
   hostId?: string
   hostName?: string
   colorTag?: string
+  hosts?: Host[]
   // AI explanation for command (inline, not in history)
   explanation?: string
 }
@@ -59,7 +62,6 @@ export interface AssetInfo {
 export interface HistoryItem {
   id: string
   chatTitle: string
-  chatType: string
   chatContent: ChatMessage[]
   isEditing?: boolean
   editingTitle?: string
@@ -67,25 +69,17 @@ export interface HistoryItem {
   ts?: number
 }
 
-export interface TaskHistoryItem {
+export interface TaskListItem {
   id: string
-  task?: string // Original full task description
-  chatTitle?: string // Optional LLM-generated short title
-  ts: number
-  isFavorite?: boolean
+  title: string | null
+  favorite: boolean
+  createdAt: number
+  updatedAt: number
 }
 
 export interface ModelOption {
   label: string
   value: string
-}
-
-export interface Host {
-  host: string
-  uuid: string
-  connection: string
-  organizationUuid?: string
-  assetType?: string
 }
 
 // Tree structure types for host list
@@ -100,6 +94,7 @@ export function isBastionHostType(type: string | undefined): boolean {
 export interface TreeHostOption {
   key: string
   label: string
+  title?: string
   type: HostItemType
   selectable: boolean
   uuid: string
@@ -138,7 +133,7 @@ export interface HostOption {
 }
 
 // Menu level for context popup
-export type ContextMenuLevel = 'main' | 'hosts' | 'docs' | 'chats'
+export type ContextMenuLevel = 'main' | 'hosts' | 'docs' | 'chats' | 'skills'
 
 // Knowledge base document option
 export interface DocOption {
@@ -153,4 +148,12 @@ export interface ChatOption {
   id: string
   title: string
   ts: number
+}
+
+// Skill option for @ mention
+export interface SkillOption {
+  name: string
+  description: string
+  path: string
+  enabled: boolean
 }

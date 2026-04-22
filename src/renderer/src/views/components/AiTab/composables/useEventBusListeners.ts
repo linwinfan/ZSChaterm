@@ -3,13 +3,24 @@ import eventBus from '@/utils/eventBus'
 import { useSessionState } from './useSessionState'
 import { focusChatInput } from './useTabManagement'
 import { isFocusInAiTab } from '@/utils/domUtils'
-import type { AssetInfo } from '../types'
+import type { AssetInfo, Host } from '../types'
+import type { ContentPart, ToolResultPayload } from '@shared/WebviewMessage'
 import { isSwitchAssetType } from '../utils'
 import i18n from '@/locales'
 import { Notice } from '@/views/components/Notice'
 
+const logger = createRendererLogger('aitab.eventBus')
+
 interface UseEventBusListenersParams {
-  sendMessageWithContent: (content: string, sendType: string, tabId?: string) => Promise<void>
+  sendMessageWithContent: (
+    content: string,
+    sendType: string,
+    tabId?: string,
+    truncateAtMessageTs?: number,
+    contentParts?: ContentPart[],
+    overrideHosts?: Host[],
+    toolResult?: ToolResultPayload
+  ) => Promise<void>
   initModel: () => Promise<void>
   getCurentTabAssetInfo: () => Promise<AssetInfo | null>
   updateHosts: (hostInfo: { ip: string; uuid: string; connection: string; assetType?: string } | null) => void
@@ -17,9 +28,9 @@ interface UseEventBusListenersParams {
 }
 
 export const AiTypeOptions = [
-  { label: 'Chat', value: 'chat' },
-  { label: 'Command', value: 'cmd' },
-  { label: 'Agent', value: 'agent' }
+  // { label: 'Chat', value: 'chat' },
+  { label: 'Agent', value: 'agent' },
+  { label: 'Command', value: 'cmd' }
 ]
 
 interface TabInfo {
@@ -61,10 +72,9 @@ export function useEventBusListeners(params: UseEventBusListenersParams) {
 
   // Initialize asset information
   const initAssetInfo = async () => {
-    // Skip host initialization in chat mode
-    if (chatTypeValue.value === 'chat') {
-      return
-    }
+    // if (chatTypeValue.value === 'chat') {
+    //   return
+    // }
 
     // Always check for switch mode restriction first
     await checkAndHandleSwitchMode()
@@ -86,13 +96,13 @@ export function useEventBusListeners(params: UseEventBusListenersParams) {
     }
   }
 
-  const handleSendMessageToAi = async (payload: { content: string; tabId?: string }) => {
+  const handleSendMessageToAi = async (payload: { content: string; tabId?: string; toolResult?: ToolResultPayload }) => {
     if (isAgentMode) {
-      console.log('Ignoring sendMessageToAi event in agent mode')
+      logger.debug('Ignoring sendMessageToAi event in agent mode')
       return
     }
 
-    const { content, tabId } = payload
+    const { content, tabId, toolResult } = payload
 
     if (!content || content.trim() === '') {
       return
@@ -101,18 +111,18 @@ export function useEventBusListeners(params: UseEventBusListenersParams) {
     if (tabId) {
       const targetTab = chatTabs.value.find((tab) => tab.id === tabId)
       if (!targetTab) {
-        console.warn('sendMessageToAi: Tab not found:', tabId)
+        logger.warn('sendMessageToAi: Tab not found', { tabId })
         return
       }
     }
 
     await initAssetInfo()
-    await sendMessageWithContent(content.trim(), 'commandSend', tabId)
+    await sendMessageWithContent(content.trim(), 'commandSend', tabId, undefined, undefined, undefined, toolResult)
   }
 
   const handleChatToAi = async (text: string) => {
     if (isAgentMode) {
-      console.log('Ignoring chatToAi event in agent mode')
+      logger.debug('Ignoring chatToAi event in agent mode')
       return
     }
     appendTextToInputParts(text, '\n', '\n')
@@ -121,10 +131,9 @@ export function useEventBusListeners(params: UseEventBusListenersParams) {
   }
 
   const handleActiveTabChanged = async (tabInfo: TabInfo) => {
-    // Skip host update in chat mode
-    if (chatTypeValue.value === 'chat') {
-      return
-    }
+    // if (chatTypeValue.value === 'chat') {
+    //   return
+    // }
     const session = currentSession.value
     if (!autoUpdateHost.value || (session && session.chatHistory.length > 0)) {
       return

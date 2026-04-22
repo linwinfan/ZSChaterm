@@ -5,7 +5,7 @@
     @drop.prevent="onDrop"
   >
     <div class="panel_header">
-      <span class="panel_title">{{ t('extensions.extensions') }}</span>
+      <span class="panel_title">{{ t('extensions.plugins') }}</span>
     </div>
 
     <div class="search_box">
@@ -142,10 +142,13 @@ import iconJumpserver from '@/assets/img/jumpserver.svg'
 import { userConfigStore } from '@/services/userConfigStoreService'
 import eventBus from '@/utils/eventBus'
 import { getPluginDownload, getPluginIconUrl } from '@/api/plugin/plugin'
+import { convertFileLocalResourceSrc } from '@/utils/convertFileLocalResourceSrc'
 import { type DisplayPluginItem, usePluginStore } from './usePlugins'
 
 const api = (window as any).api
 const { t } = i18n.global
+
+const logger = createRendererLogger('extensions')
 
 const emit = defineEmits(['open-user-tab'])
 const searchValue = ref('')
@@ -181,7 +184,7 @@ const getIcons = async (item: DisplayPluginItem): Promise<string> => {
 
   // Installed
   if (item.installed && item.iconUrl) {
-    const src = convertFileSrc(item.iconUrl)
+    const src = convertFileLocalResourceSrc(item.iconUrl)
     if (item.pluginId) {
       iconUrls[item.pluginId] = src
     }
@@ -205,7 +208,7 @@ const getIcons = async (item: DisplayPluginItem): Promise<string> => {
     iconUrls[item.pluginId] = url
     return url
   } catch (e) {
-    console.error('getIcons: preload icon failed', item.pluginId, e)
+    logger.error('Preload icon failed', { pluginId: item.pluginId, error: e })
     iconUrls[item.pluginId] = ''
     return ''
   }
@@ -355,7 +358,7 @@ const loadConfig = async () => {
       currentTheme.value = config.theme || 'dark'
     }
   } catch (error) {
-    console.error('Failed to load config:', error)
+    logger.error('Failed to load config', { error: error })
   }
 }
 
@@ -438,27 +441,12 @@ watch(
   { immediate: false, deep: false }
 )
 
-const convertFileSrc = (path: string | null): string => {
-  if (!path || path.startsWith('http') || path.startsWith('data:')) {
-    return path || ''
-  }
-
-  let cleanPath = path
-  if (path.startsWith('file:///')) {
-    cleanPath = path.slice(8)
-  } else if (path.startsWith('file://')) {
-    cleanPath = path.slice(7)
-  }
-
-  return `local-resource://${cleanPath}`
-}
-
 const getIconSrc = (item: any) => {
   if (!item.isPlugin && item.iconKey) {
     return iconMap[item.iconKey] || ''
   }
   if (item.installed && item.iconUrl) {
-    return convertFileSrc(item.iconUrl)
+    return convertFileLocalResourceSrc(item.iconUrl)
   }
   if (!item.pluginId) {
     return ''

@@ -1,4 +1,4 @@
-export { getLocalAssetRouteLogic } from './assets.routes'
+export { getLocalAssetRouteLogic, recordConnectionLogic } from './assets.routes'
 
 export {
   updateLocalAssetLabelLogic,
@@ -22,5 +22,10 @@ export {
   deleteCustomFolderLogic,
   moveAssetToFolderLogic,
   removeAssetFromFolderLogic,
-  getAssetsInFolderLogic
+  getAssetsInFolderLogic,
+  getOrganizationAssetsLogic,
+  createOrganizationAssetLogic,
+  updateOrganizationAssetLogic,
+  deleteOrganizationAssetLogic,
+  batchDeleteOrganizationAssetsLogic
 } from './assets.organization'

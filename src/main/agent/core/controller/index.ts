@@ -12,7 +12,6 @@ import { McpHub } from '@services/mcp/McpHub'
 import { SkillsManager } from '@services/skills'
 import { version as extensionVersion } from '../../../../../package.json'
 import { ExtensionMessage, Platform } from '@shared/ExtensionMessage'
-import { HistoryItem } from '@shared/HistoryItem'
 import { WebviewMessage } from '@shared/WebviewMessage'
 import type { ContentPart, Host } from '@shared/WebviewMessage'
 import { validateWebviewMessageContract } from '@shared/WebviewMessage'
@@ -22,14 +21,23 @@ import {
   deleteChatermHistoryByTaskId,
   getTaskMetadata,
   saveTaskMetadata,
+  saveTaskTitle,
+  ensureTaskMetadataExists,
   ensureMcpServersDirectoryExists
 } from '../storage/disk'
-import { getAllExtensionState, getGlobalState, updateApiConfiguration, updateGlobalState, getUserConfig, getModelOptions } from '../storage/state'
+import { isValidCommand } from '../../../storage/db/commandValidation'
+import { getAllExtensionState, updateGlobalState, getUserConfig, getModelOptions } from '../storage/state'
 import { Task } from '../task'
 import { ApiConfiguration, ApiProvider, PROVIDER_MODEL_KEY_MAP } from '@shared/api'
 import { TITLE_GENERATION_PROMPT, TITLE_GENERATION_PROMPT_CN } from '../prompts/system'
 import { DEFAULT_LANGUAGE_SETTINGS } from '@shared/Languages'
 import type { CommandGenerationContext } from '@shared/WebviewMessage'
+import { isChineseEdition } from '../../../config/edition'
+import { mark } from '@perf'
+const logger = createLogger('agent')
+// TODO: Replace hardcoded model names with chaterm-model configuration
+const AI_SUGGEST_MODEL_CN = 'Qwen-Plus'
+const AI_SUGGEST_MODEL_GLOBAL = 'gemini-3-pro'
 
 export class Controller {
   private postMessage: (message: ExtensionMessage) => Promise<boolean> | undefined
@@ -39,7 +47,7 @@ export class Controller {
   skillsManager: SkillsManager
 
   constructor(postMessage: (message: ExtensionMessage) => Promise<boolean> | undefined, getMcpSettingsFilePath: () => Promise<string>) {
-    console.log('Controller instantiated')
+    logger.debug('Controller instantiated', { event: 'agent.controller.init' })
     this.postMessage = postMessage
 
     this.mcpHub = new McpHub(
@@ -52,7 +60,7 @@ export class Controller {
     // Initialize Skills Manager
     this.skillsManager = new SkillsManager((msg) => this.postMessageToWebview(msg))
     this.skillsManager.initialize().catch((error) => {
-      console.error('[Controller] Failed to initialize SkillsManager:', error)
+      logger.error('[Controller] Failed to initialize SkillsManager', { error: error })
     })
   }
 
@@ -78,7 +86,9 @@ export class Controller {
       try {
         await task.reloadSecurityConfig()
       } catch (error) {
-        console.warn(`[SecurityConfig] Failed to hot reload configuration in Task ${task.taskId}:`, error)
+        logger.warn(`[SecurityConfig] Failed to hot reload configuration in Task ${task.taskId}`, {
+          error: error
+        })
       }
     })
     await Promise.allSettled(promises)
@@ -102,56 +112,111 @@ export class Controller {
     await updateGlobalState('userInfo', info)
   }
 
-  async initTask(hosts: Host[], task?: string, historyItem?: HistoryItem, taskId?: string, contentParts?: ContentPart[]) {
-    console.log('initTask', task, historyItem, 'taskId:', taskId)
-    const resolvedTaskId = taskId ?? historyItem?.id
+  /**
+   * Build ApiConfiguration for a given model name (from model options). Includes thinking models.
+   * Returns base config unchanged if modelName is empty or not found.
+   */
+  private async buildApiConfigurationForModel(base: ApiConfiguration, modelName: string): Promise<ApiConfiguration> {
+    if (!modelName?.trim()) return base
+    const modelOptions = await getModelOptions(false)
+    const selectedModel = modelOptions.find((m) => m.name === modelName)
+    if (!selectedModel?.apiProvider) return base
+    const modelKey = PROVIDER_MODEL_KEY_MAP[selectedModel.apiProvider] || 'defaultModelId'
+    return {
+      ...base,
+      apiProvider: selectedModel.apiProvider as ApiProvider,
+      [modelKey]: selectedModel.name
+    }
+  }
+
+  /**
+   * Build ApiConfiguration from task metadata model_usage entry (model_id + model_provider_id).
+   */
+  private buildApiConfigurationFromMetadata(base: ApiConfiguration, modelId: string, modelProviderId: string): ApiConfiguration {
+    if (!modelId?.trim() || !modelProviderId?.trim()) return base
+    const modelKey = PROVIDER_MODEL_KEY_MAP[modelProviderId] || 'defaultModelId'
+    return {
+      ...base,
+      apiProvider: modelProviderId as ApiProvider,
+      [modelKey]: modelId
+    }
+  }
+
+  async initTask(hosts: Host[], task?: string, taskId?: string, contentParts?: ContentPart[], modelName?: string) {
+    const resolvedTaskId = taskId
+    mark('chaterm/agent/willCreateTask')
+    logger.info('Initializing task', {
+      event: 'agent.task.init',
+      taskId: resolvedTaskId || 'new',
+      hasInitialPrompt: !!task
+    })
     if (resolvedTaskId) {
       await this.clearTask(resolvedTaskId)
     }
     const { apiConfiguration, userRules, autoApprovalSettings } = await getAllExtensionState()
     const customInstructions = this.formatUserRulesToInstructions(userRules)
 
-    // Create task immediately without waiting for title generation
+    let resolvedApiConfiguration: ApiConfiguration
+    if (modelName?.trim()) {
+      resolvedApiConfiguration = await this.buildApiConfigurationForModel(apiConfiguration, modelName)
+    } else if (resolvedTaskId) {
+      const metadata = await getTaskMetadata(resolvedTaskId)
+      const lastUsage = metadata?.model_usage?.length ? metadata.model_usage[metadata.model_usage.length - 1] : null
+      if (lastUsage?.model_id && lastUsage?.model_provider_id) {
+        resolvedApiConfiguration = this.buildApiConfigurationFromMetadata(apiConfiguration, lastUsage.model_id, lastUsage.model_provider_id)
+      } else {
+        resolvedApiConfiguration = apiConfiguration
+      }
+    } else {
+      resolvedApiConfiguration = apiConfiguration
+    }
+
+    // Ensure metadata row exists before Task constructor runs,
+    // so touchTaskUpdatedAt cannot insert a title-less row first.
+    if (task && taskId) {
+      const initialTitle = task.substring(0, 50).trim() || undefined
+      await ensureTaskMetadataExists(taskId, initialTitle)
+    }
+
     let newTask: Task
     const postState = () => this.postStateToWebview(newTask?.taskId ?? resolvedTaskId)
     const postMessage = (message: ExtensionMessage) => this.postMessageToWebview(message, newTask?.taskId ?? resolvedTaskId)
 
     newTask = new Task(
-      (historyItem) => this.updateTaskHistory(historyItem),
       postState,
       postMessage,
       (taskId) => this.reinitExistingTaskFromId(taskId),
-      apiConfiguration,
+      resolvedApiConfiguration,
       autoApprovalSettings,
       hosts,
       this.mcpHub,
       this.skillsManager,
       customInstructions,
       task,
-      historyItem,
-      undefined, // Don't pass generated title initially
+      undefined, // chatTitle - Don't pass generated title initially
       taskId,
       contentParts
     )
 
     this.tasks.set(newTask.taskId, newTask)
+    mark('chaterm/agent/didCreateTask')
 
     // Generate chat title asynchronously for new tasks (non-blocking)
-    if (task && taskId && !historyItem) {
+    if (task && taskId) {
       // Start title generation in background without awaiting
       this.generateChatTitle(task, taskId).catch((error) => {
-        console.error('Failed to generate chat title:', error)
+        logger.error('Failed to generate chat title', { error: error })
         // Title generation failure doesn't affect task execution
       })
     }
   }
 
   async reinitExistingTaskFromId(taskId: string) {
-    const history = await this.getTaskWithId(taskId)
-    if (history) {
+    const { taskId: existingTaskId } = await this.getTaskWithId(taskId)
+    if (existingTaskId) {
       const existingTask = this.getTaskFromId(taskId)
       const hosts = existingTask?.hosts || []
-      await this.initTask(hosts, undefined, history.historyItem, taskId)
+      await this.initTask(hosts, undefined, existingTaskId)
     }
   }
 
@@ -179,7 +244,7 @@ export class Controller {
     if (process.env.NODE_ENV === 'test' || process.env.CHATERM_E2E === '1') {
       const check = validateWebviewMessageContract(message)
       if (!check.ok) {
-        console.warn('[IPC Contract] Invalid WebviewMessage:', check.error)
+        logger.warn('[IPC Contract] Invalid WebviewMessage', { value: check.error })
       }
     }
 
@@ -188,7 +253,7 @@ export class Controller {
 
     switch (message.type) {
       case 'newTask':
-        await this.initTask(message.hosts!, message.text, undefined, message.taskId, message.contentParts)
+        await this.initTask(message.hosts!, message.text, message.taskId, message.contentParts, message.modelName)
         if (message.taskId && message.hosts) {
           await updateTaskHosts(message.taskId, message.hosts)
         }
@@ -196,20 +261,22 @@ export class Controller {
       case 'condense':
         targetTask?.handleWebviewAskResponse('yesButtonClicked')
         break
-      case 'apiConfiguration':
-        if (message.apiConfiguration) {
-          await updateApiConfiguration(message.apiConfiguration)
-          // Update API configuration for all tasks
-          for (const task of this.tasks.values()) {
-            task.api = buildApiHandler(message.apiConfiguration)
-          }
-        }
-        await this.postStateToWebview(targetTaskId)
-        break
 
       case 'askResponse':
-        console.log('askResponse', message)
         if (targetTask) {
+          logger.debug('Received askResponse message', {
+            event: 'agent.controller.ask.response',
+            taskId: targetTask.taskId,
+            askResponse: message.askResponse
+          })
+          if (message.modelName?.trim() && message.modelName.trim() !== targetTask.api.getModel().id) {
+            const { apiConfiguration } = await getAllExtensionState()
+            if (apiConfiguration) {
+              const perTabConfig = await this.buildApiConfigurationForModel(apiConfiguration, message.modelName)
+              targetTask.api = buildApiHandler(perTabConfig)
+              targetTask.setApiProvider(perTabConfig.apiProvider)
+            }
+          }
           if (message.hosts) {
             targetTask.hosts = message.hosts
             if (targetTaskId) {
@@ -218,13 +285,24 @@ export class Controller {
           }
           if (message.askResponse === 'messageResponse') {
             // Clean up all command contexts for this task and broadcast close events
-            console.log(`[Controller] messageResponse received, cleaning up command contexts for task: ${targetTask.taskId}`)
+            logger.debug('Cleaning command contexts before handling messageResponse', {
+              event: 'agent.controller.message_response.cleanup.start',
+              taskId: targetTask.taskId
+            })
             Task.clearCommandContextsForTask(targetTask.taskId)
-            console.log(`[Controller] Command contexts cleaned, clearing todos...`)
             await targetTask.clearTodos('new_user_input')
-            console.log(`[Controller] Todos cleared, calling handleWebviewAskResponse...`)
+            logger.debug('Command contexts and todos cleared for messageResponse', {
+              event: 'agent.controller.message_response.cleanup.complete',
+              taskId: targetTask.taskId
+            })
           }
-          await targetTask.handleWebviewAskResponse(message.askResponse!, message.text, message.truncateAtMessageTs, message.contentParts)
+          await targetTask.handleWebviewAskResponse(
+            message.askResponse!,
+            message.text,
+            message.truncateAtMessageTs,
+            message.contentParts,
+            message.toolResult
+          )
         }
         break
       case 'showTaskWithId':
@@ -254,26 +332,25 @@ export class Controller {
     if (!currentTask) {
       return
     }
-    const { historyItem } = await this.getTaskWithId(currentTask.taskId)
     try {
       await currentTask.abortTask()
     } catch (error) {
-      console.error('Failed to abort task', error)
+      logger.error('Failed to abort task', { error: error })
     }
     await pWaitFor(() => currentTask.isStreaming === false || currentTask.didFinishAbortingStream || currentTask.isWaitingForFirstChunk, {
       timeout: 3_000
     }).catch(() => {
-      console.error('Failed to abort task')
+      logger.error('Failed to abort task')
     })
 
     try {
       await currentTask.clearTodos('user_cancelled')
     } catch (error) {
-      console.error('Failed to clear todos during cancelTask', error)
+      logger.error('Failed to clear todos during cancelTask', { error: error })
     }
 
     currentTask.abandoned = true
-    await this.initTask(currentTask.hosts, undefined, historyItem, currentTask.taskId)
+    await this.initTask(currentTask.hosts, undefined, currentTask.taskId)
   }
 
   async gracefulCancelTask(tabId?: string) {
@@ -285,37 +362,24 @@ export class Controller {
     try {
       await currentTask.gracefulAbortTask()
     } catch (error) {
-      console.error('Failed to gracefully abort task', error)
+      logger.error('Failed to gracefully abort task', { error: error })
     }
     try {
       await currentTask.clearTodos('user_cancelled')
     } catch (error) {
-      console.error('Failed to clear todos during gracefulCancelTask', error)
+      logger.error('Failed to clear todos during gracefulCancelTask', { error: error })
     }
   }
 
   async getTaskWithId(id: string): Promise<{
-    historyItem: HistoryItem
     taskId: string
     apiConversationHistory: Anthropic.MessageParam[]
   }> {
-    const history = ((await getGlobalState('taskHistory')) as HistoryItem[] | undefined) || []
-    const historyItem = history.find((item) => item.id === id)
-    if (historyItem) {
-      const taskId = await ensureTaskExists(id)
-      if (taskId) {
-        const apiConversationHistory = await getSavedApiConversationHistory(taskId)
-
-        return {
-          historyItem,
-          taskId,
-          apiConversationHistory
-        }
-      }
+    const taskId = await ensureTaskExists(id)
+    if (taskId) {
+      const apiConversationHistory = await getSavedApiConversationHistory(taskId)
+      return { taskId, apiConversationHistory }
     }
-    // if we tried to get a task that doesn't exist, remove it from state
-    // FIXME: this seems to happen sometimes when the json file doesn't save to disk for some reason
-    await this.deleteTaskFromState(id)
     throw new Error('Task not found')
   }
 
@@ -326,26 +390,16 @@ export class Controller {
       return
     }
 
-    const { historyItem } = await this.getTaskWithId(id)
-    await this.initTask(hosts, undefined, historyItem, id)
+    await this.getTaskWithId(id) // existence check only
+    await this.initTask(hosts, undefined, id)
   }
 
   async deleteTaskWithId(id: string) {
-    console.info('deleteTaskWithId: ', id)
+    logger.info('deleteTaskWithId', { taskId: id })
     await deleteChatermHistoryByTaskId(id)
     await this.clearTask(id)
-  }
-
-  async deleteTaskFromState(id: string) {
-    // Remove the task from history
-    const taskHistory = ((await getGlobalState('taskHistory')) as HistoryItem[] | undefined) || []
-    const updatedTaskHistory = taskHistory.filter((task) => task.id !== id)
-    await updateGlobalState('taskHistory', updatedTaskHistory)
-
-    // Notify the webview that the task has been deleted
-    await this.postStateToWebview()
-
-    return updatedTaskHistory
+    // Notify renderer so all UI components (sidebar, chatHistory) can remove the item.
+    await this.postMessageToWebview({ type: 'taskDeleted', taskId: id })
   }
 
   async postStateToWebview(taskId?: string) {
@@ -377,7 +431,7 @@ export class Controller {
       try {
         await task.abortTask()
       } catch (error) {
-        console.error('Failed to abort task during clearTask', error)
+        logger.error('Failed to abort task during clearTask', { error: error })
       }
 
       const terminalManager = task.getTerminalManager()
@@ -400,33 +454,7 @@ export class Controller {
     }
     this.tasks.clear()
   }
-  async updateTaskHistory(item: Partial<HistoryItem> & { id: string }): Promise<HistoryItem[]> {
-    const history = ((await getGlobalState('taskHistory')) as HistoryItem[]) || []
-    const idx = history.findIndex((h) => h.id === item.id)
-    if (idx !== -1) {
-      const existing = history[idx]
-      history[idx] = {
-        ...existing,
-        ...item,
-        task: existing.task || item.task || '',
-        // Use new chatTitle if provided and not empty, otherwise keep existing
-        chatTitle: item.chatTitle && item.chatTitle.trim() ? item.chatTitle : existing.chatTitle
-      }
-    } else {
-      // For new items, ensure required fields are present
-      if (!item.ts || !item.task || item.tokensIn === undefined || item.tokensOut === undefined || item.totalCost === undefined) {
-        throw new Error('New history item must include all required fields: ts, task, tokensIn, tokensOut, totalCost')
-      }
-      history.push(item as HistoryItem)
-    }
-    await updateGlobalState('taskHistory', history)
-    // Notify renderer process that taskHistory has been updated
-    await this.postMessageToWebview({
-      type: 'taskHistoryUpdated',
-      taskId: item.id
-    })
-    return history
-  }
+  // updateTaskHistory removed - task metadata now persisted via agent_task_metadata_v1
 
   async validateApiKey(configuration: ApiConfiguration): Promise<{ isValid: boolean; error?: string }> {
     // For LiteLLM, use createSync for synchronous initialization
@@ -517,11 +545,11 @@ export class Controller {
           tabId: tabId
         })
       } catch (streamError) {
-        console.error('Error processing AI stream:', streamError)
+        logger.error('Error processing AI stream', { error: streamError })
         throw streamError
       }
     } catch (error) {
-      console.error('Command generation failed:', error)
+      logger.error('Command generation failed', { error: error })
 
       // Send error response back to webview with tabId for proper routing
       await this.postMessageToWebview({
@@ -590,7 +618,7 @@ export class Controller {
           commandMessageId
         })
       } catch (streamError) {
-        console.error('Explain command stream error:', streamError)
+        logger.error('Explain command stream error', { error: streamError })
         await this.postMessageToWebview({
           type: 'explainCommandResponse',
           error: streamError instanceof Error ? streamError.message : 'Explain failed',
@@ -599,7 +627,7 @@ export class Controller {
         })
       }
     } catch (error) {
-      console.error('Explain command failed:', error)
+      logger.error('Explain command failed', { error: error })
       await this.postMessageToWebview({
         type: 'explainCommandResponse',
         error: error instanceof Error ? error.message : 'Explain failed',
@@ -669,12 +697,7 @@ export class Controller {
 
       return await Promise.race([titleGenerationPromise, timeoutPromise])
     } catch (error) {
-      // Only log as error if it's not a timeout (timeout is expected when API is slow)
-      if (error instanceof Error && error.message === 'Title generation timeout') {
-        console.warn('Chat title generation timed out (API may be slow)')
-      } else {
-        console.error('Chat title generation failed:', error)
-      }
+      logger.error('Chat title generation failed', { error: error })
       // Always return empty string to avoid disrupting task execution
       return ''
     }
@@ -686,7 +709,7 @@ export class Controller {
   private async _performTitleGeneration(userTask: string, taskId: string): Promise<string> {
     const { apiConfiguration } = await getAllExtensionState()
     if (!apiConfiguration) {
-      console.warn('API configuration not found, skipping title generation')
+      logger.warn('API configuration not found, skipping title generation')
       return ''
     }
 
@@ -735,23 +758,25 @@ export class Controller {
         .substring(0, 100) // Limit to 100 characters
 
       if (cleanedTitle) {
-        console.log('Generated chat title:', cleanedTitle)
+        logger.debug('Generated chat title', {
+          event: 'agent.chat.title.generated',
+          taskId,
+          titleLength: cleanedTitle.length
+        })
 
         // Update Task instance's chatTitle property
         const task = this.getTaskFromId(taskId)
         if (task) {
           task.chatTitle = cleanedTitle
-          // Update history immediately with the new title
-          await this.updateTaskHistory({
-            id: taskId,
-            chatTitle: cleanedTitle
-          })
         }
 
-        // Send the generated title to webview for immediate UI update
+        // Write title to agent_task_metadata_v1 (sole persistence target)
+        await saveTaskTitle(taskId, cleanedTitle)
+
+        // Send the updated title to webview for immediate UI update
         await this.postMessageToWebview({
-          type: 'chatTitleGenerated',
-          chatTitle: cleanedTitle,
+          type: 'taskTitleUpdated',
+          title: cleanedTitle,
           taskId: taskId
         })
 
@@ -760,9 +785,192 @@ export class Controller {
 
       return ''
     } catch (streamError) {
-      console.error('Error processing title generation stream:', streamError)
+      logger.error('Error processing title generation stream', { error: streamError })
       return ''
     }
+  }
+
+  /**
+   * Handle AI command suggestion for terminal autocomplete.
+   * Returns a single predicted command based on partial user input,
+   * or null if prediction is not possible.
+   */
+  async handleAiSuggestCommand(partialCommand: string, osInfo?: string): Promise<{ command: string; explanation: string } | null> {
+    const trace = (message: string, meta?: Record<string, unknown>) => {
+      logger.debug(message, {
+        event: 'agent.aiSuggest.trace',
+        ...meta
+      })
+    }
+
+    const trimmed = partialCommand?.trim() ?? ''
+
+    if (trimmed.length < 3) {
+      return null
+    }
+
+    try {
+      const { apiConfiguration } = await getAllExtensionState()
+      if (!apiConfiguration) {
+        return null
+      }
+
+      const timeoutMs = 2000
+      const fixedModelId = this.getFixedAiSuggestModelId()
+      // Clone configuration with a short timeout for autocomplete responsiveness
+      const suggestConfig: ApiConfiguration = {
+        ...apiConfiguration,
+        apiProvider: 'default',
+        defaultModelId: fixedModelId,
+        requestTimeoutMs: timeoutMs
+      }
+      trace('AI suggest provider selected', {
+        fixedModelId,
+        timeoutMs
+      })
+
+      if (!suggestConfig.defaultBaseUrl || !suggestConfig.defaultApiKey) {
+        return null
+      }
+
+      const api = buildApiHandler(suggestConfig)
+      const readStreamText = async (systemPrompt: string, userInput: string): Promise<string> => {
+        const conversation: Anthropic.MessageParam[] = [{ role: 'user' as const, content: userInput }]
+        const stream = api.createMessage(systemPrompt, conversation)
+        let output = ''
+
+        for await (const chunk of stream) {
+          if (chunk.type === 'text') {
+            output += chunk.text
+          }
+        }
+
+        return output
+      }
+
+      let userLanguage = DEFAULT_LANGUAGE_SETTINGS
+      try {
+        const userConfig = await getUserConfig()
+        if (userConfig?.language) {
+          userLanguage = userConfig.language
+        }
+      } catch {
+        // Ignore errors and fallback to default language.
+      }
+      const explanationLanguage = this.resolveAiSuggestExplanationLanguage(userLanguage)
+
+      const result = await readStreamText(this.buildAiSuggestPrompt(osInfo, explanationLanguage), trimmed)
+      const parsed = this.parseAiSuggestResponse(result, explanationLanguage)
+      if (!parsed) {
+        return null
+      }
+
+      if (!isValidCommand(parsed.command)) {
+        trace('AI suggest rejected by validator')
+        return null
+      }
+
+      trace('AI suggest accepted', { outputLength: parsed.command.length, explanationLength: parsed.explanation.length })
+      return parsed
+    } catch (error) {
+      trace('AI suggest failed', { error: error instanceof Error ? error.message : String(error) })
+      // Silently return null on any error to avoid disrupting autocomplete flow
+      return null
+    }
+  }
+
+  /**
+   * Build system prompt for AI command suggestion.
+   * Single-call prompt that returns both the predicted command and a brief explanation.
+   */
+  private buildAiSuggestPrompt(osInfo?: string, language?: 'zh' | 'en'): string {
+    const langInstruction = language === 'zh' ? 'EXP in Chinese, max 16 chars.' : 'EXP in English, max 8 words.'
+    const exampleExp = language === 'zh' ? '查看最近10条提交' : 'Show recent 10 commits'
+    return `You are a terminal autocomplete engine.
+The user message is a PARTIAL command typed in a terminal${osInfo ? ` (OS: ${osInfo})` : ''}. Complete it.
+
+Rules:
+- The completed command MUST start with exactly what the user typed
+- Prefer common commands and flags over obscure ones
+- Never suggest destructive commands (rm -rf /, mkfs, dd to disk)
+- If unsure, return: NONE
+- Format (two lines only, no other text):
+  CMD: <complete command>
+  EXP: <brief purpose>
+- ${langInstruction}
+
+Example:
+Input: git lo
+CMD: git log --oneline -10
+EXP: ${exampleExp}`
+  }
+
+  /**
+   * Parse the combined AI suggest response into command and explanation.
+   * Expected format:
+   *   CMD: <command>
+   *   EXP: <explanation>
+   */
+  private parseAiSuggestResponse(response: string, language: 'zh' | 'en'): { command: string; explanation: string } | null {
+    const text = response.trim()
+    if (!text || text.toUpperCase() === 'NONE') {
+      return null
+    }
+
+    const cmdMatch = text.match(/^CMD:\s*(.+)/im)
+    const expMatch = text.match(/^EXP:\s*(.+)/im)
+
+    if (!cmdMatch) {
+      // Fallback: treat entire response as command (backward compat with simple models)
+      // Strip any leftover label prefixes that slipped through
+      const cleaned = this.extractCommandFromResponse(text.replace(/^(?:cmd|exp):\s*/gim, '').trim())
+      if (!cleaned || cleaned.toUpperCase() === 'NONE') {
+        return null
+      }
+      return {
+        command: cleaned,
+        explanation: this.limitAiSuggestExplanation(this.getAiSuggestExplanationFallback(cleaned, language), language)
+      }
+    }
+
+    const command = this.extractCommandFromResponse(cmdMatch[1])
+    if (!command || command.toUpperCase() === 'NONE') {
+      return null
+    }
+
+    let explanation = expMatch ? expMatch[1].trim().replace(/^["']|["']$/g, '') : ''
+    if (!explanation) {
+      explanation = this.getAiSuggestExplanationFallback(command, language)
+    }
+
+    return {
+      command,
+      explanation: this.limitAiSuggestExplanation(explanation, language)
+    }
+  }
+
+  private resolveAiSuggestExplanationLanguage(language?: string): 'zh' | 'en' {
+    return language?.toLowerCase().startsWith('zh') ? 'zh' : 'en'
+  }
+
+  private getAiSuggestExplanationFallback(_command: string, language: 'zh' | 'en'): string {
+    if (language === 'zh') {
+      return 'AI 建议'
+    }
+    return 'AI suggested'
+  }
+
+  private limitAiSuggestExplanation(explanation: string, language: 'zh' | 'en'): string {
+    const normalized = explanation.replace(/\s+/g, ' ').trim()
+    const maxChars = language === 'zh' ? 20 : 60
+    if (normalized.length <= maxChars) {
+      return normalized
+    }
+    return `${normalized.slice(0, maxChars).trimEnd()}...`
+  }
+
+  private getFixedAiSuggestModelId(): string {
+    return isChineseEdition() ? AI_SUGGEST_MODEL_CN : AI_SUGGEST_MODEL_GLOBAL
   }
 
   /**
@@ -861,6 +1069,7 @@ function removeSensitiveKeys(obj: any): any {
       if (
         key.toLowerCase().includes('accesskey') ||
         key.toLowerCase().includes('secretkey') ||
+        key.toLowerCase().includes('apikey') ||
         key.toLowerCase().includes('endpoint') ||
         key.toLowerCase().includes('awsprofile')
       ) {

@@ -95,6 +95,16 @@
           />
         </a-form-item>
         <a-form-item
+          :label="$t('user.showCloseButton')"
+          class="user_my-ant-form-item"
+        >
+          <a-switch
+            :checked="userConfig.showCloseButton === 1"
+            class="user_my-ant-form-item-content"
+            @change="handleShowCloseButtonChange"
+          />
+        </a-form-item>
+        <a-form-item
           label="SSH Agents"
           class="user_my-ant-form-item"
         >
@@ -141,6 +151,7 @@
                 <a-select-option value="none">{{ $t('user.none') }}</a-select-option>
                 <a-select-option value="paste">{{ $t('user.pasteClipboard') }}</a-select-option>
                 <a-select-option value="contextMenu">{{ $t('user.showContextMenu') }}</a-select-option>
+                <a-select-option value="closeTab">{{ $t('user.closeCurrentTab') }}</a-select-option>
               </a-select>
             </div>
             <div class="mouse-event-row">
@@ -362,6 +373,8 @@ import { notification } from 'ant-design-vue'
 import { userConfigStore } from '@/services/userConfigStoreService'
 import { useI18n } from 'vue-i18n'
 import eventBus from '@/utils/eventBus'
+
+const logger = createRendererLogger('settings.terminal')
 const { t } = useI18n()
 const api = (window as any).api
 
@@ -378,6 +391,7 @@ const defaultProxyConfig = {
 // const proxyConfigs: Array<DefaultProxyConfig> = []
 
 const proxyConfig = ref(defaultProxyConfig)
+const isApplying = ref(false)
 
 interface ProxyConfig {
   name: string
@@ -398,6 +412,7 @@ const userConfig = ref<{
   rightMouseEvent: string
   terminalType: string
   pinchZoomStatus: number
+  showCloseButton: number
   sshAgentsStatus: number
   sshAgentsMap: string
   sshProxyStatus: boolean
@@ -411,6 +426,7 @@ const userConfig = ref<{
   rightMouseEvent: 'contextMenu',
   terminalType: 'vt100',
   pinchZoomStatus: 1,
+  showCloseButton: 1,
   sshAgentsStatus: 2,
   sshAgentsMap: '[]',
   sshProxyStatus: false,
@@ -500,7 +516,7 @@ const getDefaultFontFamily = async (): Promise<string> => {
       return '"SF Mono", Monaco, "Courier New", Courier, monospace'
     }
   } catch (error) {
-    console.warn('Failed to get platform, using default font:', error)
+    logger.warn('Failed to get platform, using default font', { error: error })
   }
   return 'Menlo, Monaco, "Courier New", Consolas, Courier, monospace'
 }
@@ -520,7 +536,7 @@ const loadSavedConfig = async () => {
       userConfig.value.fontFamily = await getDefaultFontFamily()
     }
   } catch (error) {
-    console.error('Failed to load config:', error)
+    logger.error('Failed to load config', { error: error })
     notification.error({
       message: t('user.loadConfigFailed'),
       description: t('user.loadConfigFailedDescription')
@@ -543,6 +559,11 @@ const handleSshAgentsStatusChange = async (checked) => {
 const handlePinchZoomStatusChange = async (checked) => {
   userConfig.value.pinchZoomStatus = checked ? 1 : 2
   eventBus.emit('pinchZoomStatusChanged', checked)
+}
+
+const handleShowCloseButtonChange = async (checked) => {
+  userConfig.value.showCloseButton = checked ? 1 : 2
+  eventBus.emit('showCloseButtonChanged', checked)
 }
 
 // SSH proxy
@@ -723,6 +744,7 @@ const saveConfig = async () => {
       rightMouseEvent: userConfig.value.rightMouseEvent,
       terminalType: userConfig.value.terminalType,
       pinchZoomStatus: userConfig.value.pinchZoomStatus,
+      showCloseButton: userConfig.value.showCloseButton,
       sshAgentsStatus: userConfig.value.sshAgentsStatus,
       sshAgentsMap: userConfig.value.sshAgentsMap,
       sshProxyConfigs: userConfig.value.sshProxyConfigs
@@ -730,7 +752,7 @@ const saveConfig = async () => {
 
     await userConfigStore.saveConfig(configToStore as any)
   } catch (error) {
-    console.error('Failed to save config:', error)
+    logger.error('Failed to save config', { error: error })
     notification.error({
       message: t('user.error'),
       description: t('user.saveConfigFailedDescription')
@@ -741,6 +763,7 @@ const saveConfig = async () => {
 watch(
   () => userConfig.value,
   async () => {
+    if (isApplying.value) return
     await saveConfig()
   },
   { deep: true }
@@ -753,16 +776,22 @@ watch(
   }
 )
 
+const reloadConfigOnSync = async () => {
+  await loadSavedConfig()
+}
+
 const handleOpenAddProxyConfigModal = () => {
   handleProxyConfigAdd()
 }
 
 onMounted(async () => {
   await loadSavedConfig()
+  eventBus.on('userConfigSyncApplied', reloadConfigOnSync)
   eventBus.on('openAddProxyConfigModal', handleOpenAddProxyConfigModal)
 })
 
 onBeforeUnmount(() => {
+  eventBus.off('userConfigSyncApplied', reloadConfigOnSync)
   eventBus.off('openAddProxyConfigModal', handleOpenAddProxyConfigModal)
 })
 </script>
@@ -876,6 +905,38 @@ onBeforeUnmount(() => {
 .terminal-type-select {
   width: 180px !important;
   text-align: left;
+}
+
+.terminal-type-select :deep(.ant-select-selector) {
+  background-color: var(--select-bg);
+  border: 1px solid var(--select-border);
+  border-radius: 6px;
+  color: var(--text-color);
+  transition: all 0.3s;
+  height: 32px;
+}
+
+.terminal-type-select :deep(.ant-select-selector:hover) {
+  border-color: #1890ff;
+  background-color: var(--select-hover-bg);
+}
+
+.terminal-type-select :deep(.ant-select-focused .ant-select-selector),
+.terminal-type-select :deep(.ant-select-selector:focus) {
+  border-color: #1890ff;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+  background-color: var(--select-hover-bg);
+}
+
+.terminal-type-select :deep(.ant-select-selection-item) {
+  color: var(--text-color);
+  font-size: 14px;
+  line-height: 32px;
+}
+
+.terminal-type-select :deep(.ant-select-arrow) {
+  color: var(--text-color);
+  opacity: 0.7;
 }
 
 .font-family-select {

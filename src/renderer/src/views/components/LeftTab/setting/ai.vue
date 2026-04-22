@@ -46,6 +46,31 @@
         </p>
       </div>
 
+      <!-- Knowledge Base Search -->
+      <div class="setting-item">
+        <a-checkbox
+          v-model:checked="kbSearchEnabled"
+          @change="handleKbSearchEnabledChange(kbSearchEnabled)"
+        >
+          {{ $t('user.kbSearchEnabled') }}
+        </a-checkbox>
+        <p class="setting-description">
+          {{ $t('user.kbSearchEnabledDescribe') }}
+        </p>
+      </div>
+
+      <div class="setting-item">
+        <a-checkbox
+          v-model:checked="experienceExtractionEnabled"
+          @change="handleExperienceExtractionEnabledChange(experienceExtractionEnabled)"
+        >
+          {{ $t('user.experienceExtractionEnabled') }}
+        </a-checkbox>
+        <p class="setting-description">
+          {{ $t('user.experienceExtractionEnabledDescribe') }}
+        </p>
+      </div>
+
       <!-- Auto Approval -->
       <div class="setting-item">
         <a-checkbox v-model:checked="autoApprovalSettings.enabled">
@@ -241,12 +266,15 @@ import { ChatSettings, DEFAULT_CHAT_SETTINGS, ProxyConfig } from '@/agent/storag
 import i18n from '@/locales'
 import eventBus from '@/utils/eventBus'
 
+const logger = createRendererLogger('settings.ai')
 const { t } = i18n.global
 
 const thinkingBudgetTokens = ref(2048)
 const enableExtendedThinking = ref(true)
 const reasoningEffort = ref('low')
 const shellIntegrationTimeout = ref(4)
+const kbSearchEnabled = ref(true)
+const experienceExtractionEnabled = ref(true)
 const autoApprovalSettings = ref<AutoApprovalSettings>(DEFAULT_AUTO_APPROVAL_SETTINGS)
 const chatSettings = ref<ChatSettings>(DEFAULT_CHAT_SETTINGS)
 const customInstructions = ref('')
@@ -283,7 +311,7 @@ watch(
 
       await updateGlobalState('autoApprovalSettings', settingsToStore)
     } catch (error) {
-      console.error('Failed to update auto approval settings:', error)
+      logger.error('Failed to update auto approval settings', { error: error })
       notification.error({
         message: 'Error',
         description: 'Failed to update auto approval settings'
@@ -310,9 +338,9 @@ watch(
       }
 
       await updateGlobalState('autoApprovalSettings', settingsToStore)
-      console.log('[Settings] Auto-execute read-only commands setting saved:', newValue)
+      logger.info('Auto-execute read-only commands setting saved', { data: newValue })
     } catch (error) {
-      console.error('Failed to update auto-execute read-only commands setting:', error)
+      logger.error('Failed to update auto-execute read-only commands setting', { error: error })
       notification.error({
         message: 'Error',
         description: 'Failed to update settings'
@@ -333,7 +361,7 @@ watch(
 
       await updateGlobalState('chatSettings', settingsToStore)
     } catch (error) {
-      console.error('Failed to update chat settings:', error)
+      logger.error('Failed to update chat settings', { error: error })
       notification.error({
         message: t('user.error'),
         description: t('user.saveConfigFailedDescription')
@@ -346,9 +374,16 @@ watch(
 const loadSavedConfig = async () => {
   try {
     // Load other configurations
-    thinkingBudgetTokens.value = ((await getGlobalState('thinkingBudgetTokens')) as number) || 2048
+    thinkingBudgetTokens.value = ((await getGlobalState('thinkingBudgetTokens')) as number) ?? 2048
     customInstructions.value = ((await getGlobalState('customInstructions')) as string) || ''
 
+    const savedKbSearchEnabled = await getGlobalState('kbSearchEnabled')
+    kbSearchEnabled.value = savedKbSearchEnabled === undefined || savedKbSearchEnabled === null ? true : (savedKbSearchEnabled as boolean)
+    const savedExperienceExtractionEnabled = await getGlobalState('experienceExtractionEnabled')
+    experienceExtractionEnabled.value =
+      savedExperienceExtractionEnabled === undefined || savedExperienceExtractionEnabled === null
+        ? true
+        : (savedExperienceExtractionEnabled as boolean)
     needProxy.value = ((await getGlobalState('needProxy')) as boolean) || false
     proxyConfig.value = ((await getGlobalState('proxyConfig')) as ProxyConfig) || defaultProxyConfig
 
@@ -375,7 +410,7 @@ const loadSavedConfig = async () => {
     reasoningEffort.value = ((await getGlobalState('reasoningEffort')) as string) || 'low'
     shellIntegrationTimeout.value = ((await getGlobalState('shellIntegrationTimeout')) as number) || 4
   } catch (error) {
-    console.error('Failed to load config:', error)
+    logger.error('Failed to load config', { error: error })
     notification.error({
       message: t('user.loadConfigFailed'),
       description: t('user.loadConfigFailedDescription')
@@ -404,13 +439,15 @@ const saveConfig = async () => {
     await updateGlobalState('chatSettings', chatSettingsToSave)
     await updateGlobalState('reasoningEffort', reasoningEffort.value)
     await updateGlobalState('shellIntegrationTimeout', shellIntegrationTimeout.value)
+    await updateGlobalState('kbSearchEnabled', kbSearchEnabled.value)
+    await updateGlobalState('experienceExtractionEnabled', experienceExtractionEnabled.value)
     await updateGlobalState('needProxy', needProxy.value)
     const proxyConfigToSave: ProxyConfig = {
       ...proxyConfig.value
     }
     await updateGlobalState('proxyConfig', proxyConfigToSave)
   } catch (error) {
-    console.error('Failed to save config:', error)
+    logger.error('Failed to save config', { error: error })
     notification.error({
       message: t('user.error'),
       description: t('user.saveConfigFailedDescription')
@@ -424,7 +461,7 @@ watch(
     try {
       await updateGlobalState('reasoningEffort', newValue)
     } catch (error) {
-      console.error('Failed to update reasoningEffort:', error)
+      logger.error('Failed to update reasoningEffort', { error: error })
     }
   }
 )
@@ -435,7 +472,7 @@ watch(
     try {
       await updateGlobalState('customInstructions', newValue)
     } catch (error) {
-      console.error('Failed to update customInstructions:', error)
+      logger.error('Failed to update customInstructions', { error: error })
     }
   }
 )
@@ -470,7 +507,7 @@ watch(
       }
       await updateGlobalState('proxyConfig', proxyConfigToSave)
     } catch (error) {
-      console.error('Failed to update proxyConfig:', error)
+      logger.error('Failed to update proxyConfig', { error: error })
     }
   },
   { deep: true }
@@ -482,7 +519,7 @@ watch(
     try {
       await updateGlobalState('needProxy', newValue)
     } catch (error) {
-      console.error('Failed to update needProxy:', error)
+      logger.error('Failed to update needProxy', { error: error })
     }
   }
 )
@@ -490,13 +527,20 @@ watch(
 // Load saved configuration when component is mounted
 onMounted(async () => {
   await loadSavedConfig()
-  await saveConfig()
+  // Listen for ai_preferences specific sync events
+  eventBus.on('aiPreferencesSyncApplied', onAiSyncApplied)
 })
 
 // Save configuration before component unmounts
 onBeforeUnmount(async () => {
+  eventBus.off('aiPreferencesSyncApplied', onAiSyncApplied)
   await saveConfig()
 })
+
+const onAiSyncApplied = () => {
+  // aiPreferencesSyncService already applied remote data to local storage, just reload UI
+  loadSavedConfig()
+}
 
 // Validate shell integration timeout input
 const validateTimeout = (value: string) => {
@@ -526,10 +570,30 @@ watch(
         await updateGlobalState('shellIntegrationTimeout', newValue)
       }
     } catch (error) {
-      console.error('Failed to update shellIntegrationTimeout:', error)
+      logger.error('Failed to update shellIntegrationTimeout', { error: error })
     }
   }
 )
+
+// Handle KB search enabled toggle
+const handleKbSearchEnabledChange = async (checked: boolean) => {
+  try {
+    await updateGlobalState('kbSearchEnabled', checked)
+    if (window.api?.kbSetSearchEnabled) {
+      await window.api.kbSetSearchEnabled(checked)
+    }
+  } catch (error) {
+    logger.error('Failed to update kbSearchEnabled', { error })
+  }
+}
+
+const handleExperienceExtractionEnabledChange = async (checked: boolean) => {
+  try {
+    await updateGlobalState('experienceExtractionEnabled', checked)
+  } catch (error) {
+    logger.error('Failed to update experienceExtractionEnabled', { error })
+  }
+}
 
 // Handle extended thinking toggle
 const handleEnableExtendedThinking = (checked: boolean) => {
@@ -547,7 +611,7 @@ const openSecurityConfig = async () => {
     // Open tab via eventBus
     eventBus.emit('open-user-tab', 'securityConfigEditor')
   } catch (error) {
-    console.error('Failed to open security config editor:', error)
+    logger.error('Failed to open security config editor', { error: error })
     notification.error({
       message: t('user.error'),
       description: t('user.openSecurityConfigFailed')

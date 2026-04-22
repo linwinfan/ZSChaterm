@@ -81,6 +81,7 @@ describe('useChatMessages', () => {
     isExecutingCommand: false,
     lastStreamMessage: null,
     lastPartialMessage: null,
+    lastStateChatermMessages: null,
     shouldStickToBottom: true,
     isCancelled: false
   })
@@ -379,9 +380,7 @@ describe('useChatMessages', () => {
       expect(notification.error).toHaveBeenCalled()
     })
 
-    it('should return error when hosts are empty for non-chat type', async () => {
-      const { notification } = await import('ant-design-vue')
-
+    it('should send message even when hosts are empty for non-chat type', async () => {
       const { sendMessage } = useChatMessages(
         mockScrollToBottom,
         mockClearTodoState,
@@ -395,10 +394,9 @@ describe('useChatMessages', () => {
       mockState.hosts.value = []
       mockState.chatTypeValue.value = 'cmd'
 
-      const result = await sendMessage('send')
+      await sendMessage('send')
 
-      expect(result).toBe('ASSET_ERROR')
-      expect(notification.error).toHaveBeenCalled()
+      expect(mockSendToMain).toHaveBeenCalled()
     })
 
     it('should switch to cmd when switch host is selected in agent mode', async () => {
@@ -724,7 +722,7 @@ describe('useChatMessages', () => {
       const message: any = { type: 'partialMessage' }
       await processMainMessage(message)
 
-      expect(consoleSpy).toHaveBeenCalledWith('AiTab: Ignoring message for no target tab:', 'partialMessage')
+      expect(consoleSpy).toHaveBeenCalledWith('[ai.chatMessages] Ignoring message for no target tab', { data: 'partialMessage' })
       consoleSpy.mockRestore()
     })
 
@@ -746,7 +744,7 @@ describe('useChatMessages', () => {
       }
       await processMainMessage(message)
 
-      expect(consoleSpy).toHaveBeenCalledWith('AiTab: Ignoring message for deleted tab:', 'non-existent-tab')
+      expect(consoleSpy).toHaveBeenCalledWith('[ai.chatMessages] Ignoring message for deleted tab', { detail: 'non-existent-tab' })
       consoleSpy.mockRestore()
     })
 
@@ -780,6 +778,81 @@ describe('useChatMessages', () => {
       expect(session.chatHistory[0].content).toBe('Assistant response')
       expect(session.chatHistory[0].role).toBe('assistant')
       expect(session.chatHistory[0].partial).toBe(true)
+    })
+
+    it('should preserve contentParts on new and updated assistant partial messages', async () => {
+      const { processMainMessage } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+      const firstContentParts = [
+        { type: 'text' as const, text: '知识库检索:' },
+        {
+          type: 'chip' as const,
+          chipType: 'doc' as const,
+          ref: {
+            absPath: '/mock/knowledgebase/rss2.md',
+            relPath: 'rss2.md',
+            name: 'rss2.md',
+            type: 'file' as const,
+            startLine: 1,
+            endLine: 3
+          }
+        }
+      ]
+      const secondContentParts = [
+        { type: 'text' as const, text: '知识库检索:' },
+        {
+          type: 'chip' as const,
+          chipType: 'doc' as const,
+          ref: {
+            absPath: '/mock/knowledgebase/rss2.md',
+            relPath: 'rss2.md',
+            name: 'rss2.md',
+            type: 'file' as const,
+            startLine: 4,
+            endLine: 6
+          }
+        }
+      ]
+
+      await processMainMessage({
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: '知识库检索',
+          type: 'say',
+          say: 'text',
+          partial: true,
+          ts: 100,
+          contentParts: firstContentParts
+        }
+      } as ExtensionMessage)
+
+      expect(session.chatHistory).toHaveLength(1)
+      expect(session.chatHistory[0].contentParts).toEqual(firstContentParts)
+
+      await processMainMessage({
+        type: 'partialMessage',
+        tabId: 'test-tab-1',
+        partialMessage: {
+          text: '知识库检索',
+          type: 'say',
+          say: 'text',
+          partial: false,
+          ts: 100,
+          contentParts: secondContentParts
+        }
+      } as ExtensionMessage)
+
+      expect(session.chatHistory).toHaveLength(1)
+      expect(session.chatHistory[0].contentParts).toEqual(secondContentParts)
     })
 
     it('should handle completion_result message', async () => {
@@ -866,7 +939,7 @@ describe('useChatMessages', () => {
       expect(mockMarkLatestMessageWithTodoUpdate).toHaveBeenCalledWith(session.chatHistory, todos)
     })
 
-    it('should handle chatTitleGenerated message', async () => {
+    it('should handle taskTitleUpdated message', async () => {
       const { processMainMessage } = useChatMessages(
         mockScrollToBottom,
         mockClearTodoState,
@@ -878,10 +951,10 @@ describe('useChatMessages', () => {
       const mockState = vi.mocked(useSessionState)()
 
       const message: any = {
-        type: 'chatTitleGenerated',
+        type: 'taskTitleUpdated',
         tabId: 'test-tab-1',
         taskId: 'test-tab-1',
-        chatTitle: 'New Chat Title'
+        title: 'New Chat Title'
       }
 
       await processMainMessage(message)
@@ -971,7 +1044,7 @@ describe('useChatMessages', () => {
       const session = mockState.currentSession.value!
       session.isCancelled = true
 
-      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const consoleSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
 
       const message: ExtensionMessage = {
         type: 'partialMessage',
@@ -988,7 +1061,7 @@ describe('useChatMessages', () => {
       await processMainMessage(message)
 
       expect(session.chatHistory).toHaveLength(0)
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('cancelled'))
+      expect(consoleSpy).toHaveBeenCalledWith('[ai.chatMessages] Ignoring partial message because task is cancelled', '')
       consoleSpy.mockRestore()
     })
 
@@ -1278,6 +1351,246 @@ describe('useChatMessages', () => {
       expect(sent.type).toBe('askResponse')
       expect(sent.askResponse).toBe('messageResponse')
       expect(sent.text).toBe('hello')
+    })
+
+    it('sends structured toolResult for commandSend without overloading text', async () => {
+      const session = createMockSession()
+      session.chatHistory.push({
+        id: 'm1',
+        role: 'assistant',
+        content: 'Run ls',
+        type: 'ask',
+        ask: 'command',
+        say: '',
+        ts: Date.now()
+      })
+
+      const mockTab = createMockTab('test-tab-1', session)
+      const chatTabs = ref([mockTab])
+      const currentChatId = ref('test-tab-1')
+      const chatInputParts = ref([])
+      const hosts = ref<Host[]>([{ host: '127.0.0.1', uuid: 'localhost', connection: 'localhost' }])
+      const chatTypeValue = ref('cmd')
+
+      vi.mocked(useSessionState).mockReturnValue({
+        chatTabs,
+        currentChatId,
+        currentTab: ref(mockTab),
+        currentSession: ref(mockTab.session),
+        chatInputParts,
+        hosts,
+        chatTypeValue
+      } as any)
+
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const toolResult = {
+        output: 'file1\nfile2',
+        toolName: 'execute_command'
+      }
+
+      await sendMessageWithContent('Terminal output:\n```\nfile1\nfile2\n```', 'commandSend', undefined, undefined, undefined, undefined, toolResult)
+
+      expect(mockSendToMain).toHaveBeenCalledTimes(1)
+      const sent = mockSendToMain.mock.calls[0][0]
+      expect(sent.type).toBe('askResponse')
+      expect(sent.askResponse).toBe('yesButtonClicked')
+      expect(sent.text).toBeUndefined()
+      expect(sent.toolResult).toEqual(toolResult)
+    })
+  })
+
+  describe('hosts parameter handling', () => {
+    it('should use default tab hosts when overrideHosts is not provided', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const currentTabHosts = mockState.currentTab.value!.hosts
+
+      await sendMessageWithContent('Test message', 'send', undefined, undefined, undefined, undefined)
+
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hosts: currentTabHosts
+        })
+      )
+    })
+
+    it('should use overrideHosts when provided', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const customHosts: Host[] = [
+        { host: '172.16.0.1', uuid: 'custom-host-1', connection: 'personal' },
+        { host: '172.16.0.2', uuid: 'custom-host-2', connection: 'organization' }
+      ]
+
+      await sendMessageWithContent('Test message', 'send', undefined, undefined, undefined, customHosts)
+
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hosts: customHosts
+        })
+      )
+    })
+
+    it('should attach hosts to user message in chat history', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      const customHosts: Host[] = [{ host: '192.168.2.10', uuid: 'edited-host', connection: 'personal' }]
+
+      await sendMessageWithContent('Edited message', 'send', undefined, undefined, undefined, customHosts)
+
+      const lastMessage = session.chatHistory[session.chatHistory.length - 1]
+      expect(lastMessage.hosts).toEqual(customHosts)
+    })
+
+    it('should set hosts to empty array when overrideHosts is empty', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const session = mockState.currentSession.value!
+
+      await sendMessageWithContent('Message', 'send', undefined, undefined, undefined, [])
+
+      const lastMessage = session.chatHistory[session.chatHistory.length - 1]
+      expect(lastMessage.hosts).toEqual([])
+    })
+
+    it('should handle truncate-and-send with edited hosts', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const mockState = vi.mocked(useSessionState)()
+      const originalHosts = mockState.currentTab.value!.hosts
+      const editedHosts: Host[] = [{ host: '10.10.10.10', uuid: 'new-host', connection: 'organization' }]
+
+      const truncateTs = Date.now() - 1000
+
+      await sendMessageWithContent('Edited content', 'send', undefined, truncateTs, undefined, editedHosts)
+
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: expect.any(String),
+          hosts: editedHosts
+        })
+      )
+
+      // Verify original tab hosts are not modified
+      expect(mockState.currentTab.value!.hosts).toEqual(originalHosts)
+    })
+
+    it('should preserve Host object fields that are supported by sendMessageToMain', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const detailedHosts: Host[] = [
+        {
+          host: '192.168.1.100',
+          uuid: 'detailed-host-uuid',
+          connection: 'organization',
+          organizationUuid: 'org-uuid-456',
+          assetType: 'linux-production'
+        }
+      ]
+
+      await sendMessageWithContent('Test', 'send', undefined, undefined, undefined, detailedHosts)
+
+      const callArgs = mockSendToMain.mock.calls[0][0]
+      expect(callArgs.hosts).toBeDefined()
+      expect(callArgs.hosts).toHaveLength(1)
+
+      // Verify that the currently supported fields are preserved
+      // Note: organizationUuid is not currently preserved by sendMessageToMain (line 119-124 in useChatMessages.ts)
+      expect(callArgs.hosts[0].host).toBe('192.168.1.100')
+      expect(callArgs.hosts[0].uuid).toBe('detailed-host-uuid')
+      expect(callArgs.hosts[0].connection).toBe('organization')
+      expect(callArgs.hosts[0].assetType).toBe('linux-production')
+    })
+
+    it('should support edit-and-resend with different hosts through truncateAtMessageTs', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const editedHosts: Host[] = [
+        { host: '192.168.1.10', uuid: 'host-1', connection: 'personal' },
+        { host: '192.168.1.20', uuid: 'host-3', connection: 'personal' }
+      ]
+
+      const truncateTs = Date.now() - 2000
+      const contentParts = [{ type: 'text' as const, text: 'Edited message' }]
+
+      await sendMessageWithContent('Edited message', 'send', undefined, truncateTs, contentParts, editedHosts)
+
+      const callArgs = mockSendToMain.mock.calls[0][0]
+      expect(callArgs.hosts).toEqual(editedHosts)
+    })
+
+    it('should allow removing all hosts during edit', async () => {
+      const { sendMessageWithContent } = useChatMessages(
+        mockScrollToBottom,
+        mockClearTodoState,
+        mockMarkLatestMessageWithTodoUpdate,
+        mockCurrentTodos,
+        mockCheckModelConfig
+      )
+
+      const originalTs = Date.now() - 3000
+
+      await sendMessageWithContent('Message with no hosts', 'send', undefined, originalTs, undefined, [])
+
+      expect(mockSendToMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hosts: []
+        })
+      )
     })
   })
 })

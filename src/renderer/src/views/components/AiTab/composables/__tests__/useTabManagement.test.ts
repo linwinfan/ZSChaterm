@@ -3,7 +3,6 @@ import { ref, nextTick } from 'vue'
 import { Modal } from 'ant-design-vue'
 import { useTabManagement } from '../useTabManagement'
 import { useSessionState } from '../useSessionState'
-import { getGlobalState, updateGlobalState } from '@renderer/agent/storage/state'
 import type { AssetInfo, HistoryItem } from '../../types'
 import type { ChatermMessage } from '@/types/ChatermMessage'
 
@@ -32,8 +31,7 @@ vi.mock('ant-design-vue', () => ({
   }
 }))
 vi.mock('@renderer/agent/storage/state', () => ({
-  getGlobalState: vi.fn(),
-  updateGlobalState: vi.fn()
+  getGlobalState: vi.fn()
 }))
 vi.mock('vue-i18n', async (importOriginal) => {
   const actual = await importOriginal<typeof import('vue-i18n')>()
@@ -92,9 +90,24 @@ vi.mock('@/services/userConfigStoreService', () => {
       }),
       saveConfig: vi.fn().mockResolvedValue(undefined),
       initDB: vi.fn().mockResolvedValue(undefined)
-    }
+    },
+    remoteApplyGuard: { isApplying: false },
+    SUPPORTED_USER_CONFIG_SCHEMA_VERSION: 1,
+    getStoredUserConfigSnapshot: vi.fn(),
+    resolveDataSyncPreference: vi.fn()
   }
 })
+
+// Mock dataSyncService to prevent transitive import failures
+vi.mock('@/services/dataSyncService', () => ({
+  dataSyncService: {
+    initialize: vi.fn(),
+    enableDataSync: vi.fn(),
+    disableDataSync: vi.fn(),
+    reset: vi.fn(),
+    getInitializationStatus: vi.fn()
+  }
+}))
 
 // In-memory storage for testing
 const storage = new Map<string, string>()
@@ -104,6 +117,7 @@ const mockGetTaskMetadata = vi.fn()
 const mockChatermGetChatermMessages = vi.fn()
 const mockSendToMain = vi.fn()
 const mockCancelTask = vi.fn()
+const mockSaveTaskTitle = vi.fn().mockResolvedValue(undefined)
 const mockKvGet = vi.fn(async (params: { key?: string }) => {
   if (params.key) {
     const value = storage.get(params.key)
@@ -127,6 +141,7 @@ global.window = {
     chatermGetChatermMessages: mockChatermGetChatermMessages,
     sendToMain: mockSendToMain,
     cancelTask: mockCancelTask,
+    saveTaskTitle: mockSaveTaskTitle,
     kvGet: mockKvGet,
     kvMutate: mockKvMutate
   }
@@ -148,6 +163,7 @@ describe('useTabManagement', () => {
     isExecutingCommand: false,
     lastStreamMessage: null,
     lastPartialMessage: null,
+    lastStateChatermMessages: null,
     shouldStickToBottom: true,
     isCancelled: false
   })
@@ -245,7 +261,7 @@ describe('useTabManagement', () => {
       ])
     })
 
-    it('should use localhost when no asset info available', async () => {
+    it('should have empty hosts when no asset info available', async () => {
       mockGetCurentTabAssetInfo.mockResolvedValue(null)
 
       const { createNewEmptyTab } = useTabManagement({
@@ -259,7 +275,7 @@ describe('useTabManagement', () => {
       await nextTick()
 
       const newTab = mockState.chatTabs.value[1]
-      expect(newTab.hosts?.[0]?.host).toBe('127.0.0.1')
+      expect(newTab.hosts).toEqual([])
     })
 
     it('should set model value from global state', async () => {
@@ -303,7 +319,6 @@ describe('useTabManagement', () => {
       const history: HistoryItem = {
         id: 'tab-1',
         chatTitle: 'Existing Tab',
-        chatType: 'agent',
         chatContent: [],
         isFavorite: false,
         isEditing: false,
@@ -333,6 +348,22 @@ describe('useTabManagement', () => {
           type: 'ask',
           ts: 100,
           partial: false
+        },
+        {
+          ask: undefined,
+          say: 'api_req_started',
+          text: JSON.stringify({ request: 'req', tokensIn: 100, tokensOut: 20, contextWindow: 128000 }),
+          type: 'say',
+          ts: 101,
+          partial: false
+        },
+        {
+          ask: undefined,
+          say: 'context_truncated',
+          text: 'truncated',
+          type: 'say',
+          ts: 102,
+          partial: false
         }
       ]
       mockChatermGetChatermMessages.mockResolvedValue(mockMessages)
@@ -346,7 +377,6 @@ describe('useTabManagement', () => {
       const history: HistoryItem = {
         id: 'history-1',
         chatTitle: 'Previous Chat',
-        chatType: 'agent',
         chatContent: [],
         isFavorite: false,
         isEditing: false,
@@ -362,6 +392,7 @@ describe('useTabManagement', () => {
       expect(restoredTab!.hosts?.[0]?.host).toBe('192.168.1.50')
       expect(restoredTab!.chatType).toBe('cmd')
       expect(restoredTab!.modelValue).toBe('gpt-4')
+      expect(restoredTab!.session.chatHistory.map((m) => m.say)).toEqual([undefined, 'api_req_started', 'context_truncated'])
     })
 
     it('should replace current new tab with history', async () => {
@@ -381,7 +412,6 @@ describe('useTabManagement', () => {
       const history: HistoryItem = {
         id: 'history-2',
         chatTitle: 'Restored Chat',
-        chatType: 'agent',
         chatContent: [],
         isFavorite: false,
         isEditing: false,
@@ -410,7 +440,6 @@ describe('useTabManagement', () => {
       const history: HistoryItem = {
         id: 'history-3',
         chatTitle: 'Forced New Tab',
-        chatType: 'agent',
         chatContent: [],
         isFavorite: false,
         isEditing: false,
@@ -441,7 +470,6 @@ describe('useTabManagement', () => {
       const history: HistoryItem = {
         id: 'history-3',
         chatTitle: 'Test',
-        chatType: 'agent',
         chatContent: [],
         isFavorite: false,
         isEditing: false,
@@ -481,7 +509,6 @@ describe('useTabManagement', () => {
       const history: HistoryItem = {
         id: 'history-4',
         chatTitle: 'Command Test',
-        chatType: 'cmd',
         chatContent: [],
         isFavorite: false,
         isEditing: false,
@@ -579,7 +606,7 @@ describe('useTabManagement', () => {
   })
 
   describe('renameTab', () => {
-    it('should update tab title and persist to taskHistory', async () => {
+    it('should update tab title and persist via saveTaskTitle', async () => {
       const { renameTab } = useTabManagement({
         getCurentTabAssetInfo: mockGetCurentTabAssetInfo,
         emitStateChange: mockEmitStateChange,
@@ -590,24 +617,15 @@ describe('useTabManagement', () => {
       mockState.chatTabs.value.push(createMockTab('tab-2'))
       mockState.currentChatId.value = 'tab-1'
 
-      const mockTaskHistory = [
-        { id: 'tab-1', chatTitle: 'Old Title', ts: 1000 },
-        { id: 'tab-2', chatTitle: 'Tab 2', ts: 2000 }
-      ]
-      vi.mocked(getGlobalState).mockResolvedValue(mockTaskHistory)
-
       await renameTab('tab-1', 'Renamed Tab')
 
       expect(mockState.chatTabs.value[0].title).toBe('Renamed Tab')
       expect(mockState.currentChatId.value).toBe('tab-1')
-      expect(updateGlobalState).toHaveBeenCalledWith('taskHistory', [
-        { id: 'tab-1', chatTitle: 'Renamed Tab', ts: 1000 },
-        { id: 'tab-2', chatTitle: 'Tab 2', ts: 2000 }
-      ])
+      expect(mockSaveTaskTitle).toHaveBeenCalledWith('tab-1', 'Renamed Tab')
       expect(mockEmitStateChange).toHaveBeenCalled()
     })
 
-    it('should update tab title even if not in taskHistory', async () => {
+    it('should call saveTaskTitle even for new tabs', async () => {
       const { renameTab } = useTabManagement({
         getCurentTabAssetInfo: mockGetCurentTabAssetInfo,
         emitStateChange: mockEmitStateChange,
@@ -617,17 +635,14 @@ describe('useTabManagement', () => {
       const mockState = vi.mocked(useSessionState)()
       mockState.currentChatId.value = 'tab-1'
 
-      // Tab not in taskHistory (new tab not yet saved)
-      vi.mocked(getGlobalState).mockResolvedValue([])
-
       await renameTab('tab-1', 'Renamed Tab')
 
       expect(mockState.chatTabs.value[0].title).toBe('Renamed Tab')
-      expect(updateGlobalState).not.toHaveBeenCalled()
+      expect(mockSaveTaskTitle).toHaveBeenCalledWith('tab-1', 'Renamed Tab')
       expect(mockEmitStateChange).toHaveBeenCalled()
     })
 
-    it('should persist to taskHistory even if tab not currently open', async () => {
+    it('should persist via saveTaskTitle even if tab not currently open', async () => {
       const { renameTab } = useTabManagement({
         getCurentTabAssetInfo: mockGetCurentTabAssetInfo,
         emitStateChange: mockEmitStateChange,
@@ -638,21 +653,12 @@ describe('useTabManagement', () => {
       // Only tab-1 is open, but we're renaming a history item (tab-history) that's not open
       mockState.currentChatId.value = 'tab-1'
 
-      const mockTaskHistory = [
-        { id: 'tab-1', chatTitle: 'Tab 1', ts: 1000 },
-        { id: 'tab-history', chatTitle: 'Old History Title', ts: 2000 }
-      ]
-      vi.mocked(getGlobalState).mockResolvedValue(mockTaskHistory)
-
       await renameTab('tab-history', 'New History Title')
 
       // Tab not in open tabs, so no tab title update
       expect(mockState.chatTabs.value.find((t) => t.id === 'tab-history')).toBeUndefined()
-      // But taskHistory should be updated
-      expect(updateGlobalState).toHaveBeenCalledWith('taskHistory', [
-        { id: 'tab-1', chatTitle: 'Tab 1', ts: 1000 },
-        { id: 'tab-history', chatTitle: 'New History Title', ts: 2000 }
-      ])
+      // But saveTaskTitle should still be called
+      expect(mockSaveTaskTitle).toHaveBeenCalledWith('tab-history', 'New History Title')
       expect(mockEmitStateChange).toHaveBeenCalled()
     })
   })

@@ -107,7 +107,11 @@
 <script setup lang="ts">
 const api = (window as any).api
 import eventBus from '@/utils/eventBus'
+import { sanitizeHtml } from '@/utils/sanitize'
+
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+
+const logger = createRendererLogger('layout.extensionHost')
 const props = defineProps<{
   viewId: string
 }>()
@@ -310,7 +314,7 @@ const onLoadData = async (treeNode: any) => {
 
     treeData.value = [...treeData.value]
   } catch (err) {
-    console.error('Failed to load tree data:', err)
+    logger.error('Failed to load tree data', { error: err })
   }
 }
 
@@ -318,7 +322,10 @@ const onExpand = (keys) => {
   expandedKeys.value = keys
 }
 
-const renderMarkdown = (t) => t?.replace(/\[(.*?)\]\(command:(.*?)\)/g, '<a href="javascript:void(0)" class="vs-link" data-cmd="$2">$1</a>')
+const renderMarkdown = (t) => {
+  const html = t?.replace(/\[(.*?)\]\(command:(.*?)\)/g, '<a href="javascript:void(0)" class="vs-link" data-cmd="$2">$1</a>')
+  return html ? sanitizeHtml(html) : ''
+}
 
 const handleGlobalClick = (e) => {
   const link = e.target.closest('.vs-link')

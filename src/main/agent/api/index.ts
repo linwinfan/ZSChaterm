@@ -5,11 +5,12 @@
 // Licensed under the Apache License, Version 2.0
 
 import { Anthropic } from '@anthropic-ai/sdk'
-import { ApiConfiguration, ModelInfo } from '../shared/api'
+import { ApiConfiguration, ModelInfo, liteLlmModelInfoSaneDefaults } from '../shared/api'
 import { AwsBedrockHandler } from './providers/bedrock'
 import { LiteLlmHandler } from './providers/litellm'
 import { DeepSeekHandler } from './providers/deepseek'
 import { OpenAiHandler } from './providers/openai'
+import { AnthropicHandler } from './providers/anthropic'
 import { OllamaHandler } from './providers/ollama'
 import { ApiStream, ApiStreamUsageChunk } from './transform/stream'
 
@@ -75,6 +76,8 @@ export function buildApiHandler(configuration: ApiConfiguration): ApiHandler {
 
   const { apiProvider, ...options } = configuration
   switch (apiProvider) {
+    case 'anthropic':
+      return new AnthropicHandler(options)
     case 'bedrock':
       return new AwsBedrockHandler(options)
     case 'litellm':
@@ -85,13 +88,18 @@ export function buildApiHandler(configuration: ApiConfiguration): ApiHandler {
       return new OpenAiHandler(options)
     case 'ollama':
       return new OllamaHandler(options)
-    case 'default':
+    case 'default': {
+      const modelName = options.defaultModelId
+      const infoFromMap = modelName ? options.defaultModelInfoMap?.[modelName] : undefined
+      const liteLlmModelInfo = infoFromMap ? { ...liteLlmModelInfoSaneDefaults, ...infoFromMap } : undefined
       return LiteLlmHandler.createSync({
         ...options,
         liteLlmModelId: options.defaultModelId,
         liteLlmBaseUrl: options.defaultBaseUrl,
-        liteLlmApiKey: options.defaultApiKey
+        liteLlmApiKey: options.defaultApiKey,
+        liteLlmModelInfo
       })
+    }
     default:
       throw new Error(`Unsupported API provider: ${apiProvider}`)
   }

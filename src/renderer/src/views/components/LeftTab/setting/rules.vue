@@ -130,6 +130,9 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { updateGlobalState, getGlobalState } from '@renderer/agent/storage/state'
 import { PlusOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons-vue'
+import eventBus from '@/utils/eventBus'
+
+const logger = createRendererLogger('settings.rules')
 
 interface Rule {
   id: string
@@ -141,10 +144,19 @@ interface Rule {
 // Load saved configuration when component is mounted
 onMounted(async () => {
   await loadUserRules()
+  // Listen for user_rules specific sync events
+  eventBus.on('userRulesSyncApplied', onRulesSyncApplied)
 })
 
-// Save configuration before component unmounts
-onBeforeUnmount(async () => {})
+// Clean up event listener before component unmounts
+onBeforeUnmount(async () => {
+  eventBus.off('userRulesSyncApplied', onRulesSyncApplied)
+})
+
+const onRulesSyncApplied = () => {
+  // userRulesSyncService already applied remote data to local storage, just reload UI
+  loadUserRules()
+}
 
 // Rules
 const userRules = ref<Rule[]>([])
@@ -189,10 +201,10 @@ const loadUserRules = async () => {
       // Save updated userRules
       await saveUserRules()
 
-      console.log('Successfully migrated customInstructions to userRules')
+      logger.info('Successfully migrated customInstructions to userRules')
     }
   } catch (error) {
-    console.error('Failed to load user rules:', error)
+    logger.error('Failed to load user rules', { error: error })
     userRules.value = []
   }
 }
@@ -209,7 +221,7 @@ const saveUserRules = async () => {
       })) // Save ID, content and enabled state, do not save editing state
     await updateGlobalState('userRules', rulesToSave)
   } catch (error) {
-    console.error('Failed to save user rules:', error)
+    logger.error('Failed to save user rules', { error: error })
   }
 }
 

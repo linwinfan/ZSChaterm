@@ -10,8 +10,10 @@ import { ApiHandlerOptions, liteLlmDefaultModelId, liteLlmModelInfoSaneDefaults 
 import { ApiHandler } from '..'
 import { ApiStream } from '../transform/stream'
 import { convertToOpenAiMessages } from '../transform/openai-format'
+import { convertToGlmMessages } from '../transform/glm-format'
 import { createProxyAgent, checkProxyConnectivity, resolveSystemProxy, createProxyAgentFromString } from './proxy/index'
 import type { Agent } from 'http'
+const logger = createLogger('agent')
 
 /**
  * LiteLLM Handler for OpenAI-compatible API with enhanced reasoning support
@@ -101,7 +103,7 @@ export class LiteLlmHandler implements ApiHandler {
 
       // CRITICAL OPTIMIZATION: Only recreate client when proxy configuration changes
       if (proxyString !== this.currentProxyString) {
-        console.log(`[LiteLLM] System proxy changed: ${this.currentProxyString} -> ${proxyString || 'DIRECT'}`)
+        logger.info('[LiteLLM] System proxy changed', { event: 'litellm.proxy.changed', hasProxy: !!proxyString })
         this.currentProxyString = proxyString ?? null
 
         // Unified proxy agent creation logic
@@ -109,7 +111,7 @@ export class LiteLlmHandler implements ApiHandler {
         if (proxyString) {
           httpAgent = createProxyAgentFromString(proxyString)
           if (!httpAgent) {
-            console.warn(`[LiteLLM] Failed to create proxy agent, falling back to direct connection`)
+            logger.warn(`[LiteLLM] Failed to create proxy agent, falling back to direct connection`)
           }
         }
 
@@ -122,11 +124,11 @@ export class LiteLlmHandler implements ApiHandler {
           timeout: timeoutMs
         })
 
-        console.log(`[LiteLLM] Client recreated with ${httpAgent ? 'system proxy' : 'direct connection'}`)
+        logger.info(`[LiteLLM] Client recreated with ${httpAgent ? 'system proxy' : 'direct connection'}`)
       }
       // If proxy hasn't changed, do nothing (performance optimization)
     } catch (error) {
-      console.error('[LiteLLM] Failed to refresh proxy agent:', error)
+      logger.error('[LiteLLM] Failed to refresh proxy agent', { error: error })
       // Fallback: continue using existing client
     }
   }
@@ -135,12 +137,13 @@ export class LiteLlmHandler implements ApiHandler {
     // Refresh proxy agent to detect runtime proxy changes
     await this.refreshProxyAgent()
 
-    const formattedMessages = convertToOpenAiMessages(messages)
+    const modelId = this.options.liteLlmModelId || liteLlmDefaultModelId
+    const isGlmModel = modelId.toLowerCase().includes('glm')
+    const formattedMessages = isGlmModel ? convertToGlmMessages(messages) : convertToOpenAiMessages(messages)
     const systemMessage: OpenAI.Chat.ChatCompletionSystemMessageParam = {
       role: 'system',
       content: systemPrompt
     }
-    const modelId = this.options.liteLlmModelId || liteLlmDefaultModelId
     const isOminiModel = modelId.includes('o1-mini') || modelId.includes('o3-mini') || modelId.includes('o4-mini')
     const isGpt5OrAbove = modelId.startsWith('gpt-5') || modelId.startsWith('gpt-6')
 
@@ -197,7 +200,6 @@ export class LiteLlmHandler implements ApiHandler {
     const stream = await this.client.chat.completions.create(params)
 
     let usageInfo: OpenAI.CompletionUsage | undefined | null = undefined
-    const isGlmModel = modelId.toLowerCase().includes('glm')
     // GLM models with -Thinking suffix output <thinking>...</thinking> tags when thinking mode is enabled
     const glmThinkingParser = isGlmModel && reasoningOn ? createGlmThinkingParser() : null
     for await (const chunk of stream) {

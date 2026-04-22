@@ -136,7 +136,9 @@
             <template v-if="column.dataIndex === 'name'">
               <div
                 class="file-name-cell"
+                :class="{ 'dir-name-cell-clickable': !editableData[record.key] && record.isDir }"
                 style="position: relative"
+                @click="!editableData[record.key] && record.isDir && rowClick(record as FileRecord)"
               >
                 <template v-if="editableData[record.key]">
                   <span style="position: absolute; top: 0; left: 0; display: flex; align-items: center; padding-right: 8px">
@@ -180,8 +182,6 @@
                   <span
                     v-if="record.isDir"
                     class="file-name-main"
-                    style="cursor: pointer"
-                    @click="rowClick(record as FileRecord)"
                   >
                     <FolderFilled
                       class="file-name-icon"
@@ -484,6 +484,8 @@ const api = (window as any).api
 const { t } = useI18n()
 const { t: $t } = useI18n()
 
+const logger = createRendererLogger('files')
+
 const props = defineProps({
   currentDirectoryInput: {
     type: String,
@@ -584,7 +586,7 @@ const baseColumns: FlexibleColumn[] = [
     },
     sortDirections: ['descend', 'ascend'],
     ellipsis: true,
-    width: '500px'
+    width: 500
   },
   {
     title: t('files.permissions'),
@@ -656,7 +658,10 @@ const tableColumns = computed(() => {
     })
 })
 // const tableScroll = computed(() => (uiMode.value === 'transfer' ? {} : { x: 'max-content' }))
-const tableScroll = computed(() => (uiMode.value === 'transfer' ? { x: 350 } : { x: 'max-content' }))
+const tableScroll = computed(() => {
+  if (uiMode.value === 'transfer') return { x: 350, y: 'calc(100vh - 260px)' }
+  return { x: 500 + 120 + 100 + 160, y: 'calc(100vh - 300px)' }
+})
 const renderSize = (value: number): string => {
   if (value == null || value === 0) {
     return '0 B'
@@ -1163,11 +1168,24 @@ const onDropZoneOver = (e: DragEvent) => {
   })
 }
 
+const getHoveredDirByPoint = (ev: DragEvent) => {
+  const el = document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null
+  const tr = el?.closest?.('tr.ant-table-row, .ant-table-row') as HTMLElement | null
+  const rowKey = tr?.getAttribute?.('data-row-key') || (tr as any)?.dataset?.rowKey || ''
+  if (!rowKey) return null
+
+  const rec = recordByName.value.get(rowKey)
+  if (rec && rec.isDir && rec.key !== '..' && !rec.disabled) {
+    return rec.path
+  }
+  return null
+}
+
 const onDropZoneDrop = (e: DragEvent) => {
   // Always prevent default on drop to avoid browser side-effects
   e.preventDefault()
-
-  const hoveredDir = lastHoverDir
+  const dropHitDir = getHoveredDirByPoint(e)
+  const hoveredDir = dropHitDir || lastHoverDir
 
   // Drag end: Unified cleanup
   setGlobalDragFromSide(null)
@@ -1254,8 +1272,8 @@ const uploadFile = async () => {
     const config = {
       success: { type: 'success', text: t('files.uploadSuccess') },
       cancelled: { type: 'info', text: t('files.uploadCancel') },
-      skipped: { type: 'info', text: t('files.downloadSkipped') }
-    }[res.status] || { type: 'error', text: `${t('files.downloadFailed')}：${res.message}` }
+      skipped: { type: 'info', text: t('files.uploadSkipped') }
+    }[res.status] || { type: 'error', text: `${t('files.uploadFailed')}：${res.message}` }
 
     message[config.type]({
       content: config.text,
@@ -1641,7 +1659,7 @@ const downloadFile = async (record: any) => {
       duration: 3
     })
   } catch (err: any) {
-    console.error('Download Error:', err)
+    logger.error('Download error', { error: err })
     message.error({ content: `${t('files.downloadError')}：${(err as Error).message}`, key, duration: 3 })
   }
 }
@@ -1669,7 +1687,7 @@ const downloadFile = async (record: any) => {
 const editableData = reactive({})
 const renameFile = (record: FileRecord): void => {
   if (!record?.key) {
-    console.warn('Invalid record: missing key')
+    logger.warn('Invalid record: missing key')
     return
   }
 
@@ -1682,7 +1700,7 @@ const renameFile = (record: FileRecord): void => {
     if (targetFile) {
       editableData[key] = cloneDeep(targetFile)
     } else {
-      console.warn(`File with key ${key} not found`)
+      logger.warn('File not found', { key })
     }
   }
 }
@@ -1775,50 +1793,43 @@ const copyFile = (record: FileRecord) => {
 }
 
 const copyOrMoveModalOk = async (targetPath: string) => {
-  if (!currentRecord.value) {
-    return
-  }
-  const src = currentRecord.value.path
-  const dest = targetPath
-  if (copyOrMoveModalType.value == 'copy') {
-    try {
-      const cmd = `cp -r "${src}" "${dest}"`
-      const { stderr } = await api.sshConnExec({
-        cmd: cmd,
-        id: props.uuid
-      })
-      currentRecord.value = null
-      copyOrMoveDialog.value = false
+  if (!currentRecord.value) return
 
-      if (stderr !== '') {
-        message.error(`${t('files.copyFileFailed')}：${stderr}`)
+  const srcPath = currentRecord.value.path
+
+  try {
+    const res = await api.copyOrMoveBySftp({
+      id: props.uuid,
+      srcPath,
+      targetPath,
+      action: copyOrMoveModalType.value === 'copy' ? 'copy' : 'move'
+    })
+
+    currentRecord.value = null
+    copyOrMoveDialog.value = false
+
+    if (res.status !== 'success') {
+      if (copyOrMoveModalType.value === 'copy') {
+        message.error(`${t('files.copyFileFailed')}：${res.message || ''}`)
       } else {
-        message.success(t('files.copyFileSuccess'))
-        localCurrentDirectoryInput.value = getDirname(dest)
-        refresh()
+        message.error(`${t('files.moveFileFailed')}：${res.message || ''}`)
       }
-    } catch (error) {
-      message.error(`${t('files.copyFileError')}：${error}`)
+      return
     }
-  } else {
-    try {
-      const cmd = `mv "${src}" "${dest}"`
-      const { stderr } = await api.sshConnExec({
-        cmd: cmd,
-        id: props.uuid
-      })
-      currentRecord.value = null
-      copyOrMoveDialog.value = false
 
-      if (stderr !== '') {
-        message.error(`${t('files.moveFileFailed')}：${stderr}`)
-      } else {
-        message.success(t('files.moveFileSuccess'))
-        localCurrentDirectoryInput.value = getDirname(dest)
-        refresh()
-      }
-    } catch (error) {
-      message.error(`${t('files.moveFileError')}：${error}`)
+    if (copyOrMoveModalType.value === 'copy') {
+      message.success(t('files.copyFileSuccess'))
+    } else {
+      message.success(t('files.moveFileSuccess'))
+    }
+
+    localCurrentDirectoryInput.value = getDirname(res.path || targetPath)
+    refresh()
+  } catch (error: any) {
+    if (copyOrMoveModalType.value === 'copy') {
+      message.error(`${t('files.copyFileError')}：${error?.message || error}`)
+    } else {
+      message.error(`${t('files.moveFileError')}：${error?.message || error}`)
     }
   }
 }
@@ -1846,6 +1857,47 @@ defineExpose({
 
 .base-file :deep(.ant-card-body) {
   padding: 0px 7px;
+}
+
+.files-table :deep(.ant-table) {
+  background-color: var(--bg-color);
+  color: var(--text-color);
+}
+.files-table :deep(.ant-table-container) {
+  background-color: var(--bg-color);
+}
+
+.files-table :deep(.ant-table-placeholder) {
+  background-color: var(--bg-color);
+}
+
+.files-table :deep(.ant-table-placeholder td) {
+  background-color: var(--bg-color) !important;
+}
+
+.files-table :deep(.ant-table-header) {
+  background: var(--bg-color) !important;
+}
+.files-table :deep(.ant-table-thead > tr > th.ant-table-cell-scrollbar) {
+  background: var(--bg-color);
+  border-bottom: 1px solid var(--border-color);
+  box-shadow: none;
+}
+
+.files-table :deep(.ant-table-header table) {
+  background-color: var(--bg-color);
+}
+
+.files-table :deep(.ant-spin-container) {
+  background-color: var(--bg-color);
+}
+
+.files-table :deep(.ant-table-wrapper) {
+  background-color: var(--bg-color);
+}
+
+.files-table :deep(.ant-empty-description) {
+  color: var(--text-color-secondary);
 }
 
 .fs-header {
@@ -1939,9 +1991,9 @@ defineExpose({
 
 .input-search {
   background-color: var(--bg-color-secondary);
-  border-color: var(--bg-color-secondary);
   color: var(--text-color);
   height: 80%;
+  border: var(--border-color) solid 1px;
 }
 
 .file-name-cell {
@@ -1951,7 +2003,9 @@ defineExpose({
   display: flex;
   align-items: center;
 }
-
+.dir-name-cell-clickable {
+  cursor: pointer;
+}
 .files-table :deep(.ant-table-cell::before) {
   display: none !important;
 }
@@ -2024,6 +2078,7 @@ defineExpose({
 .file-name-icon {
   flex: 0 0 auto;
   margin-right: 4px;
+  flex-shrink: 0;
 }
 
 .file-name-text {
@@ -2056,7 +2111,9 @@ defineExpose({
 .permission-group {
   margin-bottom: 10px;
 }
-
+.permission-group :deep(.ant-checkbox-wrapper) {
+  color: var(--text-color);
+}
 .permission-settings {
   margin-top: 15px;
   padding-top: 15px;
@@ -2070,7 +2127,13 @@ defineExpose({
 .setting-item label {
   margin-bottom: 8px;
   font-weight: 500;
-  color: #262626;
+  color: var(--text-color);
+}
+.setting-item input:disabled {
+  background-color: var(--border-color);
+  color: var(--text-color-tertiary);
+  border: 1px solid var(--border-color-light);
+  opacity: 1;
 }
 
 .files-table :deep(.ant-table-tbody > tr.file-table-row-hover > td) {
@@ -2099,42 +2162,49 @@ defineExpose({
   max-width: calc(100% - 90px);
 }
 
+/* Keep transfer table viewport height stable even when rows are few. */
+.transfer-mode .files-table :deep(.ant-table-body) {
+  height: calc(100vh - 260px) !important;
+  max-height: calc(100vh - 260px) !important;
+}
+
 .files-table {
-  --sb-size: 6px;
+  --sb-size: 12px;
   --sb-thumb: var(--border-color-light);
-  --sb-thumb-hover: var(--text-color-tertiary);
-  --sb-track: transparent;
+  --sb-thumb-hover: var(--color-checks-scrollbar-thumb-bg);
 }
 
 .files-table :deep(.ant-table-body),
 .files-table :deep(.ant-table-content) {
   background: var(--bg-color);
+  overflow: auto !important;
 }
 
-/* Chromium/Electron */
 .files-table :deep(.ant-table-body)::-webkit-scrollbar,
-.files-table :deep(.ant-table-content)::-webkit-scrollbar {
-  width: var(--sb-size);
-  height: var(--sb-size);
+.files-table :deep(.ant-table-content)::-webkit-scrollbar,
+.files-table :deep(.ant-table-header)::-webkit-scrollbar {
+  display: block !important;
+  width: var(--sb-size) !important;
+  height: var(--sb-size) !important;
+  border-radius: 40px;
 }
 
 .files-table :deep(.ant-table-body)::-webkit-scrollbar-track,
 .files-table :deep(.ant-table-content)::-webkit-scrollbar-track {
-  background: var(--sb-track);
+  background: var(--sb-track) !important;
+  border-radius: 4px;
 }
 
 .files-table :deep(.ant-table-body)::-webkit-scrollbar-thumb,
 .files-table :deep(.ant-table-content)::-webkit-scrollbar-thumb {
-  background-color: var(--sb-thumb);
-  border-radius: 6px;
+  background-color: var(--sb-thumb) !important;
+  border-radius: 10px;
+  border: 2px solid transparent;
+  background-clip: content-box;
 }
 
 .files-table :deep(.ant-table-body)::-webkit-scrollbar-thumb:hover,
 .files-table :deep(.ant-table-content)::-webkit-scrollbar-thumb:hover {
-  background-color: var(--sb-thumb-hover);
-}
-
-.files-table :deep(.ant-table-cell) {
-  white-space: nowrap;
+  background-color: var(--sb-thumb-hover, #555) !important;
 }
 </style>

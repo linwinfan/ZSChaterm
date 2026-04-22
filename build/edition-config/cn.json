@@ -1,29 +1,29 @@
 {
   "edition": "cn",
-  "displayName": "Chaterm CN",
+  "displayName": "中山政务一云 Chaterm CN",
   "api": {
-    "baseUrl": "https://api8.chaterm.net/v1",
-    "kmsUrl": "https://api8.chaterm.net/v1",
-    "syncUrl": "https://api8.chaterm.net"
+    "baseUrl": "",
+    "kmsUrl": "",
+    "syncUrl": ""
   },
   "update": {
-    "serverUrl": "https://static-download8.chaterm.net/",
-    "releaseNotesUrl": "https://chaterm.net/release-notes"
+    "serverUrl": "",
+    "releaseNotesUrl": ""
   },
   "auth": {
-    "loginBaseUrl": "https://login.chaterm.cn"
+    "loginBaseUrl": ""
   },
   "defaults": {
     "language": "zh-CN"
   },
   "legal": {
-    "privacyPolicyUrl": "https://chaterm.cn/docs/user/privacy",
-    "termsOfServiceUrl": "https://chaterm.cn/docs/user/terms"
+    "privacyPolicyUrl": "",
+    "termsOfServiceUrl": ""
   },
   "speech": {
-    "wsUrl": "wss://api8.chaterm.net/v1/speech/asr"
+    "wsUrl": ""
   },
   "docs": {
-    "baseUrl": "https://chaterm.cn/docs"
+    "baseUrl": ""
   }
 }

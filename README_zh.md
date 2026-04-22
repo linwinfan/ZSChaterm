@@ -1,21 +1,23 @@
 <div align="center">
-  中文 / <a href="./README.md">English</a>
+  中文 / <a href="./README.md">English</a> / <a href="./README_ja.md">日本語</a>
 </div>
 <br>
 
 <p align="center">
   <a href="https://www.tbench.ai/leaderboard/terminal-bench/1.0"><img src="https://img.shields.io/badge/Terminal--Bench-Ranked_%232-00D94E?style=for-the-badge&logo=github&logoColor=white" alt="Terminal-Bench"></a>
-  <a href="https://landscape.cncf.io/?item=provisioning--automation-configuration--chaterm"><img src="https://img.shields.io/badge/CNCF-Landscape-0086FF?style=for-the-badge&logo=kubernetes&logoColor=white" alt="CNCF Landscape"></a>
   <a href="https://aws.amazon.com/cn/blogs/china/chaterm-aws-kms-envelope-encryption-for-zero-trust-security-en/"><img src="https://img.shields.io/badge/AWS-Security-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white&labelColor=232F3E" alt="AWS Security"></a>
+  <a href="https://landscape.cncf.io/?item=provisioning--automation-configuration--chaterm"><img src="https://img.shields.io/badge/CNCF-Landscape-0086FF?style=for-the-badge&logo=kubernetes&logoColor=white" alt="CNCF Landscape"></a>
   <p align="center">
 </p>
 
 <p align="center">
   <a href="https://github.com/chaterm/Chaterm/releases"><img src="https://img.shields.io/github/v/release/chaterm/Chaterm" alt="Releases"></a>
-  <a href="https://www.electronjs.org/"><img src="https://img.shields.io/github/package-json/dependency-version/chaterm/Chaterm/dev/electron" alt="electron-version"></a>
-  <a href="https://vitejs.dev/"><img src="https://img.shields.io/github/package-json/dependency-version/chaterm/Chaterm/dev/vite" alt="vite-version"></a>
-  <a href="https://vuejs.org/"><img src="https://img.shields.io/github/package-json/dependency-version/chaterm/Chaterm/dev/vue" alt="vue-version"></a>
-  <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/github/package-json/dependency-version/chaterm/Chaterm/dev/typescript" alt="typescript-version"></a>
+  <img src="https://img.shields.io/github/stars/chaterm/Chaterm?style=flat&logo=github" alt="Stars">
+  <img src="https://img.shields.io/github/forks/chaterm/Chaterm?style=flat&logo=github" alt="Forks">
+  <img src="https://img.shields.io/codecov/c/github/chaterm/Chaterm?style=flat&logo=codecov" alt="Coverage">
+  <img src="https://img.shields.io/badge/AI-Native-blue?style=flat" alt="AI Native">
+  <a href="https://x.com/chaterm_ai"><img src="https://img.shields.io/twitter/follow/chaterm_ai?style=flat&logo=x&logoColor=white&label=Follow" alt="Follow on X"></a>
+  <a href="https://discord.gg/AgsYzwRp62"><img src="https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 <p align="center">
@@ -24,33 +26,85 @@
   <a href="https://chaterm.ai/download/"><img src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux"></a>
   <a href="https://apps.apple.com/us/app/chaterm/id6754307456"><img src="https://img.shields.io/badge/iOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="iOS"></a>
   <a href="https://play.google.com/store/apps/details?id=com.intsig.chaterm.global"><img src="https://img.shields.io/badge/Android-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android"></a>
+  <a href="https://aws.amazon.com/marketplace/"><img src="https://img.shields.io/badge/AWS-Marketplace-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white&labelColor=232F3E" alt="AWS Marketplace"></a>
+  <p align="center">
 </p>
+
+## 目录
+
+- [产品介绍](#产品介绍)
+- [为什么选择 Chaterm](#为什么选择-chaterm)
+- [核心特性](#核心特性)
+- [开发指南](#开发指南)
+  - [Install Electron](#install-electron)
+  - [Install](#install)
+  - [Development](#development)
+  - [Build](#build)
+- [Chaterm 参考文档](https://chaterm.cn/docs/)
+  - [Achieving Secure and Intelligent Operations for AWS Private Subnets Using Chaterm](https://aws.amazon.com/cn/blogs/china/bastion-using-aws-eice-ec2-instance-connect-endpoint-chaterm-implement-subnet-security-intelligent-en/)
+  - [How Chaterm’s Security Architecture Ensures Data Security and Reliability](https://aws.amazon.com/cn/blogs/china/chaterm-aws-kms-envelope-encryption-for-zero-trust-security-en/)
+  - [Enhancing DevOps Intelligence with Chaterm Skills and Qwen Models](https://chaterm.ai/blog/posts/agent-skills)
+- [Gold Sponsors](#gold-sponsors)
+- [Contributors](#contributors)
 
 # 产品介绍
 
-Chaterm: 您的下一代AI终端副驾驶!
+Chaterm 是一款专为基础设施和云资源管理而构建的 AI 原生终端。它使工程师能够使用自然语言执行部署服务、故障排除和解决问题等复杂任务。
 
-Chaterm是一款AI原生的智能终端Agent，旨在通过自然语言交互重构传统的命令行操作体验。它的目标是成为您的DevOps智能副驾驶，而非仅仅是一个带对话框的SSH客户端。
+凭借其内置的专家级知识库和强大的代理推理能力，Chaterm 能够理解您的业务拓扑和运维目标。无需记忆复杂的命令、语法或参数，只需用自然语言描述您的任务目标，Chaterm 即可自主规划并执行跨多个主机或集群的复杂操作，包括代码构建、服务部署、故障诊断和自动回滚等关键流程。
 
-通过内置的专家知识库与强大的 Agent 推理能力，Chaterm能够理解您的业务拓扑与操作意图。无需记忆复杂的 Shell 指令、SQL 语法或脚本参数，即可通过自然语言自动完成代码构建、服务部署、故障排查及自动回滚等全链路操作。Chaterm 致力于消除技术栈的认知门槛，让每一位开发者都能即刻拥有资深SRE的运维能力。
+Chaterm 依靠长期记忆和团队知识库，学习团队知识和用户习惯。它的目标是成为您智能的 DevOps 副驾驶，通过可重用的代理技能，帮助工程师更高效地完成日常任务。Chaterm 旨在降低不同技术栈带来的认知障碍，使每位开发人员都能快速获得高级 SRE 的运维经验和执行能力。
 
 ![Preview image](resources/hero.webp)
 
+![Preview image](resources/hero2.webp)
+
+## 为什么选择 Chaterm
+
+Chaterm 不仅仅是一个更智能的终端，它是一个基础设施代理。
+有句话说，每个 Agent 都会时常失败，但 Chaterm 帮助你修复它。
+
+- 🤖 从命令到执行 - 描述任务，让 AI 规划并执行
+
+- 🌐 专为真实基础设施打造 - 服务器、Kubernetes 和多集群工作流
+
+- 🔁 可复用的 Agent 技能 - 将经验转化为自动化
+
+- 🧠 上下文感知智能 - 理解你的系统，而不仅仅是命令
+
+- 🛡️ 安全可控 - 可审计、可审查、支持回滚
+
 ## 核心特性
 
-- 🤖 自主 Agent 引擎 具备复杂任务的拆解与规划能力，支持从日志分析到服务回滚的闭环自动化操作。
+- 🤖 **AI 智能代理**
 
-- 🧠 智能语境补全 超越传统历史记录，基于用户操作习惯、当前业务上下文及跨服务器环境，提供更懂你的智能命令建议。
+  Agent 能理解目标，自主规划，并跨越多台主机完成问题分析与根因定位，自动闭环完成复杂的流程处理。
 
-- 🎙️ 语音即时交互 打破键盘限制，支持移动端的语音指令输入，大幅提升远程运维与应急响应效率。
+  每一步操作均可审核与追溯，并支持快速日志回滚，让 AI 自动化在生产环境中更加安全可靠。
 
-- 🎨 全局一致性体验 配置漫游：一次配置语法高亮与环境偏好，任意主机登录即可自动同步。 可视化 Vim：在终端内提供类 IDE 的现代化文件编辑体验，支持多语言语法高亮。
+- 🧠 **智能命令推荐**
 
-- 🛡️ 企业级零信任安全 集成会话级无感知认证体系，全面支持零信任安全架构，确保每一次操作都合规可溯。
+  结合用户习惯、本地记忆及当前服务器上下文，推荐最合适的命令，让终端输入更智能、更高效。
 
-- 🔗 MCP 协议生态 全面支持 Model Context Protocol (MCP)，可低成本接入 Notion、GitHub 等企业知识库，实现 AI 技能的无限扩展。
+  支持跨设备会话同步，并通过快捷命令与语音交互减少移动端输入成本，使远程运维更加流畅。
 
-- 🏢 统一工作空间 支持 Alias 快捷指令共享与企业级 SSO 统一授权，高效管理跨组织的数字资产。
+- 🧩 **用户知识库**
+
+  支持导入技术手册、内部文档、脚本和白皮书，构建个人运维知识体系。
+
+  Chaterm 能理解当前基础设施上下文并精准检索相关知识，辅助任务决策与执行。
+
+- ⚡ **Agent Skill**
+
+  将复杂运维流程封装为可复用的 AI 技能，实现结构化、可靠的自动化执行。
+
+  帮助团队沉淀运维经验，使 AI 能安全、稳定地应用于真实生产环境。
+
+- 🔌 **插件系统**
+
+  通过插件扩展，实现对公有云服务器与 Kubernetes 的统一认证、动态授权与安全加密连接。
+
+  提供更高效的资源访问体验，助力基础设施的集中化管理。
 
 ![Preview image](resources/features.webp)
 
@@ -100,7 +154,16 @@ npm run build:mac
 npm run build:linux
 ```
 
+## Gold Sponsors
+
+![Preview image](resources/aws.webp) ![Preview image](resources/aliyun.webp)
+
 ## Contributors
 
 感谢您为Chaterm做出贡献！请参阅<a href="./CONTRIBUTING_zh.md">贡献指南</a>获取更多信息。
-![Preview image](resources/contributors.webp)
+
+<div align=center style="margin-top: 30px;">
+  <a href="https://github.com/chaterm/Chaterm/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=chaterm/Chaterm&refresh=true" />
+  </a>
+</div>

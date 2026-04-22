@@ -7,7 +7,7 @@
 import { ApiConfiguration } from './api'
 import { z } from 'zod'
 
-export type Host = { host: string; uuid: string; connection: string; assetType?: string }
+export type Host = { host: string; uuid: string; connection: string; organizationUuid?: string; assetType?: string }
 
 export type CommandGenerationContext = {
   platform: string
@@ -19,7 +19,14 @@ export type CommandGenerationContext = {
   sudoPermission?: boolean
 }
 
-export type ContextDocRef = { absPath: string; name?: string; type?: 'file' | 'dir' }
+export type ContextDocRef = {
+  absPath: string
+  relPath?: string
+  name?: string
+  type?: 'file' | 'dir'
+  startLine?: number
+  endLine?: number
+}
 
 export type ContextPastChatRef = { taskId: string; title?: string }
 
@@ -31,6 +38,9 @@ export type ContextCommandRef = {
   path?: string // absolute path to command file in knowledge base
 }
 
+// Skill reference (activated via @ mention in chat input)
+export type ContextSkillRef = { skillName: string; description?: string }
+
 export type ContextRefs = {
   docs?: ContextDocRef[]
   pastChats?: ContextPastChatRef[]
@@ -40,13 +50,20 @@ export type TextContentPart = { type: 'text'; text: string }
 export type DocChipContentPart = { type: 'chip'; chipType: 'doc'; ref: ContextDocRef }
 export type ChatChipContentPart = { type: 'chip'; chipType: 'chat'; ref: ContextPastChatRef }
 export type CommandChipContentPart = { type: 'chip'; chipType: 'command'; ref: ContextCommandRef }
-export type ChipContentPart = DocChipContentPart | ChatChipContentPart | CommandChipContentPart
+export type SkillChipContentPart = { type: 'chip'; chipType: 'skill'; ref: ContextSkillRef }
+export type ChipContentPart = DocChipContentPart | ChatChipContentPart | CommandChipContentPart | SkillChipContentPart
 export type ImageContentPart = {
   type: 'image'
   mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp' | 'image/bmp' | 'image/svg+xml'
   data: string // base64 encoded image data
 }
 export type ContentPart = TextContentPart | ChipContentPart | ImageContentPart
+
+export type ToolResultPayload = {
+  output: string
+  toolName?: string
+  isError?: boolean
+}
 
 export type WebviewMessageType =
   | 'apiConfiguration'
@@ -63,6 +80,7 @@ export type WebviewMessageType =
 export interface WebviewMessage {
   type: WebviewMessageType
   text?: string
+  toolResult?: ToolResultPayload
   apiConfiguration?: ApiConfiguration
   askResponse?: ChatermAskResponse
   hosts?: Host[]
@@ -98,6 +116,13 @@ export const WebviewMessageSchema = z
     tabId: z.string().optional(),
     taskId: z.string().optional(),
     text: z.string().optional(),
+    toolResult: z
+      .object({
+        output: z.string(),
+        toolName: z.string().optional(),
+        isError: z.boolean().optional()
+      })
+      .optional(),
     apiConfiguration: z.record(z.unknown()).optional()
   })
   .passthrough()

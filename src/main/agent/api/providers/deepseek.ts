@@ -14,6 +14,7 @@ import { ApiStream } from '../transform/stream'
 import { convertToR1Format } from '../transform/r1-format'
 import { Agent } from 'http'
 import { checkProxyConnectivity, createProxyAgent } from './proxy/index'
+const logger = createLogger('agent')
 
 export class DeepSeekHandler implements ApiHandler {
   private options: ApiHandlerOptions
@@ -28,7 +29,12 @@ export class DeepSeekHandler implements ApiHandler {
       const proxyConfig = this.options.proxyConfig
       httpAgent = createProxyAgent(proxyConfig)
     }
-    console.log('Using DeepSeekHandler with options:', this.options)
+    logger.info('Using DeepSeekHandler', {
+      event: 'deepseek.init',
+      baseURL: 'https://api.deepseek.com/v1',
+      hasApiKey: !!this.options.deepSeekApiKey,
+      hasProxy: this.options.needProxy !== false
+    })
     this.client = new OpenAI({
       baseURL: 'https://api.deepseek.com/v1',
       apiKey: this.options.deepSeekApiKey,
@@ -61,7 +67,7 @@ export class DeepSeekHandler implements ApiHandler {
       }
       return { isValid: true }
     } catch (error) {
-      console.error('DeepSeek configuration validation failed:', error)
+      logger.error('DeepSeek configuration validation failed', { error: error })
 
       return {
         isValid: false,

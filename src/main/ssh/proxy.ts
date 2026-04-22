@@ -1,6 +1,7 @@
 import { SocksClient } from 'socks'
 import * as net from 'net'
 import * as tls from 'tls'
+const proxyLogger = createLogger('ssh')
 
 export interface ProxyConfig {
   type?: 'HTTP' | 'HTTPS' | 'SOCKS4' | 'SOCKS5'
@@ -28,6 +29,8 @@ export const createProxySocket = async (config: ProxyConfig, targetHost: string,
   if (!type || !host || !port) {
     throw new ProxyConnectionError('Proxy configuration incomplete: type, host, and port are required')
   }
+  validateEndpointForConnect(host, port, 'proxy')
+  validateEndpointForConnect(targetHost, targetPort, 'target')
 
   if (type === 'SOCKS4' && enableProxyIdentity && !username) {
     throw new ProxyConnectionError('SOCKS4 proxy requires username (userId) when authentication is enabled')
@@ -74,8 +77,12 @@ const createSocksConnection = async (config: ProxyConfig, targetHost: string, ta
       }
     }
 
-    console.log(`[DEBUG] Creating ${type} connection to ${targetHost}:${targetPort} via ${host}:${port}`)
-    console.log(`[DEBUG] Proxy config:`, { ...proxyConfig, password: proxyConfig.password ? '[REDACTED]' : undefined })
+    proxyLogger.debug('Creating SOCKS proxy connection', {
+      event: 'ssh.proxy.connect',
+      type,
+      targetPort,
+      proxyPort: port
+    })
 
     const connectionOptions = {
       proxy: proxyConfig,
@@ -88,10 +95,14 @@ const createSocksConnection = async (config: ProxyConfig, targetHost: string, ta
     }
     const { socket } = await SocksClient.createConnection(connectionOptions)
 
-    console.log(`[DEBUG] ${type} connection established successfully`)
+    proxyLogger.debug('SOCKS proxy connection established', { event: 'ssh.proxy.connected', type })
     return socket
   } catch (error) {
-    console.error(`[ERROR] ${type} proxy connection failed:`, error)
+    proxyLogger.error('SOCKS proxy connection failed', {
+      event: 'ssh.proxy.error',
+      type,
+      error: error instanceof Error ? error.message : String(error)
+    })
 
     // Provide more detailed error information
     if (error instanceof Error) {
@@ -129,7 +140,12 @@ const createHttpConnection = (config: ProxyConfig, targetHost: string, targetPor
       reject(new ProxyConnectionError(`HTTP proxy connection failed: ${error.message}`, type))
     }
 
-    console.log(`[DEBUG] Creating HTTP connection to ${targetHost}:${targetPort} via ${host}:${port}`)
+    proxyLogger.debug('Creating HTTP proxy connection', {
+      event: 'ssh.proxy.connect',
+      type,
+      targetPort,
+      proxyPort: port
+    })
 
     const proxySocket = net.connect(port!, host!, () => {
       try {
@@ -146,7 +162,7 @@ const createHttpConnection = (config: ProxyConfig, targetHost: string, targetPor
         headers += `Proxy-Connection: Keep-Alive\r\n`
         headers += '\r\n'
 
-        console.log(`[DEBUG] Sending CONNECT request`)
+        proxyLogger.debug('Sending CONNECT request', { event: 'ssh.proxy.connect.request' })
         proxySocket.write(headers)
       } catch (error) {
         clearTimeoutAndReject(error as Error)
@@ -156,27 +172,26 @@ const createHttpConnection = (config: ProxyConfig, targetHost: string, targetPor
     proxySocket.once('data', (chunk) => {
       try {
         const response = chunk.toString()
-        console.log(`[DEBUG] Received proxy response: ${response.split('\r\n')[0]}`)
+        proxyLogger.debug('Received proxy response', { event: 'ssh.proxy.response', statusLine: response.split('\r\n')[0] })
 
         if (/HTTP\/1\.[01] 200 Connection established/i.test(response)) {
           if (type === 'HTTPS') {
             const tlsSocket = tls.connect({
               socket: proxySocket,
-              servername: targetHost,
-              rejectUnauthorized: false
+              servername: targetHost
             })
 
             tlsSocket.on('secureConnect', () => {
-              console.log(`[DEBUG] HTTPS tunnel established successfully`)
+              proxyLogger.debug('HTTPS tunnel established', { event: 'ssh.proxy.connected', type: 'HTTPS' })
               clearTimeoutAndResolve(tlsSocket)
             })
 
             tlsSocket.on('error', (error) => {
-              console.error(`[ERROR] TLS connection failed:`, error)
+              proxyLogger.error('TLS connection failed', { event: 'ssh.proxy.tls.error', error: error.message })
               clearTimeoutAndReject(error)
             })
           } else {
-            console.log(`[DEBUG] HTTP tunnel established successfully`)
+            proxyLogger.debug('HTTP tunnel established', { event: 'ssh.proxy.connected', type: 'HTTP' })
             clearTimeoutAndResolve(proxySocket)
           }
         } else {
@@ -193,13 +208,23 @@ const createHttpConnection = (config: ProxyConfig, targetHost: string, targetPor
     })
 
     proxySocket.on('error', (error) => {
-      console.error(`[ERROR] Proxy socket error:`, error)
+      proxyLogger.error('Proxy socket error', { event: 'ssh.proxy.socket.error', error: error.message })
       clearTimeoutAndReject(error)
     })
 
     proxySocket.on('close', () => {
-      console.error(`[ERROR] Proxy socket closed unexpectedly`)
+      proxyLogger.error('Proxy socket closed unexpectedly', { event: 'ssh.proxy.socket.closed' })
       clearTimeoutAndReject(new Error('Proxy socket closed unexpectedly'))
     })
   })
+}
+
+function validateEndpointForConnect(host: string, port: number, label: 'proxy' | 'target'): void {
+  if (/[\r\n\0]/.test(host) || host.trim() !== host) {
+    throw new ProxyConnectionError(`${label} host contains invalid characters`)
+  }
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new ProxyConnectionError(`${label} port is out of range`)
+  }
 }

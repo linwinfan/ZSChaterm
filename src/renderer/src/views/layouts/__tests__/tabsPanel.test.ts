@@ -67,13 +67,6 @@ vi.mock('@views/components/Extensions/jumpserverSupport.vue', () => ({
   }
 }))
 
-vi.mock('@views/components/Files/index.vue', () => ({
-  default: {
-    name: 'Files',
-    template: '<div class="files-mock">Files</div>'
-  }
-}))
-
 vi.mock('@views/components/Kubernetes/index.vue', () => ({
   default: {
     name: 'Kubernetes',
@@ -81,7 +74,7 @@ vi.mock('@views/components/Kubernetes/index.vue', () => ({
   }
 }))
 
-vi.mock('@views/components/CommonConfigEditor/index.vue', () => ({
+vi.mock('@views/components/Editors/CommonConfigEditor.vue', () => ({
   default: {
     name: 'CommonConfigEditor',
     template: '<div class="common-config-editor-mock">Common Config Editor</div>',
@@ -89,21 +82,21 @@ vi.mock('@views/components/CommonConfigEditor/index.vue', () => ({
   }
 }))
 
-vi.mock('@views/components/Ssh/editors/mcpConfigEditor.vue', () => ({
+vi.mock('@views/components/Editors/McpConfigEditor.vue', () => ({
   default: {
     name: 'McpConfigEditor',
     template: '<div class="mcp-config-editor-mock">MCP Config Editor</div>'
   }
 }))
 
-vi.mock('@views/components/SecurityConfigEditor/index.vue', () => ({
+vi.mock('@views/components/Editors/SecurityConfigEditor.vue', () => ({
   default: {
     name: 'SecurityConfigEditor',
     template: '<div class="security-config-editor-mock">Security Config Editor</div>'
   }
 }))
 
-vi.mock('@views/components/KeywordHighlightEditor/index.vue', () => ({
+vi.mock('@views/components/Editors/KeywordHighlightEditor.vue', () => ({
   default: {
     name: 'KeywordHighlightEditor',
     template: '<div class="keyword-highlight-editor-mock">Keyword Highlight Editor</div>'
@@ -115,6 +108,14 @@ vi.mock('@views/components/Extensions/pluginDetail.vue', () => ({
     name: 'PluginDetail',
     template: '<div class="plugin-detail-mock">Plugin Detail</div>',
     props: ['pluginInfo']
+  }
+}))
+
+vi.mock('@views/components/LeftTab/config/assetManagement.vue', () => ({
+  default: {
+    name: 'AssetManagement',
+    template: '<div class="asset-management-mock">Asset Management</div>',
+    props: ['organizationUuid']
   }
 }))
 
@@ -134,26 +135,61 @@ const mockT = (key: string) => {
     'common.userConfig': 'User Config',
     'common.assetConfig': 'Asset Config',
     'common.aliasConfig': 'Alias Config',
-    'common.management': 'Management',
+    'common.management': 'Asset Management',
     'common.keyManagement': 'Key Management',
     'common.keyManagementDesc': 'Manage SSH keys and certificates',
     'common.hostManagement': 'Host Management',
-    'common.hostManagementDesc': 'Manage SSH hosts and connection configurations',
-    'common.fileManagement': 'File Management',
-    'common.fileManagementDesc': 'Manage files and folders'
+    'common.hostManagementDesc': 'Manage SSH hosts and connection configurations'
   }
   return translations[key] || key
 }
 
 vi.mock('vue-i18n', () => ({
   useI18n: () => ({
-    t: mockT
-  })
+    t: (key: string) => {
+      const translations: Record<string, string> = {
+        'common.userInfo': 'User Info',
+        'common.userConfig': 'User Config',
+        'common.assetConfig': 'Asset Config',
+        'common.aliasConfig': 'Alias Config',
+        'common.management': 'Asset Management',
+        'common.keyManagement': 'Key Management',
+        'common.keyManagementDesc': 'Manage SSH keys and certificates',
+        'common.hostManagement': 'Host Management',
+        'common.hostManagementDesc': 'Manage SSH hosts and connection configurations'
+      }
+      return translations[key] || key
+    }
+  }),
+  createI18n: vi.fn(() => ({
+    global: {
+      t: (key: string) => key,
+      locale: { value: 'zh-CN' }
+    }
+  }))
 }))
 
-// Mock domUtils
-vi.mock('@/utils/domUtils', () => ({
-  isFocusInAiTab: vi.fn(() => false)
+// Mock userConfigStoreService to prevent transitive import failures
+vi.mock('@/services/userConfigStoreService', () => ({
+  userConfigStore: {
+    getConfig: vi.fn().mockResolvedValue({}),
+    saveConfig: vi.fn()
+  },
+  remoteApplyGuard: { isApplying: false },
+  SUPPORTED_USER_CONFIG_SCHEMA_VERSION: 1,
+  getStoredUserConfigSnapshot: vi.fn(),
+  resolveDataSyncPreference: vi.fn()
+}))
+
+// Mock dataSyncService to prevent transitive import failures
+vi.mock('@/services/dataSyncService', () => ({
+  dataSyncService: {
+    initialize: vi.fn(),
+    enableDataSync: vi.fn(),
+    disableDataSync: vi.fn(),
+    reset: vi.fn(),
+    getInitializationStatus: vi.fn()
+  }
 }))
 
 describe('TabsPanel Component', () => {
@@ -317,11 +353,6 @@ describe('TabsPanel Component', () => {
     it('should render JumpserverSupport when content is jumpserverSupport', () => {
       wrapper = createWrapper({ content: 'jumpserverSupport', organizationId: '' })
       expect(wrapper.html()).toContain('Jumpserver Support')
-    })
-
-    it('should render Files when content is files', () => {
-      wrapper = createWrapper({ content: 'files', organizationId: '' })
-      expect(wrapper.html()).toContain('Files')
     })
 
     it('should render McpConfigEditor when content is mcpConfigEditor', () => {
@@ -801,112 +832,6 @@ describe('TabsPanel Component', () => {
       // Menu position should be adjusted
       expect(vm.contextMenu.x).toBeLessThan(750)
       expect(vm.contextMenu.y).toBeLessThan(500)
-    })
-  })
-
-  describe('Keyboard Shortcuts', () => {
-    it('should handle Cmd+W (Mac) or Ctrl+Shift+W (Windows/Linux) to close tab', async () => {
-      const closeCurrentPanel = vi.fn()
-      wrapper = createWrapper({
-        id: 'test-tab',
-        closeCurrentPanel
-      })
-
-      const vm = wrapper.vm as any
-      vm.isActive = true
-
-      // Mock Mac platform
-      Object.defineProperty(navigator, 'platform', {
-        writable: true,
-        configurable: true,
-        value: 'MacIntel'
-      })
-
-      const mockEvent = {
-        preventDefault: vi.fn(),
-        stopPropagation: vi.fn(),
-        metaKey: true,
-        ctrlKey: false,
-        shiftKey: false,
-        key: 'w',
-        target: document.createElement('div')
-      } as any
-
-      vm.handleCloseTabKeyDown(mockEvent)
-      await nextTick()
-
-      expect(closeCurrentPanel).toHaveBeenCalledWith('panel_test-tab')
-    })
-
-    it('should not close tab when not active', () => {
-      const closeCurrentPanel = vi.fn()
-      wrapper = createWrapper({
-        id: 'test-tab',
-        closeCurrentPanel
-      })
-
-      const vm = wrapper.vm as any
-      vm.isActive = false
-
-      const mockEvent = {
-        metaKey: true,
-        key: 'w',
-        target: document.createElement('div')
-      } as any
-
-      vm.handleCloseTabKeyDown(mockEvent)
-
-      expect(closeCurrentPanel).not.toHaveBeenCalled()
-    })
-
-    it('should not close tab when focus is in AI tab', async () => {
-      const { isFocusInAiTab } = await import('@/utils/domUtils')
-      vi.mocked(isFocusInAiTab).mockReturnValueOnce(true)
-
-      const closeCurrentPanel = vi.fn()
-      wrapper = createWrapper({
-        id: 'test-tab',
-        closeCurrentPanel
-      })
-
-      const vm = wrapper.vm as any
-      vm.isActive = true
-
-      const mockEvent = {
-        metaKey: true,
-        key: 'w',
-        target: document.createElement('div')
-      } as any
-
-      vm.handleCloseTabKeyDown(mockEvent)
-
-      expect(closeCurrentPanel).not.toHaveBeenCalled()
-    })
-
-    it('should not close SSH tab when focus is in terminal', () => {
-      const closeCurrentPanel = vi.fn()
-      wrapper = createWrapper({
-        id: 'test-tab',
-        organizationId: 'org-123',
-        closeCurrentPanel
-      })
-
-      const vm = wrapper.vm as any
-      vm.isActive = true
-
-      // Create element with terminal class
-      const terminalElement = document.createElement('div')
-      terminalElement.className = 'terminal-container'
-
-      const mockEvent = {
-        metaKey: true,
-        key: 'w',
-        target: terminalElement
-      } as any
-
-      vm.handleCloseTabKeyDown(mockEvent)
-
-      expect(closeCurrentPanel).not.toHaveBeenCalled()
     })
   })
 

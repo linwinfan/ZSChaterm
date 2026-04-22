@@ -2,11 +2,19 @@ import { ipcMain } from 'electron'
 import { Client, ConnectConfig } from 'ssh2'
 import { ConnectionInfo } from '../agent/integrations/remote-terminal'
 import { createProxySocket } from './proxy'
-import { createProxyCommandSocket, getReusableSshConnection, registerReusableSshSession, releaseReusableSshSession } from './sshHandle'
+import {
+  createProxyCommandSocket,
+  getReusableSshConnection,
+  registerReusableSshSession,
+  releaseReusableSshSession,
+  findWakeupConnectionInfoByHost
+} from './sshHandle'
 import { LEGACY_ALGORITHMS } from './algorithms'
 import net from 'net'
 import tls from 'tls'
+import { randomUUID } from 'crypto'
 import { getUserConfigFromRenderer } from '../index'
+const logger = createLogger('ssh')
 
 // Store SSH connections
 const remoteConnections = new Map<string, Client>()
@@ -152,18 +160,26 @@ function buildStreamingShellCommand(command: string, shellType: ShellType): stri
 
 export async function remoteSshConnect(connectionInfo: ConnectionInfo): Promise<{ id?: string; error?: string }> {
   const { host, port, username, password, privateKey, passphrase } = connectionInfo
-  const connectionId = `ssh_${Date.now()}_${Math.random().toString(36).substr(2, 12)}`
+  const connectionId = `ssh_${randomUUID()}`
   const normalizedHost = host ?? ''
   const normalizedUsername = username ?? ''
   const normalizedPort = port || 22
 
+  logger.info('Starting SSH connection', {
+    event: 'ssh.connect.start',
+    connectionId,
+    port: normalizedPort
+  })
+
   if (normalizedHost && normalizedUsername) {
-    const reusable = getReusableSshConnection(normalizedHost, normalizedPort, normalizedUsername)
+    const reusable = getReusableSshConnection(normalizedHost, normalizedPort, normalizedUsername, {
+      wakeupTabId: connectionInfo.wakeupTabId
+    })
     if (reusable) {
       remoteConnections.set(connectionId, reusable.conn)
       reusedRemoteSessions.set(connectionId, { poolKey: reusable.poolKey })
       registerReusableSshSession(reusable.poolKey, connectionId)
-      console.log(`SSH connection re-used via MFA pool: ${normalizedUsername}@${normalizedHost} (session: ${connectionId})`)
+      logger.info('SSH connection reused via MFA pool', { event: 'ssh.reuse', connectionId })
       return Promise.resolve({ id: connectionId })
     }
   }
@@ -195,19 +211,23 @@ export async function remoteSshConnect(connectionInfo: ConnectionInfo): Promise<
     conn.on('keyboard-interactive', () => {
       secondAuthTriggered = true
       conn.end()
+      logger.warn('SSH connection requires additional authentication', {
+        event: 'ssh.auth.second_factor_required',
+        connectionId
+      })
       safeResolve({ error: 'Server requires second authentication (e.g., OTP/2FA), cannot connect.' })
     })
 
     conn.on('ready', () => {
       if (secondAuthTriggered) return
       remoteConnections.set(connectionId, conn)
-      console.log(`SSH connection successful: ${connectionId}`)
+      logger.info('SSH connection successful', { event: 'ssh.connect', connectionId })
       safeResolve({ id: connectionId })
     })
 
     conn.on('error', (err) => {
       if (secondAuthTriggered) return
-      console.error('SSH connection error:', err.message)
+      logger.error('SSH connection error', { event: 'ssh.error', error: err.message })
       conn.end()
       safeResolve({ error: err.message })
     })
@@ -216,6 +236,10 @@ export async function remoteSshConnect(connectionInfo: ConnectionInfo): Promise<
       if (secondAuthTriggered) return
       // If the connection closes before the 'ready' event, and no 'error' event is triggered,
       // this usually means all authentication methods failed.
+      logger.warn('SSH connection closed before ready', {
+        event: 'ssh.connect.closed_before_ready',
+        connectionId
+      })
       safeResolve({ error: 'SSH connection closed, possibly authentication failed.' })
     })
 
@@ -249,7 +273,7 @@ export async function remoteSshConnect(connectionInfo: ConnectionInfo): Promise<
       conn.connect(connectConfig)
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err)
-      console.error('SSH connection configuration error:', errorMessage)
+      logger.error('SSH connection configuration error', { event: 'ssh.config.error', error: errorMessage })
       safeResolve({ error: `Connection configuration error: ${errorMessage}` })
     }
   })
@@ -263,10 +287,10 @@ export async function remoteSshExec(
   const conn = remoteConnections.get(sessionId)
 
   if (!conn) {
-    console.error(`SSH connection does not exist: ${sessionId}`)
+    logger.error('SSH connection does not exist', { event: 'ssh.exec.notfound', sessionId })
     return { success: false, error: 'Not connected to remote server' }
   }
-  console.log(`Starting SSH command: ${command} (Session: ${sessionId})`)
+  logger.debug('Starting SSH command', { event: 'ssh.exec', sessionId })
 
   // Detect shell type automatically
   const shellType = await detectShellType(sessionId)
@@ -348,11 +372,11 @@ export async function remoteSshExecStream(
 ): Promise<{ success?: boolean; error?: string; stream?: any }> {
   const conn = remoteConnections.get(sessionId)
   if (!conn) {
-    console.error(`SSH connection does not exist: ${sessionId}`)
+    logger.error('SSH stream connection does not exist', { event: 'ssh.exec.stream.notfound', sessionId })
     return { success: false, error: 'Not connected to remote server' }
   }
 
-  console.log(`Starting SSH command (stream): ${command} (Session: ${sessionId})`)
+  logger.debug('Starting SSH command (stream)', { event: 'ssh.exec.stream', sessionId })
 
   // Detect shell type automatically
   const shellType = await detectShellType(sessionId)
@@ -385,7 +409,10 @@ export async function remoteSshExecStream(
         try {
           onData(data.toString())
         } catch (cbErr) {
-          console.error('remoteSshExecStream onData callback error:', cbErr)
+          logger.error('remoteSshExecStream onData callback error', {
+            event: 'ssh.exec.stream.callback.error',
+            error: cbErr
+          })
         }
       })
 
@@ -393,7 +420,10 @@ export async function remoteSshExecStream(
         try {
           onData(data.toString())
         } catch (cbErr) {
-          console.error('remoteSshExecStream stderr onData callback error:', cbErr)
+          logger.error('remoteSshExecStream stderr callback error', {
+            event: 'ssh.exec.stream.callback.error',
+            error: cbErr
+          })
         }
       })
 
@@ -406,7 +436,10 @@ export async function remoteSshExecStream(
           try {
             onData(`\n[Exit Code: ${code}]`)
           } catch (cbErr) {
-            console.error('remoteSshExecStream onData callback error:', cbErr)
+            logger.error('remoteSshExecStream onData callback error', {
+              event: 'ssh.exec.stream.callback.error',
+              error: cbErr
+            })
           }
         }
 
@@ -414,7 +447,10 @@ export async function remoteSshExecStream(
           try {
             onData("\nCommand not found. Please check if the command exists in the remote server's PATH.")
           } catch (cbErr) {
-            console.error('remoteSshExecStream onData callback error:', cbErr)
+            logger.error('remoteSshExecStream onData callback error', {
+              event: 'ssh.exec.stream.callback.error',
+              error: cbErr
+            })
           }
         }
 
@@ -456,7 +492,7 @@ export async function remoteSshDisconnect(sessionId: string): Promise<{ success?
     remoteConnections.delete(sessionId)
     reusedRemoteSessions.delete(sessionId)
     releaseReusableSshSession(reuseInfo.poolKey, sessionId)
-    console.log(`SSH reused connection session released: ${sessionId}`)
+    logger.info('SSH reused connection session released', { event: 'ssh.disconnect', sessionId })
     return { success: true }
   }
 
@@ -464,12 +500,76 @@ export async function remoteSshDisconnect(sessionId: string): Promise<{ success?
   if (conn) {
     conn.end()
     remoteConnections.delete(sessionId)
-    console.log(`SSH connection disconnected: ${sessionId}`)
+    logger.info('SSH connection disconnected', { event: 'ssh.disconnect', sessionId })
     return { success: true }
   }
 
-  console.warn(`Attempting to disconnect non-existent SSH connection: ${sessionId}`)
+  logger.warn('Attempting to disconnect non-existent SSH connection', { event: 'ssh.disconnect.notfound', sessionId })
   return { success: false, error: 'No active remote connection' }
+}
+
+// ============================================================================
+// Wakeup Agent Reuse — Session Detection & Shell Execution
+// ============================================================================
+// Technical route (agent-side wakeup connection handling):
+//
+//   task/index.ts connectTerminal() -> UUID lookup fails (xshell-xxx not in DB)
+//   -> findWakeupConnectionInfoByHost(hostIP) finds pooled connection
+//   -> builds minimal ConnectionInfo { host, port, username, password:'WAKEUP_REUSE' }
+//   -> remoteSshConnect() -> getReusableSshConnection() hits pool -> reuses conn
+//   -> session stored in reusedRemoteSessions Map
+//
+//   remote-terminal run() -> isWakeupSession(sessionId) returns true
+//   -> runWakeupCommand() -> openWakeupShell() opens conn.shell()
+//   -> runMarkerBasedCommand() writes command with start/end markers, parses output
+//
+// Why shell instead of exec: Wakeup bastion servers don't support SSH exec;
+// all exec channels are treated as tunnels. See sshHandle.ts for pool details.
+// ============================================================================
+
+// Check if a session is a wakeup connection (reused from MFA/OTP pool).
+// Wakeup connections don't support SSH exec — must use shell + markers instead.
+export function isWakeupSession(sessionId: string): boolean {
+  return reusedRemoteSessions.has(sessionId)
+}
+
+// Open an interactive shell on a wakeup connection for marker-based command execution.
+// Returns the shell stream that can be used with runMarkerBasedCommand.
+export async function openWakeupShell(sessionId: string): Promise<{ stream?: any; error?: string }> {
+  const conn = remoteConnections.get(sessionId)
+  if (!conn) {
+    return { error: 'SSH connection not found for wakeup shell' }
+  }
+
+  // If a shell stream already exists for this session, reuse it
+  const existing = remoteShellStreams.get(sessionId)
+  if (existing && existing.writable) {
+    return { stream: existing }
+  }
+
+  return new Promise((resolve) => {
+    conn.shell({ term: 'xterm-256color', rows: 40, cols: 120 }, (err, stream) => {
+      if (err) {
+        logger.error('Failed to open wakeup shell', {
+          event: 'ssh.wakeup.shell.error',
+          sessionId,
+          error: err.message
+        })
+        resolve({ error: err.message })
+        return
+      }
+
+      remoteShellStreams.set(sessionId, stream)
+
+      stream.on('close', () => {
+        remoteShellStreams.delete(sessionId)
+        logger.info('Wakeup shell closed', { event: 'ssh.wakeup.shell.close', sessionId })
+      })
+
+      logger.info('Wakeup shell opened', { event: 'ssh.wakeup.shell.open', sessionId })
+      resolve({ stream })
+    })
+  })
 }
 
 // Export function for direct use in main process
@@ -481,6 +581,8 @@ export function handleRemoteExecInput(streamId: string, input: string): { succes
   }
   return { success: false, error: 'Stream not found' }
 }
+
+export { findWakeupConnectionInfoByHost }
 
 export const registerRemoteTerminalHandlers = () => {
   ipcMain.handle('ssh:remote-connect', async (_event, connectionInfo) => {

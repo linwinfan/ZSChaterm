@@ -116,6 +116,7 @@ describe('useContext', () => {
     // Mock KB APIs used by docs navigation
     window.api = {
       ...(window.api || {}),
+      getUserHosts: vi.fn().mockResolvedValue({ data: { personal: [], jumpservers: [] } }),
       kbGetRoot: vi.fn().mockResolvedValue({ root: '/kb' }),
       kbListDir: vi.fn().mockResolvedValue([])
     }
@@ -138,12 +139,13 @@ describe('useContext', () => {
       expect(isHostSelected(mockHostOption)).toBe(false)
     })
 
-    it('should match by IP and connection type as fallback', () => {
+    it('should not match when uuid is different even if IP is same', () => {
       const { isHostSelected } = useContext()
 
+      // Two hosts with same IP but different UUIDs should be treated as different hosts
       hosts.value = [{ host: 'server1.example.com', uuid: 'different-uuid', connection: 'ssh' }]
 
-      expect(isHostSelected(mockHostOption)).toBe(true)
+      expect(isHostSelected(mockHostOption)).toBe(false)
     })
   })
 

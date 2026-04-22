@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 const Database = require('better-sqlite3')
 const fs = require('fs')
 const path = require('path')
@@ -92,7 +93,9 @@ CREATE TABLE IF NOT EXISTS agent_task_metadata_v1 (
   files_in_context TEXT,                             -- 文件上下文元数据 (JSON格式)
   model_usage TEXT,                                  -- 模型使用记录 (JSON格式)
   hosts TEXT,                                        -- 主机信息 (JSON格式)
-  todos TEXT                                         -- 待办事项 (JSON格式)
+  todos TEXT,                                        -- 待办事项 (JSON格式)
+  title TEXT,                                        -- 任务标题
+  favorite INTEGER DEFAULT 0                         -- 收藏状态
 );
 CREATE INDEX IF NOT EXISTS idx_created_at_meta ON agent_task_metadata_v1(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_updated_at_meta ON agent_task_metadata_v1(updated_at DESC);
@@ -134,6 +137,7 @@ CREATE TABLE IF NOT EXISTS t_organization_assets (
   favorite INTEGER DEFAULT 2,                       -- 是否收藏
   comment TEXT,                                     -- 自定义备注
   bastion_comment TEXT,                             -- 堡垒机备注
+  data_source TEXT DEFAULT 'refresh',               -- 数据来源: manual/refresh
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,    -- 创建时间
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP     -- 更新时间
 );
@@ -241,6 +245,27 @@ CREATE TABLE IF NOT EXISTS indexdb_migration_status (
   record_count INTEGER,
   error_message TEXT
 );
+
+-- Chat Sync V2: per-task sync state tracking
+CREATE TABLE IF NOT EXISTS agent_chat_sync_task_state (
+  task_id TEXT PRIMARY KEY,
+  local_change_seq INTEGER DEFAULT 0,
+  acked_local_change_seq INTEGER DEFAULT 0,
+  last_uploaded_hash TEXT,
+  last_uploaded_hash_version INTEGER DEFAULT 0,
+  last_applied_hash TEXT,
+  last_applied_hash_version INTEGER DEFAULT 0,
+  last_server_revision INTEGER DEFAULT 0,
+  pending_upload INTEGER DEFAULT 0,
+  is_deleted INTEGER DEFAULT 0,
+  remote_deleted INTEGER DEFAULT 0,
+  sync_blocked_reason TEXT,
+  last_sync_status TEXT,
+  last_error TEXT,
+  updated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_task_state_pending ON agent_chat_sync_task_state(pending_upload, remote_deleted, is_deleted);
+
 `)
 
 console.log('数据库创建成功，表已创建')

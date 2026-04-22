@@ -1,17 +1,17 @@
 import { ref, computed, watch, nextTick, onMounted, onUnmounted, type Ref } from 'vue'
 import type { InjectionKey } from 'vue'
 import debounce from 'lodash/debounce'
-import type { Host, HostOption, HostItemType, ContextMenuLevel, DocOption, ChatOption } from '../types'
-import { formatHosts, isSwitchAssetType } from '../utils'
+
+const logger = createRendererLogger('ai.context')
+import type { Host, HostOption, HostItemType, ContextMenuLevel, DocOption, ChatOption, SkillOption } from '../types'
+import { formatHosts, hostLabelOrTitleMatches, isSwitchAssetType } from '../utils'
 import { isBastionHostType } from '../types'
 import { useSessionState } from './useSessionState'
 import { useHostState } from './useHostState'
 import { focusChatInput } from './useTabManagement'
-import { getGlobalState } from '@renderer/agent/storage/state'
-import type { TaskHistoryItem } from '../types'
 import i18n from '@/locales'
 import { Notice } from '@/views/components/Notice'
-import type { ContentPart, ImageContentPart } from '@shared/WebviewMessage'
+import type { ContentPart, ImageContentPart, ContextSkillRef } from '@shared/WebviewMessage'
 import eventBus from '@/utils/eventBus'
 
 // Type for the context return value
@@ -24,6 +24,7 @@ export interface UseContextOptions {
   chatInputParts?: Ref<ContentPart[]>
   focusInput?: () => void
   mode?: 'create' | 'edit'
+  hosts?: Ref<Host[]>
 }
 
 /**
@@ -41,8 +42,9 @@ const MAX_TARGET_HOSTS = 5
 export const useContext = (options: UseContextOptions = {}) => {
   const { t } = i18n.global
 
-  const { hosts, chatTypeValue, autoUpdateHost, chatInputParts: globalChatInputParts, isMessageEditing } = useSessionState()
+  const { hosts: sessionHosts, chatTypeValue, autoUpdateHost, chatInputParts: globalChatInputParts, isMessageEditing } = useSessionState()
   const chatInputParts = options.chatInputParts ?? globalChatInputParts
+  const hosts = options.hosts ?? sessionHosts
 
   const { getCurentTabAssetInfo } = useHostState()
 
@@ -69,7 +71,7 @@ export const useContext = (options: UseContextOptions = {}) => {
     if (chatTypeValue.value !== 'chat' && chatTypeValue.value !== 'cmd') {
       items.push('hosts')
     }
-    items.push('docs', 'chats')
+    items.push('docs', 'chats', 'skills')
     return items
   })
 
@@ -93,8 +95,14 @@ export const useContext = (options: UseContextOptions = {}) => {
   // ========== Chats State ==========
   const chatsOptions = ref<ChatOption[]>([])
   const chatsOptionsLoading = ref(false)
-  const chipInsertHandler = ref<((chipType: 'doc' | 'chat', ref: DocOption | ChatOption, label: string) => void) | null>(null)
+  const chipInsertHandler = ref<((chipType: 'doc' | 'chat' | 'skill', ref: DocOption | ChatOption | ContextSkillRef, label: string) => void) | null>(
+    null
+  )
   const imageInsertHandler = ref<((imagePart: ImageContentPart) => void) | null>(null)
+
+  // ========== Skills State ==========
+  const skillsOptions = ref<SkillOption[]>([])
+  const skillsOptionsLoading = ref(false)
 
   // ========== Opened Hosts State ==========
   // List of hosts from currently opened terminal tabs for quick selection
@@ -127,6 +135,7 @@ export const useContext = (options: UseContextOptions = {}) => {
           result.push({
             key: child.key,
             label: child.label,
+            title: child.title,
             value: child.key,
             uuid: child.uuid,
             connect: child.connection,
@@ -144,9 +153,9 @@ export const useContext = (options: UseContextOptions = {}) => {
   })
 
   const filteredHostOptions = computed(() => {
-    if (chatTypeValue.value === 'chat') {
-      return []
-    }
+    // if (chatTypeValue.value === 'chat') {
+    //   return []
+    // }
     if (chatTypeValue.value === 'cmd') {
       return flattenedHostOptions.value
     }
@@ -158,11 +167,11 @@ export const useContext = (options: UseContextOptions = {}) => {
 
     const result: HostOption[] = []
     for (const item of hostOptions.value) {
-      const labelMatches = item.label.toLowerCase().includes(searchTerm)
+      const labelMatches = hostLabelOrTitleMatches(item, searchTerm)
 
       if (isBastionHostType(item.type)) {
-        // Check if any children match
-        const matchingChildren = item.children?.filter((child) => child.label.toLowerCase().includes(searchTerm)) || []
+        // Check if any children match (IP or bastion remark / title)
+        const matchingChildren = item.children?.filter((child) => hostLabelOrTitleMatches(child, searchTerm)) || []
 
         if (labelMatches || matchingChildren.length > 0) {
           // Add bastion host node
@@ -176,6 +185,7 @@ export const useContext = (options: UseContextOptions = {}) => {
             result.push({
               key: child.key,
               label: child.label,
+              title: child.title,
               value: child.key,
               uuid: child.uuid,
               connect: child.connection,
@@ -212,6 +222,15 @@ export const useContext = (options: UseContextOptions = {}) => {
     return chatsOptions.value.filter((chat) => chat.title.toLowerCase().includes(searchTerm))
   })
 
+  // Filtered skills options based on search value
+  const filteredSkillsOptions = computed(() => {
+    const searchTerm = searchValue.value.toLowerCase()
+    if (!searchTerm) return skillsOptions.value
+    return skillsOptions.value.filter(
+      (skill) => skill.name.toLowerCase().includes(searchTerm) || skill.description.toLowerCase().includes(searchTerm)
+    )
+  })
+
   // Filtered opened hosts for main menu quick selection
   const filteredOpenedHosts = computed(() => {
     // Only show opened hosts in agent mode
@@ -239,10 +258,30 @@ export const useContext = (options: UseContextOptions = {}) => {
   })
 
   const isHostSelected = (hostOption: HostOption): boolean => {
-    return hosts.value.some((h) => {
-      if (h.uuid === hostOption.uuid) return true
-      return h.host === hostOption.label && h.connection === hostOption.connect
+    return hosts.value.some((h) => h.uuid === hostOption.uuid)
+  }
+
+  const isLocalhostHostOption = (item: Pick<HostOption, 'isLocalHost' | 'label'>): boolean => {
+    return item.isLocalHost || item.label === '127.0.0.1'
+  }
+
+  const warnMaxHostsLimit = () => {
+    Notice.open({
+      type: 'warning',
+      description: t('ai.maxHostsLimitReached', { max: MAX_TARGET_HOSTS }),
+      placement: 'bottomRight',
+      duration: 2
     })
+  }
+
+  const hostOptionToHost = (item: HostOption): Host => {
+    return {
+      host: item.label,
+      uuid: item.uuid,
+      connection: item.isLocalHost ? 'localhost' : item.connect,
+      organizationUuid: item.organizationUuid,
+      assetType: item.assetType
+    }
   }
 
   const onHostClick = (item: HostOption) => {
@@ -252,13 +291,7 @@ export const useContext = (options: UseContextOptions = {}) => {
       return
     }
 
-    const newHost: Host = {
-      host: item.label,
-      uuid: item.uuid,
-      connection: item.isLocalHost ? 'localhost' : item.connect,
-      organizationUuid: item.organizationUuid,
-      assetType: item.assetType
-    }
+    const newHost = hostOptionToHost(item)
 
     const isSwitchHost = isSwitchAssetType(item.assetType)
 
@@ -281,17 +314,12 @@ export const useContext = (options: UseContextOptions = {}) => {
       } else {
         let updatedHosts = [...hosts.value]
 
-        if (!item.isLocalHost && item.label !== '127.0.0.1') {
+        if (!isLocalhostHostOption(item)) {
           updatedHosts = updatedHosts.filter((h) => h.host !== '127.0.0.1')
         }
 
         if (updatedHosts.length >= MAX_TARGET_HOSTS) {
-          Notice.open({
-            type: 'warning',
-            description: t('ai.maxHostsLimitReached', { max: MAX_TARGET_HOSTS }),
-            placement: 'bottomRight',
-            duration: 2
-          })
+          warnMaxHostsLimit()
           return
         }
 
@@ -303,6 +331,50 @@ export const useContext = (options: UseContextOptions = {}) => {
 
     removeTrailingAtFromInputParts()
   }
+
+  // ========== Direct Host Selection Operations (agent mode) ==========
+  const selectAllHosts = () => {
+    const selectable = filteredHostOptions.value.filter((opt) => !isBastionHostType(opt.type))
+    const newHosts: Host[] = []
+
+    // Remove localhost if adding remote hosts
+    const hasRemote = selectable.some((opt) => !isLocalhostHostOption(opt))
+
+    for (const opt of selectable) {
+      if (newHosts.length >= MAX_TARGET_HOSTS) {
+        warnMaxHostsLimit()
+        break
+      }
+
+      // Skip localhost if we have remote hosts
+      if (hasRemote && isLocalhostHostOption(opt)) {
+        continue
+      }
+
+      // Check if host is already selected
+      const existing = hosts.value.find((h) => h.uuid === opt.uuid)
+      if (!existing) {
+        newHosts.push(hostOptionToHost(opt))
+      }
+    }
+
+    // Merge with existing hosts (keeping already selected ones)
+    hosts.value = [...hosts.value, ...newHosts].slice(0, MAX_TARGET_HOSTS)
+  }
+
+  const clearAllHosts = () => {
+    hosts.value = []
+  }
+
+  const allVisibleHostsSelected = computed(() => {
+    const selectable = filteredHostOptions.value.filter((opt) => !isBastionHostType(opt.type))
+    if (selectable.length === 0) return false
+
+    // Check if all visible selectable hosts are in the selected hosts
+    return selectable.every((opt) => hosts.value.some((h) => h.uuid === opt.uuid))
+  })
+
+  // ========== Pending Selection Operations (agent mode batch) ==========
 
   const removeTrailingAtFromInputParts = () => {
     if (chatInputParts.value.length === 0) return
@@ -357,6 +429,8 @@ export const useContext = (options: UseContextOptions = {}) => {
         return filteredDocsOptions.value
       case 'chats':
         return filteredChatsOptions.value
+      case 'skills':
+        return filteredSkillsOptions.value
       default:
         return []
     }
@@ -415,11 +489,14 @@ export const useContext = (options: UseContextOptions = {}) => {
         } else if (keyboardSelectedIndex.value >= 0 && keyboardSelectedIndex.value < currentList.length) {
           const item = currentList[keyboardSelectedIndex.value]
           if (currentMenuLevel.value === 'hosts') {
+            // Both agent and cmd mode use direct click now
             onHostClick(item as HostOption)
           } else if (currentMenuLevel.value === 'docs') {
             await onDocClick(item as DocOption)
           } else if (currentMenuLevel.value === 'chats') {
             onChatClick(item as ChatOption)
+          } else if (currentMenuLevel.value === 'skills') {
+            onSkillClick(item as SkillOption)
           }
         }
         break
@@ -468,9 +545,7 @@ export const useContext = (options: UseContextOptions = {}) => {
 
     // Fetch data for the selected category
     if (level === 'hosts') {
-      if (chatTypeValue.value === 'chat') {
-        hostOptions.value.splice(0, hostOptions.value.length)
-      } else if (chatTypeValue.value === 'cmd') {
+      if (chatTypeValue.value === 'cmd') {
         await fetchHostOptionsForCommandMode('')
       } else {
         await fetchHostOptions('')
@@ -481,6 +556,8 @@ export const useContext = (options: UseContextOptions = {}) => {
       await fetchDocsOptions('')
     } else if (level === 'chats') {
       await fetchChatsOptions()
+    } else if (level === 'skills') {
+      await fetchSkillsOptions()
     }
 
     nextTick(() => {
@@ -580,7 +657,7 @@ export const useContext = (options: UseContextOptions = {}) => {
         left: popupAbsLeft
       }
     } catch (error) {
-      console.error('Error calculating popup position for contenteditable:', error)
+      logger.error('Error calculating popup position for contenteditable', { error: error })
       popupPosition.value = null
     }
   }
@@ -614,16 +691,16 @@ export const useContext = (options: UseContextOptions = {}) => {
 
       popupPosition.value = { bottom, left }
     } catch (error) {
-      console.error('Error calculating create mode popup position:', error)
+      logger.error('Error calculating create mode popup position', { error: error })
       popupPosition.value = null
     }
   }
 
   const fetchHostOptions = async (search: string) => {
-    if (chatTypeValue.value === 'chat') {
-      hostOptions.value = []
-      return
-    }
+    // if (chatTypeValue.value === 'chat') {
+    //   hostOptions.value = []
+    //   return
+    // }
     if (hostOptionsLoading.value) return
 
     hostOptionsLoading.value = true
@@ -659,7 +736,7 @@ export const useContext = (options: UseContextOptions = {}) => {
       const bastionKeys = formatted.filter((h) => isBastionHostType(h.type)).map((h) => h.key)
       expandedJumpservers.value = new Set(bastionKeys)
     } catch (error) {
-      console.error('Failed to fetch host options:', error)
+      logger.error('Failed to fetch host options', { error: error })
       hostOptions.value = []
     } finally {
       hostOptionsLoading.value = false
@@ -694,7 +771,7 @@ export const useContext = (options: UseContextOptions = {}) => {
         hostOptions.value.splice(0, hostOptions.value.length)
       }
     } catch (error) {
-      console.error('Failed to fetch host options for command mode:', error)
+      logger.error('Failed to fetch host options for command mode', { error: error })
       hostOptions.value.splice(0, hostOptions.value.length)
     }
   }
@@ -703,10 +780,10 @@ export const useContext = (options: UseContextOptions = {}) => {
    * Fetch list of hosts from currently opened terminal tabs
    */
   const fetchOpenedHosts = async () => {
-    if (chatTypeValue.value === 'chat') {
-      openedHostsList.value = []
-      return
-    }
+    // if (chatTypeValue.value === 'chat') {
+    //   openedHostsList.value = []
+    //   return
+    // }
 
     openedHostsLoading.value = true
     const TIMEOUT_MS = 3000
@@ -745,7 +822,7 @@ export const useContext = (options: UseContextOptions = {}) => {
         assetType: h.assetType
       }))
     } catch (error) {
-      console.error('Failed to fetch opened hosts:', error)
+      logger.error('Failed to fetch opened hosts', { error: error })
       openedHostsList.value = []
     } finally {
       openedHostsLoading.value = false
@@ -773,7 +850,7 @@ export const useContext = (options: UseContextOptions = {}) => {
         type: item.type
       }))
     } catch (error) {
-      console.error('Failed to fetch docs options:', error)
+      logger.error('Failed to fetch docs options', { error: error })
       docsOptions.value = []
     } finally {
       docsOptionsLoading.value = false
@@ -812,19 +889,41 @@ export const useContext = (options: UseContextOptions = {}) => {
 
     chatsOptionsLoading.value = true
     try {
-      const taskHistory = ((await getGlobalState('taskHistory')) as TaskHistoryItem[]) || []
-      chatsOptions.value = taskHistory
-        .sort((a, b) => (b.ts || 0) - (a.ts || 0))
-        .map((item) => ({
-          id: item.id,
-          title: item.chatTitle || item.task || 'Untitled Chat',
-          ts: item.ts || 0
-        }))
+      const result = await window.api.getTaskList()
+      if (!result.success || !result.data) return
+
+      chatsOptions.value = result.data.map((item) => ({
+        id: item.id,
+        title: item.title || 'New Chat',
+        ts: item.updatedAt || 0
+      }))
     } catch (error) {
-      console.error('Failed to fetch chats options:', error)
+      logger.error('Failed to fetch chats options', { error: error })
       chatsOptions.value = []
     } finally {
       chatsOptionsLoading.value = false
+    }
+  }
+
+  // Fetch skills list
+  const fetchSkillsOptions = async () => {
+    if (skillsOptionsLoading.value) return
+    skillsOptionsLoading.value = true
+    try {
+      const result = await window.api.getSkills()
+      skillsOptions.value = (result || [])
+        .filter((s: any) => s.enabled)
+        .map((s: any) => ({
+          name: s.name,
+          description: s.description,
+          path: s.path,
+          enabled: s.enabled
+        }))
+    } catch (error) {
+      logger.error('Failed to fetch skills options', { error: error })
+      skillsOptions.value = []
+    } finally {
+      skillsOptionsLoading.value = false
     }
   }
 
@@ -835,6 +934,21 @@ export const useContext = (options: UseContextOptions = {}) => {
   // Check if chat is selected by looking at chatInputParts chips
   const isChatSelected = (chat: ChatOption): boolean => {
     return chatInputParts.value.some((part) => part.type === 'chip' && part.chipType === 'chat' && part.ref.taskId === chat.id)
+  }
+
+  const isSkillSelected = (skill: SkillOption): boolean => {
+    return chatInputParts.value.some((part) => part.type === 'chip' && part.chipType === 'skill' && part.ref.skillName === skill.name)
+  }
+
+  const onSkillClick = (skill: SkillOption) => {
+    if (isSkillSelected(skill)) {
+      closeContextPopup()
+      return
+    }
+    if (chipInsertHandler.value) {
+      chipInsertHandler.value('skill', { skillName: skill.name, description: skill.description }, skill.name)
+    }
+    closeContextPopup()
   }
 
   const onDocClick = async (doc: DocOption) => {
@@ -1063,6 +1177,7 @@ export const useContext = (options: UseContextOptions = {}) => {
     currentMode,
     searchInputRef,
     chatTypeValue,
+    hosts,
 
     // Hosts state
     hostOptions,
@@ -1074,6 +1189,11 @@ export const useContext = (options: UseContextOptions = {}) => {
     toggleJumpserverExpand,
     fetchHostOptions,
     fetchHostOptionsForCommandMode,
+
+    // Direct selection (agent mode)
+    selectAllHosts,
+    clearAllHosts,
+    allVisibleHostsSelected,
 
     // Opened hosts state (for quick selection in main menu)
     openedHostsList,
@@ -1096,9 +1216,17 @@ export const useContext = (options: UseContextOptions = {}) => {
     isChatSelected,
     onChatClick,
     fetchChatsOptions,
+
+    // Skills state
+    skillsOptions,
+    skillsOptionsLoading,
+    filteredSkillsOptions,
+    isSkillSelected,
+    onSkillClick,
+    fetchSkillsOptions,
     openKbFile,
     // Chip insertion
-    setChipInsertHandler: (handler: (chipType: 'doc' | 'chat', ref: DocOption | ChatOption, label: string) => void) => {
+    setChipInsertHandler: (handler: (chipType: 'doc' | 'chat' | 'skill', ref: DocOption | ChatOption | ContextSkillRef, label: string) => void) => {
       chipInsertHandler.value = handler
     },
     // Image insertion

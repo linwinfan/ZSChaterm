@@ -234,6 +234,14 @@
   width: 100%;
   min-width: 0;
 
+  .user-assistant-pair-message {
+    // Isolate layout/style calculations per message pair to reduce reflow cost during resize
+    contain: layout style;
+    // Enable browser-native content skipping for off-screen message pairs
+    content-visibility: auto;
+    contain-intrinsic-size: auto 200px;
+  }
+
   .message {
     display: inline-block;
     padding: 8px 12px;
@@ -254,7 +262,6 @@
         padding: 0 8px 2px 8px;
         margin-top: 0;
       }
-
     }
   }
 }
@@ -361,6 +368,17 @@
           &:hover {
             color: var(--text-color-secondary);
           }
+        }
+
+        .custom-icon {
+          width: 16px;
+          height: 16px;
+          opacity: 0.35;
+          filter: var(--icon-filter);
+        }
+
+        &:hover .custom-icon {
+          opacity: 1;
         }
       }
     }
@@ -667,11 +685,26 @@
       display: flex;
       align-items: center;
       justify-content: center;
+      transition: all 0.2s ease;
+
+      &:hover {
+        background-color: var(--hover-bg-color);
+        border-radius: 4px;
+
+        .star-outline-icon {
+          color: #faad14;
+        }
+      }
 
       &.ant-btn-primary {
         background-color: transparent;
         border: none;
       }
+    }
+
+    .star-outline-icon {
+      color: #999999;
+      transition: color 0.2s ease;
     }
   }
 
@@ -1335,4 +1368,52 @@
   min-height: auto !important;
   background-color: var(--bg-color-secondary) !important;
   color: var(--text-color) !important;
+}
+
+.context-truncated-notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  margin: 8px 0 12px;
+  color: var(--text-color-tertiary);
+  font-size: 13px;
+  line-height: 1.4;
+
+  .context-truncated-line {
+    flex: 1;
+    min-width: 24px;
+    height: 1px;
+    background: var(--border-color-light);
+  }
+
+  .context-truncated-content {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+
+  .context-truncated-icon {
+    font-size: 14px;
+    color: currentColor;
+  }
+
+  &.is-compressing {
+    color: var(--text-color-secondary);
+
+    .context-truncated-icon {
+      animation: context-truncated-spin 1.4s linear infinite;
+    }
+  }
+}
+
+@keyframes context-truncated-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }

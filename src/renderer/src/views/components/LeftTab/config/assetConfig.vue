@@ -31,6 +31,7 @@
           @clone="handleContextMenuClone"
           @refresh="handleContextMenuRefresh"
           @remove="handleContextMenuRemove"
+          @manage-assets="handleContextMenuManageAssets"
         />
       </div>
 
@@ -64,9 +65,12 @@ import AssetForm from '../components/AssetForm.vue'
 import AssetContextMenu from '../components/AssetContextMenu.vue'
 import eventBus from '@/utils/eventBus'
 import i18n from '@/locales'
+
 import { handleRefreshOrganizationAssets } from '../components/refreshOrganizationAssets'
 import type { AssetNode, AssetFormData, KeyChainItem, SshProxyConfigItem } from '../utils/types'
 import { isOrganizationAsset } from '../utils/types'
+
+const logger = createRendererLogger('config.asset')
 
 interface ParsedSession {
   name: string
@@ -149,11 +153,11 @@ const handleSearch = () => {
 }
 
 const handleAssetClick = (asset: AssetNode) => {
-  console.log('Asset clicked:', asset)
+  logger.info('Asset clicked', { event: 'asset.click', uuid: asset.uuid, title: asset.title })
 }
 
 const handleAssetConnect = (asset: AssetNode) => {
-  console.log('Connecting to asset:', asset)
+  logger.info('Connecting to asset', { event: 'asset.connect', uuid: asset.uuid, title: asset.title })
   eventBus.emit('currentClickServer', asset)
 }
 
@@ -163,7 +167,7 @@ const handleAssetEdit = (asset: AssetNode) => {
   editingAssetUUID.value = asset.uuid || null
 
   let keyChain = asset.key_chain_id
-  console.log('keyChain: ', keyChain)
+  logger.info('keyChain value', { event: 'asset.edit.keychain', hasKeyChain: !!keyChain && keyChain !== 0 })
   if (keyChain === 0) {
     keyChain = undefined
   }
@@ -288,6 +292,21 @@ const handleContextMenuRemove = () => {
   }
 }
 
+const handleContextMenuManageAssets = () => {
+  if (selectedAsset.value && isOrganizationAsset(selectedAsset.value.asset_type)) {
+    const orgUuid = selectedAsset.value.uuid || ''
+    const bastionName = selectedAsset.value.asset_ip || selectedAsset.value.label || ''
+    eventBus.emit('open-user-tab', {
+      key: 'assetManagement',
+      title: `${t('personal.manageAssets')} - ${bastionName}`,
+      props: {
+        organizationUuid: orgUuid
+      }
+    })
+    closeContextMenu()
+  }
+}
+
 const handleAssetRemove = (asset: AssetNode) => {
   if (!asset || !asset.uuid) return
   closeContextMenu()
@@ -403,7 +422,7 @@ const handleImportAssets = async (assets: any[]) => {
           errorCount++
         }
       } catch (error) {
-        console.error('Import asset error:', error)
+        logger.error('Import asset error', { error: error })
         errorCount++
       }
     }
@@ -438,7 +457,7 @@ const handleImportAssets = async (assets: any[]) => {
               errorCount++
             }
           } catch (error) {
-            console.error('Update duplicate asset error:', error)
+            logger.error('Update duplicate asset error', { error: error })
             errorCount++
           }
         }
@@ -459,7 +478,7 @@ const handleImportAssets = async (assets: any[]) => {
       message.warning(t('personal.importErrorCount', { count: errorCount }))
     }
   } catch (error) {
-    console.error('Batch import error:', error)
+    logger.error('Batch import error', { error: error })
     message.error(t('personal.importError'))
   }
 }
@@ -514,7 +533,7 @@ const handleExportAssets = () => {
 
     message.success(t('personal.exportSuccess', { count: allAssets.length }))
   } catch (error) {
-    console.error('Export assets error:', error)
+    logger.error('Export assets error', { error: error })
     message.error(t('personal.exportError'))
   }
 }
@@ -568,7 +587,7 @@ const handleImportFile = async (data: { file: File; type: string }) => {
       message.info(t('personal.importSuccessNeedPassword', { count: convertedAssets.length }))
     }
   } catch (error) {
-    console.error('File parsing error:', error)
+    logger.error('File parsing error', { error: error })
     message.error(t('personal.importParseError'))
   }
 }
@@ -736,7 +755,7 @@ const parseXShellXTS = async (file: File): Promise<ParsedSession[]> => {
       }
     }
   } catch (error) {
-    console.error('Error parsing XTS file:', error)
+    logger.error('Error parsing XTS file', { error: error })
     message.error(t('personal.xtsParseError'))
   }
 
@@ -945,7 +964,7 @@ const parseSecureCRTXML = (content: string): ParsedSession[] => {
       }
     }
   } catch (error) {
-    console.error('Error parsing SecureCRT XML:', error)
+    logger.error('Error parsing SecureCRT XML', { error: error })
 
     // Fallback to simple parsing (compatible with other formats)
     const simpleMatches = content.match(/<session[^>]*>[\s\S]*?<\/session>/gi)
@@ -1010,7 +1029,7 @@ const parseMobaXtermINI = (content: string): ParsedSession[] => {
           sessions.push(session)
         }
       } catch (error) {
-        console.warn('Failed to parse MobaXterm line:', trimmedLine, error)
+        logger.warn('Failed to parse MobaXterm line', { line: trimmedLine, error: error })
         continue
       }
     }
@@ -1105,7 +1124,7 @@ const parseMobaXtermEncodedLine = (line: string): ParsedSession | null => {
 
     return null
   } catch (error) {
-    console.error('Error parsing MobaXterm encoded line:', error)
+    logger.error('Error parsing MobaXterm encoded line', { error: error })
     return null
   }
 }
@@ -1188,7 +1207,7 @@ const getProxyConfigData = async () => {
       }))
     }
   } catch (error) {
-    console.error('Failed to load config:', error)
+    logger.error('Failed to load config', { error: error })
     notification.error({
       message: t('user.loadConfigFailed'),
       description: t('user.loadConfigFailedDescription')
@@ -1215,7 +1234,7 @@ const handleFormSubmit = async (data: AssetFormData) => {
       await handleCreateAsset(data)
     }
   } catch (error) {
-    console.error('Form submission error:', error)
+    logger.error('Form submission error', { error: error })
   }
 }
 
@@ -1254,7 +1273,7 @@ const handleCreateAsset = async (data: AssetFormData) => {
       throw new Error('Failed to create asset')
     }
   } catch (error) {
-    console.error('Create asset error:', error)
+    logger.error('Create asset error', { error: error })
     message.error(t('personal.createError'))
   }
 }
@@ -1315,7 +1334,7 @@ const getAssetList = () => {
         assetGroups.value = []
       }
     })
-    .catch((err) => console.error(err))
+    .catch((err) => logger.error('Failed to get asset list', { error: err }))
 }
 
 onMounted(() => {
@@ -1330,7 +1349,7 @@ onMounted(() => {
   })
   // Listen to language change event, reload asset data
   eventBus.on('languageChanged', () => {
-    console.log('Language changed in asset config, refreshing asset list...')
+    logger.info('Language changed in asset config, refreshing asset list')
     getAssetList()
     eventBus.emit('LocalAssetMenu') // Notify workspace component to refresh as well
   })

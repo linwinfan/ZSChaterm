@@ -45,6 +45,16 @@
             @create-new-term="createNewTerm"
           />
         </template>
+        <template v-else-if="localTab.type === 'k8s'">
+          <K8sConnect
+            :key="`k8s-terminal-${localTab.id}`"
+            :ref="(el) => setK8sConnectRef(el, localTab.id)"
+            :server-info="localTab"
+            :active-tab-id="localTab.id"
+            :is-active="isActive"
+            @close-tab-in-term="closeTab"
+          />
+        </template>
         <template v-else>
           <UserInfo v-if="localTab.content === 'userInfo'" />
           <UserConfig v-if="localTab.content === 'userConfig'" />
@@ -52,9 +62,13 @@
           <KnowledgeCenterEditor
             v-if="localTab.content === 'KnowledgeCenterEditor' && localTab.props"
             :rel-path="localTab.props.relPath || ''"
+            :start-line="localTab.props.startLine"
+            :end-line="localTab.props.endLine"
+            :jump-token="localTab.props.jumpToken"
             :mode="localTab.mode"
           />
           <Kubernetes v-if="localTab.content === 'kubernetes'" />
+          <K8sClusterConfig v-if="localTab.content === 'k8sClusterConfig'" />
           <AliasConfig v-if="localTab.content === 'aliasConfig'" />
           <jumpserverSupport v-if="localTab.content === 'jumpserverSupport'" />
           <AssetConfig v-if="localTab.content === 'assetConfig'" />
@@ -65,6 +79,10 @@
             :file-path="localTab.props.filePath || ''"
             :plugin-id="localTab.props.pluginId || ''"
             :initial-content="localTab.props.initialContent || ''"
+          />
+          <AssetManagement
+            v-if="localTab.content === 'assetManagement' && localTab.props"
+            :organization-uuid="localTab.props.organizationUuid || ''"
           />
           <SecurityConfigEditor v-if="localTab.content === 'securityConfigEditor'" />
           <KeywordHighlightEditor v-if="localTab.content === 'keywordHighlightEditor'" />
@@ -80,7 +98,7 @@
   </div>
 </template>
 <script setup lang="ts">
-import { computed, ref, ComponentPublicInstance, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { computed, ref, ComponentPublicInstance, onMounted, watch, nextTick } from 'vue'
 import { userConfigStore } from '@/store/userConfigStore'
 import 'splitpanes/dist/splitpanes.css'
 import UserInfo from '@views/components/LeftTab/config/userInfo.vue'
@@ -90,16 +108,18 @@ import AliasConfig from '@views/components/Extensions/aliasConfig.vue'
 import jumpserverSupport from '@views/components/Extensions/jumpserverSupport.vue'
 import KeyManagement from '@views/components/LeftTab/config/keyManagement.vue'
 import SshConnect from '@views/components/Ssh/sshConnect.vue'
+import K8sConnect from '@views/components/K8s/K8sConnect.vue'
 import Files from '@views/components/Files/index.vue'
-import KnowledgeCenterEditor from '@views/components/Ssh/editors/KnowledgeCenterEditor.vue'
+import KnowledgeCenterEditor from '@views/components/Editors/KnowledgeCenterEditor.vue'
 import Kubernetes from '@views/components/Kubernetes/index.vue'
-import McpConfigEditor from '@views/components/Ssh/editors/mcpConfigEditor.vue'
-import CommonConfigEditor from '@views/components/CommonConfigEditor/index.vue'
-import SecurityConfigEditor from '@views/components/SecurityConfigEditor/index.vue'
-import KeywordHighlightEditor from '@views/components/KeywordHighlightEditor/index.vue'
+import K8sClusterConfig from '@views/components/K8s/K8sClusterConfig.vue'
+import McpConfigEditor from '@views/components/Editors/McpConfigEditor.vue'
+import CommonConfigEditor from '@views/components/Editors/CommonConfigEditor.vue'
+import SecurityConfigEditor from '@views/components/Editors/SecurityConfigEditor.vue'
+import KeywordHighlightEditor from '@views/components/Editors/KeywordHighlightEditor.vue'
 import PluginDetail from '@views/components/Extensions/pluginDetail.vue'
+import AssetManagement from '@views/components/LeftTab/config/assetManagement.vue'
 import type { IDockviewPanelProps } from 'dockview-vue'
-import { isFocusInAiTab } from '@/utils/domUtils'
 
 interface TabItem {
   id: string
@@ -115,6 +135,10 @@ interface TabItem {
     filePath?: string
     initialContent?: string
     relPath?: string
+    startLine?: number
+    endLine?: number
+    jumpToken?: number | string
+    organizationUuid?: string
   }
   mode?: 'editor' | 'preview'
   closeCurrentPanel?: (panelId?: string) => void
@@ -154,6 +178,7 @@ const createNewTerm = () => {
 
 const termRefMap = ref<Record<string, any>>({})
 const sshConnectRefMap = ref<Record<string, any>>({})
+const k8sConnectRefMap = ref<Record<string, any>>({})
 
 const setSshConnectRef = (el: Element | ComponentPublicInstance | null, tabId: string) => {
   if (el && '$props' in el) {
@@ -163,6 +188,18 @@ const setSshConnectRef = (el: Element | ComponentPublicInstance | null, tabId: s
     }
   } else {
     delete sshConnectRefMap.value[tabId]
+  }
+}
+
+const setK8sConnectRef = (el: Element | ComponentPublicInstance | null, tabId: string) => {
+  if (el && '$props' in el) {
+    k8sConnectRefMap.value[tabId] = el as ComponentPublicInstance & {
+      getTerminalBufferContent: () => string | null
+      focus: () => void
+      handleResize: () => void
+    }
+  } else {
+    delete k8sConnectRefMap.value[tabId]
   }
 }
 
@@ -191,18 +228,28 @@ async function getTerminalOutputContent(tabId: string): Promise<string | null> {
     } catch (error: any) {
       return 'Error retrieving output from sshConnect component.'
     }
-  } else {
-    const termInstance = termRefMap.value[tabId]
-    if (termInstance && typeof termInstance.getTerminalBufferContent === 'function') {
-      try {
-        const output = await termInstance.getTerminalBufferContent()
-        return output
-      } catch (error: any) {
-        return 'Error retrieving output from Term component.'
-      }
-    }
-    return `Instance for tab ${tabId} not found or method missing.`
   }
+
+  const k8sConnectInstance = k8sConnectRefMap.value[tabId]
+  if (k8sConnectInstance && typeof k8sConnectInstance.getTerminalBufferContent === 'function') {
+    try {
+      const output = await k8sConnectInstance.getTerminalBufferContent()
+      return output
+    } catch (error: any) {
+      return 'Error retrieving output from K8sConnect component.'
+    }
+  }
+
+  const termInstance = termRefMap.value[tabId]
+  if (termInstance && typeof termInstance.getTerminalBufferContent === 'function') {
+    try {
+      const output = await termInstance.getTerminalBufferContent()
+      return output
+    } catch (error: any) {
+      return 'Error retrieving output from Term component.'
+    }
+  }
+  return `Instance for tab ${tabId} not found or method missing.`
 }
 
 const isActive = ref(!!props.params?.api?.isActive)
@@ -244,52 +291,6 @@ const hideContextMenu = () => {
   contextMenu.value.visible = false
 }
 
-const isFocusInTerminal = (event: KeyboardEvent): boolean => {
-  const target = event.target as HTMLElement
-  const activeElement = document.activeElement as HTMLElement
-  const terminalContainer = target.closest('.terminal-container') || activeElement?.closest('.terminal-container')
-  const xtermElement = target.closest('.xterm') || activeElement?.closest('.xterm')
-
-  return !!(terminalContainer || xtermElement)
-}
-
-const handleCloseTabKeyDown = (event: KeyboardEvent) => {
-  if (!isActive.value) {
-    return
-  }
-
-  const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0
-  const isCloseShortcut = (isMac && event.metaKey && event.key === 'w') || (!isMac && event.ctrlKey && event.shiftKey && event.key === 'W')
-
-  if (!isCloseShortcut) {
-    return
-  }
-
-  if (isFocusInAiTab(event)) {
-    return
-  }
-
-  if (isFocusInTerminal(event) && localTab.value?.organizationId !== '') {
-    return
-  }
-
-  const CLOSE_DEBOUNCE_TIME = 100
-  const currentTime = Date.now()
-  if (currentTime - ((window as any).lastCloseTime || 0) < CLOSE_DEBOUNCE_TIME) {
-    event.preventDefault()
-    event.stopPropagation()
-    return
-  }
-
-  ;(window as any).lastCloseTime = currentTime
-  event.preventDefault()
-  event.stopPropagation()
-
-  if (localTab.value?.closeCurrentPanel) {
-    localTab.value.closeCurrentPanel('panel_' + localTab.value.id)
-  }
-}
-
 watch(
   () => [isActive.value, localTab.value?.id],
   ([newIsActive, tabId]) => {
@@ -314,12 +315,6 @@ onMounted(() => {
   props.params?.api?.onDidActiveChange?.((event) => {
     isActive.value = event.isActive
   })
-
-  window.addEventListener('keydown', handleCloseTabKeyDown)
-})
-
-onUnmounted(() => {
-  window.removeEventListener('keydown', handleCloseTabKeyDown)
 })
 
 defineExpose({
@@ -347,16 +342,16 @@ defineExpose({
 
   &.transparent-bg {
     background-color: transparent !important;
-    border-bottom-color: rgba(255, 255, 255, 0.1);
+    border-bottom-color: var(--border-color);
 
     .tab-item {
-      background-color: rgba(0, 0, 0, 0.2);
-      color: rgba(255, 255, 255, 0.8);
-      border-right-color: rgba(255, 255, 255, 0.1);
+      background-color: var(--bg-color-secondary);
+      color: var(--text-color);
+      border-right-color: var(--border-color);
 
       &.active {
-        background-color: rgba(255, 255, 255, 0.15);
-        color: #fff;
+        background-color: var(--bg-color-tertiary);
+        color: var(--text-color);
         border-top-color: #007acc;
       }
 
@@ -365,10 +360,10 @@ defineExpose({
       }
 
       .close-btn {
-        color: rgba(255, 255, 255, 0.6);
+        color: var(--text-color-tertiary);
         &:hover {
-          color: #fff;
-          background-color: rgba(255, 255, 255, 0.2);
+          color: var(--text-color);
+          background-color: var(--hover-bg-color);
         }
       }
     }
@@ -441,30 +436,6 @@ defineExpose({
   &.transparent-bg {
     background-color: transparent !important;
   }
-}
-
-.context-menu {
-  position: fixed;
-  background-color: var(--bg-color);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 2px 0;
-  z-index: 1000;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-  min-width: 120px;
-  font-size: 12px;
-}
-
-.context-menu-item {
-  padding: 6px 12px;
-  cursor: pointer;
-  color: var(--text-color);
-  transition: background-color 0.2s ease;
-  user-select: none;
-}
-
-.context-menu-item:hover {
-  background-color: var(--hover-bg-color);
 }
 
 .tab-title-input {

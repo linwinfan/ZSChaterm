@@ -3,6 +3,8 @@ import * as os from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
 import EventEmitter from 'events'
+import { randomUUID } from 'crypto'
+const logger = createLogger('agent')
 
 export interface LocalTerminalInfo {
   id: number
@@ -185,7 +187,7 @@ export class LocalTerminalManager {
     // Use provided shell, or detect default shell
     const terminalShell = shell || this.getDefaultShell()
     const platform = os.platform()
-    const sessionId = `localhost_${Date.now()}_${Math.random().toString(36).substring(2, 14)}`
+    const sessionId = `localhost_${Date.now()}_${randomUUID().replace(/-/g, '').slice(0, 12)}`
 
     const terminal: LocalTerminalInfo = {
       id: this.nextTerminalId++,
@@ -280,9 +282,14 @@ export class LocalTerminalManager {
         shellArgs = ['-Command', finalCommand]
       }
     } else {
-      // Unix-like platforms
+      // Unix-like platforms: use login shell to load user configuration
       shellCommand = terminal.shell
-      shellArgs = ['-c', finalCommand]
+      const shellBase = path.basename(terminal.shell)
+      if (shellBase === 'zsh' || shellBase === 'bash' || shellBase === 'fish' || shellBase === 'sh') {
+        shellArgs = ['-l', '-c', finalCommand]
+      } else {
+        shellArgs = ['-c', finalCommand]
+      }
     }
 
     // Prepare environment variables
@@ -330,7 +337,7 @@ export class LocalTerminalManager {
 
     // Handle process error
     childProcess.on('error', (error: Error) => {
-      console.error(`[LocalTerminal ${terminal.id}] Command error:`, error)
+      logger.error(`[LocalTerminal ${terminal.id}] Command error`, { error: error })
       commandProcess.emit('error', error)
     })
 

@@ -1,4 +1,6 @@
 import Database from 'better-sqlite3'
+import type { TaskListItem } from '../../../agent/core/context/context-tracking/ContextTrackerTypes'
+const logger = createLogger('db')
 
 export async function deleteChatermHistoryByTaskIdLogic(db: Database.Database, taskId: string): Promise<void> {
   try {
@@ -7,7 +9,7 @@ export async function deleteChatermHistoryByTaskIdLogic(db: Database.Database, t
     db.prepare(`DELETE FROM agent_task_metadata_v1 WHERE task_id = ?`).run(taskId)
     db.prepare(`DELETE FROM agent_context_history_v1 WHERE task_id = ?`).run(taskId)
   } catch (error) {
-    console.error('Failed to delete API conversation history:', error)
+    logger.error('Failed to delete API conversation history', { error: error })
   }
 }
 
@@ -63,7 +65,7 @@ export async function getApiConversationHistoryLogic(db: Database.Database, task
 
     return messages
   } catch (error) {
-    console.error('Failed to get API conversation history:', error)
+    logger.error('Failed to get API conversation history', { error: error })
     return []
   }
 }
@@ -114,7 +116,7 @@ export async function saveApiConversationHistoryLogic(db: Database.Database, tas
       }
     })()
   } catch (error) {
-    console.error('Failed to save API conversation history:', error)
+    logger.error('Failed to save API conversation history', { error: error })
     throw error // Re-throw the error to be caught by the IPC handler
   }
 }
@@ -125,32 +127,57 @@ export async function getSavedChatermMessagesLogic(db: Database.Database, taskId
     const stmt = db.prepare(`
         SELECT ts, type, ask_type, say_type, text, content_parts, reasoning, images, partial,
                last_checkpoint_hash, is_checkpoint_checked_out, is_operation_outside_workspace,
-               conversation_history_index, conversation_history_deleted_range, mcp_tool_call_data
+               conversation_history_index, conversation_history_deleted_range, mcp_tool_call_data,
+               hosts
         FROM agent_ui_messages_v1
         WHERE task_id = ?
         ORDER BY ts ASC
       `)
     const rows = stmt.all(taskId)
 
-    return rows.map((row) => ({
-      ts: row.ts,
-      type: row.type,
-      ask: row.ask_type,
-      say: row.say_type,
-      text: row.text,
-      contentParts: row.content_parts ? JSON.parse(row.content_parts) : undefined,
-      reasoning: row.reasoning,
-      images: row.images ? JSON.parse(row.images) : undefined,
-      partial: row.partial === 1,
-      lastCheckpointHash: row.last_checkpoint_hash,
-      isCheckpointCheckedOut: row.is_checkpoint_checked_out === 1,
-      isOperationOutsideWorkspace: row.is_operation_outside_workspace === 1,
-      conversationHistoryIndex: row.conversation_history_index,
-      conversationHistoryDeletedRange: row.conversation_history_deleted_range ? JSON.parse(row.conversation_history_deleted_range) : undefined,
-      mcpToolCall: row.mcp_tool_call_data ? JSON.parse(row.mcp_tool_call_data) : undefined
-    }))
+    return rows.map((row) => {
+      // Parse hosts with backward compatibility
+      let hosts: any[] | undefined = undefined
+      if (row.hosts) {
+        try {
+          // Try parsing as JSON (new format: Host[])
+          const parsed = JSON.parse(row.hosts)
+          if (Array.isArray(parsed)) {
+            hosts = parsed
+          }
+        } catch (e) {
+          // Fallback for old format: comma-separated string
+          const hostStrings = row.hosts.split(',').filter(Boolean)
+          // Convert string[] to Host[] format with minimal info
+          hosts = hostStrings.map((ip: string) => ({
+            host: ip.trim(),
+            uuid: ip.trim(),
+            connection: 'personal'
+          }))
+        }
+      }
+
+      return {
+        ts: row.ts,
+        type: row.type,
+        ask: row.ask_type,
+        say: row.say_type,
+        text: row.text,
+        contentParts: row.content_parts ? JSON.parse(row.content_parts) : undefined,
+        reasoning: row.reasoning,
+        images: row.images ? JSON.parse(row.images) : undefined,
+        partial: row.partial === 1,
+        lastCheckpointHash: row.last_checkpoint_hash,
+        isCheckpointCheckedOut: row.is_checkpoint_checked_out === 1,
+        isOperationOutsideWorkspace: row.is_operation_outside_workspace === 1,
+        conversationHistoryIndex: row.conversation_history_index,
+        conversationHistoryDeletedRange: row.conversation_history_deleted_range ? JSON.parse(row.conversation_history_deleted_range) : undefined,
+        mcpToolCall: row.mcp_tool_call_data ? JSON.parse(row.mcp_tool_call_data) : undefined,
+        hosts
+      }
+    })
   } catch (error) {
-    console.error('Failed to get Cline messages:', error)
+    logger.error('Failed to get Cline messages', { error: error })
     return []
   }
 }
@@ -167,11 +194,15 @@ export async function saveChatermMessagesLogic(db: Database.Database, taskId: st
           INSERT INTO agent_ui_messages_v1
           (task_id, ts, type, ask_type, say_type, text, content_parts, reasoning, images, partial,
            last_checkpoint_hash, is_checkpoint_checked_out, is_operation_outside_workspace,
-           conversation_history_index, conversation_history_deleted_range, mcp_tool_call_data)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           conversation_history_index, conversation_history_deleted_range, mcp_tool_call_data,
+           hosts)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
 
       for (const message of uiMessages) {
+        // Serialize hosts array to JSON string to store complete Host objects
+        const hostsStr = message.hosts && message.hosts.length > 0 ? JSON.stringify(message.hosts) : null
+
         insertStmt.run(
           taskId,
           message.ts,
@@ -188,12 +219,14 @@ export async function saveChatermMessagesLogic(db: Database.Database, taskId: st
           message.isOperationOutsideWorkspace ? 1 : 0,
           message.conversationHistoryIndex || null,
           message.conversationHistoryDeletedRange ? JSON.stringify(message.conversationHistoryDeletedRange) : null,
-          message.mcpToolCall ? JSON.stringify(message.mcpToolCall) : null
+          message.mcpToolCall ? JSON.stringify(message.mcpToolCall) : null,
+          hostsStr
         )
       }
     })()
   } catch (error) {
-    console.error('Failed to save Cline messages:', error)
+    logger.error('Failed to save Cline messages', { error: error })
+    throw error
   }
 }
 
@@ -201,7 +234,7 @@ export async function saveChatermMessagesLogic(db: Database.Database, taskId: st
 export async function getTaskMetadataLogic(db: Database.Database, taskId: string): Promise<any> {
   try {
     const stmt = db.prepare(`
-        SELECT files_in_context, model_usage, hosts, todos
+        SELECT files_in_context, model_usage, hosts, todos, experience_ledger, title, favorite
         FROM agent_task_metadata_v1
         WHERE task_id = ?
       `)
@@ -212,28 +245,33 @@ export async function getTaskMetadataLogic(db: Database.Database, taskId: string
         files_in_context: JSON.parse(row.files_in_context || '[]'),
         model_usage: JSON.parse(row.model_usage || '[]'),
         hosts: JSON.parse(row.hosts || '[]'),
-        todos: row.todos ? JSON.parse(row.todos) : []
+        todos: row.todos ? JSON.parse(row.todos) : [],
+        experience_ledger: row.experience_ledger ? JSON.parse(row.experience_ledger) : [],
+        title: row.title || undefined,
+        favorite: row.favorite === 1
       }
     }
 
-    return { files_in_context: [], model_usage: [], hosts: [], todos: [] }
+    return { files_in_context: [], model_usage: [], hosts: [], todos: [], experience_ledger: [], title: undefined, favorite: false }
   } catch (error) {
-    console.error('Failed to get task metadata:', error)
-    return { files_in_context: [], model_usage: [], hosts: [], todos: [] }
+    logger.error('Failed to get task metadata', { error: error })
+    return { files_in_context: [], model_usage: [], hosts: [], todos: [], experience_ledger: [], title: undefined, favorite: false }
   }
 }
 
 export async function saveTaskMetadataLogic(db: Database.Database, taskId: string, metadata: any): Promise<void> {
   try {
     const upsertStmt = db.prepare(`
-        INSERT INTO agent_task_metadata_v1 (task_id, files_in_context, model_usage, hosts, todos, updated_at)
-        VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+        INSERT INTO agent_task_metadata_v1 (task_id, files_in_context, model_usage, hosts, todos, experience_ledger, title, favorite)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(task_id) DO UPDATE SET
           files_in_context = excluded.files_in_context,
           model_usage = excluded.model_usage,
           hosts = excluded.hosts,
           todos = excluded.todos,
-          updated_at = strftime('%s', 'now')
+          experience_ledger = excluded.experience_ledger,
+          title = CASE WHEN excluded.title IS NOT NULL THEN excluded.title ELSE agent_task_metadata_v1.title END,
+          favorite = CASE WHEN excluded.favorite IS NOT NULL THEN excluded.favorite ELSE agent_task_metadata_v1.favorite END
       `)
 
     upsertStmt.run(
@@ -241,10 +279,147 @@ export async function saveTaskMetadataLogic(db: Database.Database, taskId: strin
       JSON.stringify(metadata.files_in_context || []),
       JSON.stringify(metadata.model_usage || []),
       JSON.stringify(metadata.hosts || []),
-      JSON.stringify(metadata.todos || [])
+      JSON.stringify(metadata.todos || []),
+      JSON.stringify(metadata.experience_ledger || []),
+      metadata.title !== undefined ? metadata.title : null,
+      metadata.favorite !== undefined ? (metadata.favorite ? 1 : 0) : null
     )
   } catch (error) {
-    console.error('Failed to save task metadata:', error)
+    logger.error('Failed to save task metadata', { error: error })
+  }
+}
+
+export async function saveTaskTitleLogic(db: Database.Database, taskId: string, title: string): Promise<void> {
+  try {
+    const nowSec = Math.floor(Date.now() / 1000)
+    const result = db
+      .prepare(
+        `
+      UPDATE agent_task_metadata_v1
+      SET title = ?, updated_at = ?
+      WHERE task_id = ?
+    `
+      )
+      .run(title, nowSec, taskId)
+
+    if (result.changes === 0) {
+      logger.warn('saveTaskTitle skipped: metadata row not found', { taskId })
+    }
+  } catch (error) {
+    logger.error('Failed to save task title', { error })
+  }
+}
+
+// Favorite toggle should not change conversation ordering timestamp.
+export async function saveTaskFavoriteLogic(db: Database.Database, taskId: string, favorite: boolean): Promise<void> {
+  try {
+    const result = db
+      .prepare(
+        `
+      UPDATE agent_task_metadata_v1
+      SET favorite = ?
+      WHERE task_id = ?
+    `
+      )
+      .run(favorite ? 1 : 0, taskId)
+
+    if (result.changes === 0) {
+      logger.warn('saveTaskFavorite skipped: metadata row not found', { taskId })
+    }
+  } catch (error) {
+    logger.error('Failed to save task favorite', { error })
+  }
+}
+
+// Task list query - replaces global_taskHistory as data source
+export async function getTaskListLogic(db: Database.Database): Promise<TaskListItem[]> {
+  try {
+    const rows = db
+      .prepare(
+        `
+      SELECT task_id, title, favorite, created_at, updated_at, hosts
+      FROM agent_task_metadata_v1
+      ORDER BY updated_at DESC
+    `
+      )
+      .all() as Array<{
+      task_id: string
+      title: string | null
+      favorite: number
+      created_at: number
+      updated_at: number
+      hosts: string | null
+    }>
+
+    return rows.map((row) => {
+      let hosts: Array<{ host: string; uuid: string; connection: string }> = []
+      if (row.hosts) {
+        try {
+          const parsed = JSON.parse(row.hosts)
+          if (Array.isArray(parsed)) {
+            hosts = parsed
+          }
+        } catch {
+          // Backward compatibility: comma-separated IP strings
+          const hostStrings = row.hosts.split(',').filter(Boolean)
+          hosts = hostStrings.map((ip: string) => ({
+            host: ip.trim(),
+            uuid: '',
+            connection: ''
+          }))
+        }
+      }
+      return {
+        id: row.task_id,
+        title: row.title || null,
+        favorite: row.favorite === 1,
+        // DB stores seconds; renderer Date() expects milliseconds
+        createdAt: row.created_at * 1000,
+        updatedAt: row.updated_at * 1000,
+        hosts
+      }
+    })
+  } catch (error) {
+    logger.error('Failed to get task list', { error })
+    return []
+  }
+}
+
+// Ensure metadata row exists on task creation with initial title.
+// Uses UPSERT instead of INSERT OR IGNORE: if touchTaskUpdatedAt races ahead
+// and creates a title-less row, this will still fill in the initial title.
+export async function ensureTaskMetadataExistsLogic(db: Database.Database, taskId: string, initialTitle?: string): Promise<void> {
+  try {
+    db.prepare(
+      `
+      INSERT INTO agent_task_metadata_v1 (task_id, title, updated_at)
+      VALUES (?, ?, strftime('%s', 'now'))
+      ON CONFLICT(task_id) DO UPDATE SET
+        title = CASE
+          WHEN agent_task_metadata_v1.title IS NULL OR agent_task_metadata_v1.title = ''
+          THEN excluded.title
+          ELSE agent_task_metadata_v1.title
+        END
+    `
+    ).run(taskId, initialTitle || null)
+  } catch (error) {
+    logger.error('Failed to ensure task metadata exists', { error })
+  }
+}
+
+// Keep conversation ordering fresh by bumping metadata.updated_at on message save.
+export async function touchTaskUpdatedAtLogic(db: Database.Database, taskId: string): Promise<void> {
+  try {
+    db.prepare(
+      `
+      INSERT INTO agent_task_metadata_v1 (task_id, updated_at)
+      VALUES (?, strftime('%s', 'now'))
+      ON CONFLICT(task_id) DO UPDATE SET
+        updated_at = strftime('%s', 'now')
+    `
+    ).run(taskId)
+  } catch (error) {
+    logger.error('Failed to touch task updated_at', { error })
   }
 }
 
@@ -264,20 +439,24 @@ export async function getContextHistoryLogic(db: Database.Database, taskId: stri
 
     return null
   } catch (error) {
-    console.error('Failed to get context history:', error)
+    logger.error('Failed to get context history', { error: error })
     return null
   }
 }
 
 export async function saveContextHistoryLogic(db: Database.Database, taskId: string, contextHistory: any): Promise<void> {
-  console.log('[saveContextHistory] Attempting to save. Task ID:', taskId, 'Type:', typeof taskId)
+  logger.info('[saveContextHistory] Attempting to save', { taskId, type: typeof taskId })
   let jsonDataString: string | undefined
   try {
     jsonDataString = JSON.stringify(contextHistory)
-    console.log('[saveContextHistory] JSON.stringify successful. Data:', jsonDataString, 'Type:', typeof jsonDataString)
+    logger.info('[saveContextHistory] JSON.stringify successful', { dataLength: jsonDataString?.length, type: typeof jsonDataString })
   } catch (stringifyError) {
-    console.error('[saveContextHistory] Error during JSON.stringify:', stringifyError)
-    console.error('[saveContextHistory] Original contextHistory object that caused error:', contextHistory)
+    logger.error('[saveContextHistory] Error during JSON.stringify', {
+      error: stringifyError
+    })
+    logger.error('[saveContextHistory] Original contextHistory object that caused error', {
+      error: contextHistory
+    })
     if (stringifyError instanceof Error) {
       throw new Error(`Failed to stringify contextHistory: ${stringifyError.message}`)
     } else {
@@ -286,7 +465,7 @@ export async function saveContextHistoryLogic(db: Database.Database, taskId: str
   }
 
   if (typeof jsonDataString !== 'string') {
-    console.error('[saveContextHistory] jsonDataString is not a string after stringify. Value:', jsonDataString)
+    logger.error('[saveContextHistory] jsonDataString is not a string after stringify', { value: String(jsonDataString) })
     throw new Error('jsonDataString is not a string after JSON.stringify')
   }
 
@@ -299,12 +478,15 @@ export async function saveContextHistoryLogic(db: Database.Database, taskId: str
           updated_at = strftime('%s', 'now')
       `)
 
-    console.log('[saveContextHistory] Executing upsert. Task ID:', taskId, 'Data:', jsonDataString)
+    logger.info('[saveContextHistory] Executing upsert', { taskId })
     upsertStmt.run(taskId, jsonDataString)
-    console.log('[saveContextHistory] Upsert successful for Task ID:', taskId)
+    logger.info('[saveContextHistory] Upsert successful for Task ID', { value: taskId })
   } catch (error) {
-    console.error('[saveContextHistory] Failed to save context history to DB. Task ID:', taskId, 'Error:', error)
-    console.error('[saveContextHistory] Data that caused error:', jsonDataString)
+    logger.error('[saveContextHistory] Failed to save context history to DB', {
+      taskId,
+      error: error
+    })
+    logger.error('[saveContextHistory] Data that caused error', { dataLength: jsonDataString?.length })
     throw error
   }
 }

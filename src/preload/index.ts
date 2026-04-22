@@ -30,7 +30,6 @@ const envPath = path.resolve(__dirname, '../../../build/.env')
 
 // Ensure path exists
 if (!fs.existsSync(envPath)) {
-  console.warn(`Environment file does not exist: ${envPath}`)
   // Can try other paths or set default values
 }
 
@@ -95,16 +94,17 @@ if (fs.existsSync(envSpecificPath)) {
         process.env[key] = value
       }
     })
-  } catch (error) {
-    console.warn('Failed to read environment file:', error)
+  } catch {
+    // Ignore env parse errors in preload bootstrap path
   }
 } else {
-  console.log(`Environment file not found: ${envSpecificPath}, using default values`)
+  // Environment file not found, proceed with defaults
 }
 
 // Custom APIs for renderer
 import os from 'os'
 import { ExecResult } from '../main/ssh/sshHandle'
+import { SftpConnectResult } from '../main/ssh/sftpTransfer'
 
 const getLocalIP = (): string => {
   const interfaces = os.networkInterfaces()
@@ -188,6 +188,15 @@ const insertCommand = async (data: { command: string; ip: string }) => {
   }
 }
 
+const aiSuggestCommand = async (data: { command: string; osInfo?: string }): Promise<{ command: string; explanation: string } | null> => {
+  try {
+    const result = await ipcRenderer.invoke('ai-suggest-command', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
 // Chaterm database related IPC handlers
 const getLocalAssetRoute = async (data: { searchType: string; params?: unknown[] }) => {
   try {
@@ -195,6 +204,22 @@ const getLocalAssetRoute = async (data: { searchType: string; params?: unknown[]
     return result
   } catch (error) {
     return Promise.reject(error)
+  }
+}
+
+const recordConnection = async (data: {
+  assetUuid: string
+  assetIp: string
+  assetLabel?: string
+  assetPort?: number
+  assetUsername?: string
+  assetType: string
+  organizationId?: string
+}) => {
+  try {
+    await ipcRenderer.invoke('record-connection', data)
+  } catch {
+    // Non-critical: silently ignore recording failures
   }
 }
 
@@ -362,6 +387,30 @@ const getTaskMetadata = async (taskId) => {
   }
 }
 
+const saveTaskTitle = async (taskId: string, title: string) => {
+  try {
+    return await ipcRenderer.invoke('set-task-title', { taskId, title })
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const saveTaskFavorite = async (taskId: string, favorite: boolean) => {
+  try {
+    return await ipcRenderer.invoke('set-task-favorite', { taskId, favorite })
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const getTaskList = async () => {
+  try {
+    return await ipcRenderer.invoke('get-task-list')
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
 const getUserHosts = async (search: string, limit?: number) => {
   try {
     const result = await ipcRenderer.invoke('get-user-hosts', { search, limit })
@@ -447,6 +496,52 @@ const updateOrganizationAssetFavorite = async (data: { organizationUuid: string;
 const updateOrganizationAssetComment = async (data: { organizationUuid: string; host: string; comment: string }) => {
   try {
     const result = await ipcRenderer.invoke('organization-asset-comment', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+// Organization asset management API
+const getOrganizationAssets = async (data: { organizationUuid: string; search?: string; page?: number; pageSize?: number }) => {
+  try {
+    const result = await ipcRenderer.invoke('get-organization-assets', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const createOrganizationAsset = async (data: { organizationUuid: string; hostname: string; host: string; comment?: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('create-organization-asset', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const updateOrganizationAsset = async (data: { uuid: string; hostname?: string; host?: string; comment?: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('update-organization-asset', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const deleteOrganizationAsset = async (data: { uuid: string }) => {
+  try {
+    const result = await ipcRenderer.invoke('delete-organization-asset', data)
+    return result
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+const batchDeleteOrganizationAssets = async (data: { uuids: string[] }) => {
+  try {
+    const result = await ipcRenderer.invoke('batch-delete-organization-assets', data)
     return result
   } catch (error) {
     return Promise.reject(error)
@@ -539,7 +634,9 @@ const api = {
   getPlatform,
   queryCommand,
   insertCommand,
+  aiSuggestCommand,
   getLocalAssetRoute,
+  recordConnection,
   updateLocalAssetLabel,
   updateLocalAsseFavorite,
   getKeyChainSelect,
@@ -558,6 +655,9 @@ const api = {
   connectAssetInfo,
   chatermGetChatermMessages,
   getTaskMetadata,
+  saveTaskTitle,
+  saveTaskFavorite,
+  getTaskList,
   getUserHosts,
   initUserDatabase,
   getAppLockStatus,
@@ -568,6 +668,11 @@ const api = {
   refreshOrganizationAssets,
   updateOrganizationAssetFavorite,
   updateOrganizationAssetComment,
+  getOrganizationAssets,
+  createOrganizationAsset,
+  updateOrganizationAsset,
+  deleteOrganizationAsset,
+  batchDeleteOrganizationAssets,
   createCustomFolder,
   getCustomFolders,
   updateCustomFolder,
@@ -577,6 +682,11 @@ const api = {
   getAssetsInFolder,
   getPathForFile: (file: File) => webUtils.getPathForFile(file), // Get the real path from File instead of using file.path
   setDataSyncEnabled: (enabled: boolean) => ipcRenderer.invoke('data-sync:set-enabled', enabled),
+  // Chat Sync V2
+  chatSyncSetEnabled: (enabled: boolean) => ipcRenderer.invoke('chat-sync:set-enabled', enabled),
+  chatSyncGetStatus: () => ipcRenderer.invoke('chat-sync:get-status'),
+  chatSyncSyncNow: () => ipcRenderer.invoke('chat-sync:sync-now'),
+  chatSyncSetAiTabVisible: (visible: boolean) => ipcRenderer.invoke('chat-sync:set-ai-tab-visible', visible),
   maximizeWindow: () => ipcRenderer.invoke('window:maximize'),
   unmaximizeWindow: () => ipcRenderer.invoke('window:unmaximize'),
   isMaximized: () => ipcRenderer.invoke('window:is-maximized'),
@@ -618,6 +728,12 @@ const api = {
   getProtocolPrefix: (): Promise<string> => {
     return ipcRenderer.invoke('get-protocol-prefix')
   },
+  onXshellWakeup: (callback: (payload: any) => void) => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('external-xshell-wakeup', listener)
+    return () => ipcRenderer.removeListener('external-xshell-wakeup', listener)
+  },
+  consumePendingXshellWakeups: () => ipcRenderer.invoke('xshell-wakeup:consume-pending'),
 
   // keyboard-interactive authentication
   onKeyboardInteractiveTimeout: (callback) => {
@@ -716,6 +832,9 @@ const api = {
   deleteSkill: (skillId: string) => ipcRenderer.invoke('skills:delete', skillId),
   openSkillsFolder: () => ipcRenderer.invoke('skills:open-folder'),
   importSkillZip: (zipPath: string, overwrite?: boolean) => ipcRenderer.invoke('skills:import-zip', zipPath, overwrite),
+  readSkillContent: (skillName: string) => ipcRenderer.invoke('skills:read-content', skillName),
+  updateSkill: (skillName: string, metadata: any, content: string) => ipcRenderer.invoke('skills:update', skillName, metadata, content),
+  exportSkillZip: (skillName: string) => ipcRenderer.invoke('skills:export-zip', skillName),
   onSkillsUpdate: (callback: (skills: any[]) => void) => {
     const listener = (_event, data) => callback(data.skills)
     ipcRenderer.on('skillsUpdate', listener)
@@ -724,10 +843,21 @@ const api = {
 
   // Local host API
   getLocalWorkingDirectory: () => ipcRenderer.invoke('local:get-working-directory'),
-  executeLocalCommand: (command: string) => ipcRenderer.invoke('local:execute-command', command),
+  // executeLocalCommand removed: dangerous RCE vector via XSS.
+  // Local command execution is only used by the Agent system in the main process
+  // and should never be exposed to the renderer process via contextBridge.
 
   // SSH API
   connect: (connectionInfo) => ipcRenderer.invoke('ssh:connect', connectionInfo),
+  forkSession: (params) => ipcRenderer.invoke('ssh:fork-session', params),
+  startSshTunnel: (params: {
+    connectionId: string
+    tunnelId: string
+    type: 'local_forward' | 'remote_forward' | 'dynamic_socks'
+    localPort: number
+    remotePort?: number
+  }) => ipcRenderer.invoke('ssh:tunnel:start', params),
+  stopSshTunnel: (params: { tunnelId: string }) => ipcRenderer.invoke('ssh:tunnel:stop', params),
   connectReadyData: (id) => {
     return new Promise((resolve) => {
       const channel = `ssh:connect:data:${id}`
@@ -748,7 +878,6 @@ const api = {
         if (!resolved) {
           resolved = true
           ipcRenderer.removeListener(channel, handler)
-          console.warn(`[Preload] Command list reception timeout (${id})`)
           resolve({ hasSudo: false, commandList: [] })
         }
       }, COMMAND_LIST_TIMEOUT)
@@ -757,10 +886,16 @@ const api = {
   checkSftpConnAvailable: (id: string) => ipcRenderer.invoke('ssh:sftp:conn:check', { id }),
   shell: (params) => ipcRenderer.invoke('ssh:shell', params),
   resizeShell: (id, cols, rows) => ipcRenderer.invoke('ssh:shell:resize', { id, cols, rows }),
-  sshSftpList: (opts: { id: string; remotePath: string }) => ipcRenderer.invoke('ssh:sftp:list', opts) as Promise<FileRecord[] | string[]>,
+  sshSftpList: (opts: { id: string; path: string }) => ipcRenderer.invoke('ssh:sftp:list', opts) as Promise<FileRecord[] | string[]>,
   sftpConnList: () => ipcRenderer.invoke('ssh:sftp:conn:list') as Promise<SftpConnectionInfo[]>,
+  sftpConnect: (connectionInfo) => ipcRenderer.invoke('ssh:sftp:connect', connectionInfo) as Promise<SftpConnectResult>,
+  sftpClose: (payload: { id: string }) => ipcRenderer.invoke('ssh:sftp:close', payload),
+  sftpCancel: (payload: { id: string; requestId: string }) => ipcRenderer.invoke('ssh:sftp:cancel', payload),
   sshConnExec: (args: { id: string; cmd: string }) => ipcRenderer.invoke('ssh:conn:exec', args) as Promise<ExecResult>,
   writeToShell: (params) => ipcRenderer.send('ssh:shell:write', params),
+
+  setShellPid: (id: string) => ipcRenderer.invoke('ssh:shell-pid-set', { id }),
+  getCwd: (payload: { id: string }) => ipcRenderer.invoke('ssh:cwd:get', payload) as Promise<any>,
   disconnect: (params) => ipcRenderer.invoke('ssh:disconnect', params),
   selectPrivateKey: () => ipcRenderer.invoke('ssh:select-private-key'),
   getAppPath: (name) => ipcRenderer.invoke('app:get-path', { name }),
@@ -775,7 +910,7 @@ const api = {
     return () => ipcRenderer.removeListener(`ssh:shell:stderr:${id}`, listener)
   },
   onShellClose: (id, callback) => {
-    const listener = () => callback()
+    const listener = (_event, data) => callback(data)
     ipcRenderer.on(`ssh:shell:close:${id}`, listener)
     return () => ipcRenderer.removeListener(`ssh:shell:close:${id}`, listener)
   },
@@ -831,12 +966,9 @@ const api = {
   // New method to call executeRemoteCommand in the main process
   executeRemoteCommandViaPreload: async () => {
     try {
-      console.log('Calling execute-remote-command via preload') // Add log
       const result = await ipcRenderer.invoke('execute-remote-command')
-      console.log('Result from main process:', result) // Add log
       return result
     } catch (error) {
-      console.error('Error invoking execute-remote-command from preload:', error) // Add log
       // Ensure error is a serializable object
       if (error instanceof Error) {
         return {
@@ -871,6 +1003,9 @@ const api = {
   checkUpdate: () => ipcRenderer.invoke('update:checkUpdate'),
   download: () => ipcRenderer.invoke('update:download'),
   showOpenDialog: (options) => ipcRenderer.invoke('dialog:openFile', options),
+  stageChatAttachment: (payload: { taskId: string; srcAbsPath: string }) =>
+    ipcRenderer.invoke('agent:stage-chat-attachment', payload) as Promise<{ mode: 'as_is'; refPath: string } | { mode: 'offload'; refPath: string }>,
+  getHomePath: () => ipcRenderer.invoke('app:getHomePath'),
   autoUpdate: (update) => {
     ipcRenderer.on('update:autoUpdate', (_event, params) => update(params))
   },
@@ -927,6 +1062,9 @@ const api = {
     concurrency?: number
   }) => ipcRenderer.invoke('sftp:r2r:dir', args),
 
+  copyOrMoveBySftp: (args: { id: string; srcPath: string; targetPath: string; action: 'copy' | 'move' }) =>
+    ipcRenderer.invoke('ssh:sftp:copy-or-move', args),
+
   kbCheckPath: (absPath: string) => ipcRenderer.invoke('kb:check-path', { absPath }),
   kbEnsureRoot: () => ipcRenderer.invoke('kb:ensure-root'),
   kbGetRoot: () => ipcRenderer.invoke('kb:get-root'),
@@ -943,11 +1081,16 @@ const api = {
   kbCopy: (srcRelPath: string, dstRelDir: string) => ipcRenderer.invoke('kb:copy', { srcRelPath, dstRelDir }),
   kbImportFile: (srcAbsPath: string, dstRelDir: string) => ipcRenderer.invoke('kb:import-file', { srcAbsPath, dstRelDir }),
   kbImportFolder: (srcAbsPath: string, dstRelDir: string) => ipcRenderer.invoke('kb:import-folder', { srcAbsPath, dstRelDir }),
+  kbSetSearchEnabled: (enabled: boolean) => ipcRenderer.invoke('kb:set-search-enabled', enabled),
   onKbTransferProgress: (callback: (data: { jobId: string; transferred: number; total: number; destRelPath: string }) => void) => {
     const listener = (_event: unknown, data: { jobId: string; transferred: number; total: number; destRelPath: string }) => callback(data)
     ipcRenderer.on('kb:transfer-progress', listener)
     return () => ipcRenderer.removeListener('kb:transfer-progress', listener)
   },
+  kbSyncGetStatus: () => ipcRenderer.invoke('kb:sync-get-status'),
+  kbSyncLastTime: () => ipcRenderer.invoke('kb:sync-last-time'),
+  kbSyncLastResults: () => ipcRenderer.invoke('kb:sync-last-results'),
+  getKbCloudStorage: () => ipcRenderer.invoke('kb:get-cloud-storage'),
 
   agentEnableAndConfigure: (opts: { enabled: boolean }) => ipcRenderer.invoke('ssh:agent:enable-and-configure', opts),
   addKey: (opts: { keyData: string; passphrase?: string; comment?: string }) => ipcRenderer.invoke('ssh:agent:add-key', opts),
@@ -1008,6 +1151,30 @@ const api = {
   aliasesMutate: (params: { action: string; data?: any; alias?: string }) => ipcRenderer.invoke('db:aliases:mutate', params),
   kvGet: (params: { key?: string }) => ipcRenderer.invoke('db:kv:get', params),
   kvMutate: (params: { action: string; key: string; value?: string }) => ipcRenderer.invoke('db:kv:mutate', params),
+  async kvTransaction(
+    callback: (tx: { get(key: string): Promise<string | null>; set(key: string, value: string): void; delete(key: string): void }) => Promise<void>
+  ): Promise<void> {
+    const ops: Array<{ action: 'set'; key: string; value: string } | { action: 'delete'; key: string }> = []
+    const tx = {
+      async get(key: string): Promise<string | null> {
+        const row = await ipcRenderer.invoke('db:kv:get', { key })
+        if (row && row.value) {
+          return row.value
+        }
+        return null
+      },
+      set(key: string, value: string): void {
+        ops.push({ action: 'set', key, value })
+      },
+      delete(key: string): void {
+        ops.push({ action: 'delete', key })
+      }
+    }
+    await callback(tx)
+    if (ops.length > 0) {
+      await ipcRenderer.invoke('db:kv:transaction', ops)
+    }
+  },
   saveCustomBackground: (sourcePath: string) => ipcRenderer.invoke('saveCustomBackground', sourcePath),
 
   // Plugin
@@ -1130,6 +1297,19 @@ const api = {
   k8sValidateContext: (contextName: string) => ipcRenderer.invoke('k8s:validate-context', contextName),
   k8sInitialize: () => ipcRenderer.invoke('k8s:initialize'),
 
+  // K8s Proxy Configuration APIs
+  k8sSetProxy: (
+    proxyConfig: {
+      type?: 'HTTP' | 'HTTPS' | 'SOCKS4' | 'SOCKS5'
+      host: string
+      port: number
+      enableProxyIdentity?: boolean
+      username?: string
+      password?: string
+    } | null
+  ) => ipcRenderer.invoke('k8s:set-proxy', proxyConfig),
+  k8sGetProxy: () => ipcRenderer.invoke('k8s:get-proxy'),
+
   // K8s watch stream APIs
   k8sStartWatch: (contextName: string, resourceType: string, options?: any) =>
     ipcRenderer.invoke('k8s:start-watch', contextName, resourceType, options),
@@ -1139,6 +1319,102 @@ const api = {
     ipcRenderer.on('k8s:delta-batch', listener)
     return () => ipcRenderer.removeListener('k8s:delta-batch', listener)
   },
+
+  // K8s Cluster Management APIs
+  k8sClusterList: () => ipcRenderer.invoke('k8s:cluster:list'),
+  k8sClusterGet: (id: string) => ipcRenderer.invoke('k8s:cluster:get', id),
+  k8sClusterAdd: (params: {
+    name: string
+    kubeconfigPath?: string
+    kubeconfigContent?: string
+    contextName: string
+    serverUrl: string
+    authType?: string
+    autoConnect?: boolean
+    defaultNamespace?: string
+  }) => ipcRenderer.invoke('k8s:cluster:add', params),
+  k8sClusterUpdate: (
+    id: string,
+    params: {
+      name?: string
+      kubeconfigPath?: string
+      kubeconfigContent?: string
+      contextName?: string
+      serverUrl?: string
+      authType?: string
+      isActive?: boolean
+      connectionStatus?: string
+      autoConnect?: boolean
+      defaultNamespace?: string
+    }
+  ) => ipcRenderer.invoke('k8s:cluster:update', id, params),
+  k8sClusterRemove: (id: string) => ipcRenderer.invoke('k8s:cluster:remove', id),
+  k8sClusterTest: (params: { kubeconfigPath?: string; kubeconfigContent?: string; contextName: string }) =>
+    ipcRenderer.invoke('k8s:cluster:test', params),
+  k8sClusterImportKubeconfig: (kubeconfigPath: string) => ipcRenderer.invoke('k8s:cluster:import-kubeconfig', kubeconfigPath),
+  k8sClusterConnect: (id: string) => ipcRenderer.invoke('k8s:cluster:connect', id),
+  k8sClusterDisconnect: (id: string) => ipcRenderer.invoke('k8s:cluster:disconnect', id),
+
+  // K8s Terminal APIs
+  k8sTerminalCreate: (config: { id: string; clusterId: string; namespace?: string; cols?: number; rows?: number }) =>
+    ipcRenderer.invoke('k8s:terminal:create', config),
+  k8sTerminalWrite: (terminalId: string, data: string) => ipcRenderer.invoke('k8s:terminal:write', terminalId, data),
+  k8sTerminalResize: (terminalId: string, cols: number, rows: number) => ipcRenderer.invoke('k8s:terminal:resize', terminalId, cols, rows),
+  k8sTerminalClose: (terminalId: string) => ipcRenderer.invoke('k8s:terminal:close', terminalId),
+  k8sTerminalList: (clusterId: string) => ipcRenderer.invoke('k8s:terminal:list', clusterId),
+  k8sOnTerminalData: (terminalId: string, callback: (data: string) => void) => {
+    const channel = `k8s:terminal:data:${terminalId}`
+    const listener = (_event: any, data: string) => callback(data)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+  k8sOnTerminalExit: (terminalId: string, callback: (exitCode: any) => void) => {
+    const channel = `k8s:terminal:exit:${terminalId}`
+    const listener = (_event: any, exitCode: any) => callback(exitCode)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+
+  // ============================================================================
+  // K8S Agent API
+  // ============================================================================
+
+  k8sAgentSetCluster: (params: { clusterId: string; contextName: string; kubeconfigPath?: string; kubeconfigContent?: string }) =>
+    ipcRenderer.invoke('k8s:agent:set-cluster', params),
+
+  k8sAgentSetProxy: (
+    proxyConfig: {
+      type?: 'HTTP' | 'HTTPS' | 'SOCKS4' | 'SOCKS5'
+      host: string
+      port: number
+      enableProxyIdentity?: boolean
+      username?: string
+      password?: string
+    } | null
+  ) => ipcRenderer.invoke('k8s:agent:set-proxy', proxyConfig),
+
+  k8sAgentKubectl: (command: string, timeout?: number) => ipcRenderer.invoke('k8s:agent:kubectl', command, timeout),
+
+  k8sAgentGetPods: (namespace?: string) => ipcRenderer.invoke('k8s:agent:get-pods', namespace),
+
+  k8sAgentGetNodes: () => ipcRenderer.invoke('k8s:agent:get-nodes'),
+
+  k8sAgentGetNamespaces: () => ipcRenderer.invoke('k8s:agent:get-namespaces'),
+
+  k8sAgentGetServices: (namespace?: string) => ipcRenderer.invoke('k8s:agent:get-services', namespace),
+
+  k8sAgentGetDeployments: (namespace?: string) => ipcRenderer.invoke('k8s:agent:get-deployments', namespace),
+
+  k8sAgentGetPodLogs: (params: { podName: string; namespace?: string; container?: string; tailLines?: number }) =>
+    ipcRenderer.invoke('k8s:agent:get-pod-logs', params),
+
+  k8sAgentDescribe: (params: { resourceType: string; resourceName: string; namespace?: string }) => ipcRenderer.invoke('k8s:agent:describe', params),
+
+  k8sAgentTestConnection: () => ipcRenderer.invoke('k8s:agent:test-connection'),
+
+  k8sAgentGetCurrentCluster: () => ipcRenderer.invoke('k8s:agent:get-current-cluster'),
+
+  k8sAgentCleanup: () => ipcRenderer.invoke('k8s:agent:cleanup'),
 
   // ============================================================================
   // Interactive Command Execution API
@@ -1212,7 +1488,27 @@ const api = {
   /**
    * Resume interaction detection for a suppressed command
    */
-  unsuppressInteraction: (commandId: string) => ipcRenderer.invoke('unsuppress-interaction', commandId)
+  unsuppressInteraction: (commandId: string) => ipcRenderer.invoke('unsuppress-interaction', commandId),
+
+  // Performance marks
+  reportPerfMarks: (marks: Array<{ name: string; startTime: number; timestamp: number }>) => ipcRenderer.invoke('perf:report-marks', marks),
+  getPerfTimeline: () => ipcRenderer.invoke('perf:get-startup-timeline'),
+
+  /**
+   * Send a log entry from renderer to main process
+   */
+  log: (payload: {
+    level: 'debug' | 'info' | 'warn' | 'error'
+    process: 'renderer' | 'preload'
+    module: string
+    message: string
+    meta?: Record<string, unknown>
+  }) => ipcRenderer.invoke('log:write', payload),
+
+  /**
+   * Open the log directory in the system file manager
+   */
+  openLogDir: () => ipcRenderer.invoke('logging:openDir')
 }
 // Custom API for browser control
 
@@ -1231,8 +1527,8 @@ if (process.contextIsolated) {
       getCurrentURL: () => window.location.href // Get current URL via window.location
     })
     contextBridge.exposeInMainWorld('api', api)
-  } catch (error) {
-    // console.error(error)
+  } catch {
+    // Silently ignore contextBridge errors
   }
 } else {
   // @ts-ignore (define in dts)
