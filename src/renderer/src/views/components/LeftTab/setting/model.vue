@@ -376,6 +376,82 @@
           </div>
         </a-card>
 
+
+        <!-- Anthropic Configuration -->
+        <a-card
+          class="settings-section"
+          :bordered="false"
+        >
+          <div class="api-provider-header">
+            <h4>Anthropic</h4>
+          </div>
+
+          <div class="setting-item">
+            <a-form-item
+              :label="$t('user.anthropicBaseUrl')"
+              :label-col="{ span: 24 }"
+              :wrapper-col="{ span: 24 }"
+            >
+              <a-input
+                v-model:value="anthropicBaseUrl"
+                :placeholder="$t('user.anthropicBaseUrlPh')"
+              />
+              <p class="setting-description-no-padding">
+                {{ $t('user.anthropicBaseUrlDescribe') }}
+              </p>
+            </a-form-item>
+          </div>
+
+          <div class="setting-item">
+            <a-form-item
+              :label="$t('user.anthropicApiKey')"
+              :label-col="{ span: 24 }"
+              :wrapper-col="{ span: 24 }"
+            >
+              <a-input-password
+                v-model:value="anthropicApiKey"
+                :placeholder="$t('user.anthropicApiKeyPh')"
+              />
+              <p class="setting-description-no-padding">
+                {{ $t('user.anthropicApiKeyDescribe') }}
+              </p>
+            </a-form-item>
+          </div>
+
+          <div class="setting-item">
+            <a-form-item
+              :label="$t('user.model')"
+              :label-col="{ span: 24 }"
+              :wrapper-col="{ span: 24 }"
+            >
+              <div class="model-input-container">
+                <a-input
+                  v-model:value="anthropicModelId"
+                  size="small"
+                  class="model-input"
+                />
+                <div class="button-group">
+                  <a-button
+                    class="check-btn"
+                    size="small"
+                    :loading="checkLoadingAnthropic"
+                    @click="() => handleCheck('anthropic')"
+                  >
+                    Check
+                  </a-button>
+                  <a-button
+                    class="save-btn"
+                    size="small"
+                    @click="() => handleSave('anthropic')"
+                  >
+                    Save
+                  </a-button>
+                </div>
+              </div>
+            </a-form-item>
+          </div>
+        </a-card>
+
         <!-- Ollama Configuration -->
         <a-card
           class="settings-section"
@@ -507,11 +583,15 @@ const openAiApiKey = ref('')
 const openAiModelId = ref('Qwen3.5-122B-A10B-FP8')
 const ollamaBaseUrl = ref('http://localhost:11434')
 const ollamaModelId = ref('')
+const anthropicBaseUrl = ref('')
+const anthropicApiKey = ref('')
+const anthropicModelId = ref('')
 const checkLoadingLiteLLM = ref(false)
 const checkLoadingBedrock = ref(false)
 const checkLoadingDeepSeek = ref(false)
 const checkLoadingOpenAI = ref(false)
 const checkLoadingOllama = ref(false)
+const checkLoadingAnthropic = ref(false)
 const addModelSwitch = ref(false)
 
 // Load saved configuration
@@ -538,6 +618,9 @@ const loadSavedConfig = async () => {
     // Ollama information
     ollamaBaseUrl.value = ((await getGlobalState('ollamaBaseUrl')) as string) || 'http://localhost:11434'
     ollamaModelId.value = ((await getGlobalState('ollamaModelId')) as string) || ''
+    // Anthropic information
+    anthropicBaseUrl.value = ((await getGlobalState('anthropicBaseUrl')) as string) || ''
+    anthropicApiKey.value = (await getSecret('anthropicApiKey')) || ''
   } catch (error) {
     console.error('Failed to load config:', error)
     notification.error({
@@ -587,6 +670,19 @@ const saveDeepSeekConfig = async () => {
     notification.error({
       message: t('user.error'),
       description: t('user.saveDeepSeekConfigFailed')
+    })
+  }
+}
+
+const saveAnthropicConfig = async () => {
+  try {
+    await updateGlobalState('anthropicBaseUrl', anthropicBaseUrl.value)
+    await storeSecret('anthropicApiKey', anthropicApiKey.value)
+  } catch (error) {
+    logger.error('Failed to save Anthropic config', { error: error })
+    notification.error({
+      message: t('user.error'),
+      description: t('user.saveAnthropicConfigFailed')
     })
   }
 }
@@ -667,6 +763,11 @@ const checkModelConfig = async (provider: string) => {
         return false
       }
       break
+    case 'anthropic':
+      if (isEmptyValue(anthropicApiKey.value) || isEmptyValue(anthropicModelId.value)) {
+        return false
+      }
+      break
   }
   return true
 }
@@ -736,6 +837,15 @@ const handleCheck = async (provider: string): Promise<void> => {
         ollamaModelId: ollamaModelId.value
       }
       break
+    case 'anthropic':
+      checkLoadingAnthropic.value = true
+      checkOptions = {
+        apiProvider: provider,
+        anthropicBaseUrl: anthropicBaseUrl.value,
+        anthropicApiKey: anthropicApiKey.value,
+        anthropicModelId: anthropicModelId.value
+      }
+      break
   }
 
   // Override checkApiConfiguration content
@@ -777,6 +887,7 @@ const handleCheck = async (provider: string): Promise<void> => {
     checkLoadingDeepSeek.value = false
     checkLoadingOpenAI.value = false
     checkLoadingOllama.value = false
+    checkLoadingAnthropic.value = false
   }
 }
 
@@ -886,6 +997,10 @@ const handleSave = async (provider) => {
       modelId = deepSeekModelId.value
       modelName = deepSeekModelId.value
       break
+    case 'anthropic':
+      modelId = anthropicModelId.value
+      modelName = anthropicModelId.value
+      break
     case 'openai':
       modelId = openAiModelId.value
       modelName = openAiModelId.value
@@ -926,6 +1041,9 @@ const handleSave = async (provider) => {
       break
     case 'deepseek':
       await saveDeepSeekConfig()
+      break
+    case 'anthropic':
+      await saveAnthropicConfig()
       break
     case 'openai':
       await saveOpenAiConfig()
