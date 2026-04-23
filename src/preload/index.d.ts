@@ -132,7 +132,6 @@ export interface BastionDefinition {
   uiHints?: Record<string, unknown>
 }
 
-<<<<<<< HEAD
 export interface AppLockStatus {
   hasPassword: boolean
   isUnlocked: boolean
@@ -141,7 +140,8 @@ export interface AppLockStatus {
 export interface AppLockVerifyResult {
   success: boolean
   isUnlocked: boolean
-=======
+}
+
 // KV transaction operation type
 type KvOp = { action: 'set'; key: string; value: string } | { action: 'delete'; key: string }
 
@@ -150,7 +150,6 @@ interface KvTransactionContext {
   get(key: string): Promise<string | null>
   set(key: string, value: string): void
   delete(key: string): void
->>>>>>> upstream/main
 }
 
 interface ApiType {

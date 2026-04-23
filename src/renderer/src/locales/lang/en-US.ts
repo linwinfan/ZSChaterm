@@ -278,8 +278,10 @@ export default {
     telemetry: 'Telemetry',
     telemetryEnabled: 'Enabled',
     telemetryDisabled: 'Disabled',
-    telemetryDescription: 'Help improve Chaterm by sending anonymous usage data and error reports. We do not send any code, request content, or personal information. See the privacy policy for details.',
-    telemetryDescriptionText: 'Help improve Chaterm by sending anonymous usage data and error reports. We do not send any code, request content, or personal information. See the privacy policy for details.',
+    telemetryDescription:
+      'Help improve Chaterm by sending anonymous usage data and error reports. We do not send any code, request content, or personal information. See the privacy policy for details.',
+    telemetryDescriptionText:
+      'Help improve Chaterm by sending anonymous usage data and error reports. We do not send any code, request content, or personal information. See the privacy policy for details.',
     privacyPolicy: 'privacy policy',
     enterprise: 'Enterprise',
     personal: 'Personal',
@@ -295,7 +297,8 @@ export default {
     documentation: 'Documentation',
     accountManagement: 'Account Management',
     deactivateAccount: 'Delete Account',
-    deactivateAccountDescription: 'If you no longer wish to use this account, you can delete it here. This will also clear the current login status on this device.',
+    deactivateAccountDescription:
+      'If you no longer wish to use this account, you can delete it here. This will also clear the current login status on this device.',
     deactivateAccountConfirmTitle: 'Confirm Account Deletion',
     deactivateAccountConfirmDescription: 'Deleting an account is a high-risk operation. To proceed, enter the confirmation word below.',
     deactivateAccountConfirmKeyword: 'delete',
@@ -306,7 +309,8 @@ export default {
     deactivateAccountUserMissing: 'Unable to determine the current user account.',
     privacy: 'Privacy',
     trustedDevices: 'Trusted Devices',
-    trustedDevicesDescription: 'These devices have been verified and can skip verification on next login. After removal, the device will need to re-verify.',
+    trustedDevicesDescription:
+      'These devices have been verified and can skip verification on next login. After removal, the device will need to re-verify.',
     trustedDevicesCount: '{current} / {max} devices',
     trustedDevicesMaxReached: 'Maximum number of trusted devices reached. Remove one from the list before adding a new device.',
     trustedDevicesRemoveConfirm: 'After removal, the device will need to re-verify on next login. Continue?',
@@ -322,7 +326,8 @@ export default {
     anthropicBaseUrl: 'Anthropic API Base URL',
     anthropicBaseUrlPh: 'Default: https://api.anthropic.com',
     anthropicBaseUrlDescribe: 'Optional, leave empty to use the official endpoint',
-    kbSearchEnabledDescribe: 'Automatically search for relevant content in the knowledge base when starting a new conversation and cite it in responses',
+    kbSearchEnabledDescribe:
+      'Automatically search for relevant content in the knowledge base when starting a new conversation and cite it in responses',
     experienceExtractionEnabled: 'Auto-extract experience',
     experienceExtractionEnabledDescribe: 'After a task succeeds, automatically extract reusable experience into the knowledge base',
     openAiBaseUrlDescribe: 'Automatically adds /v1 prefix. Add # at the end of the URL to skip it',
@@ -355,7 +360,6 @@ export default {
     general: 'General',
     extensions: 'Extensions',
     about: 'About',
-    privacy: 'Privacy',
     secretRedaction: 'Secret Redaction',
     secretRedactionDescription:
       'Secret Redaction attempts to automatically redact secrets and sensitive information in your AI dialog output, including passwords, IP addresses, API keys, and PII.',

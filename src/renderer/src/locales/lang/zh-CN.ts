@@ -345,7 +345,6 @@ export default {
     saveAnthropicConfigFailed: '保存 Anthropic 配置失败',
     backgroundDefault: '默认背景',
     backgroundCustomUpload: '自定义上传 (JPG, PNG, WebP, GIF)',
-    privacy: '隐私',
     secretRedaction: '密文脱敏',
     secretRedactionDescription: '密文脱敏功能旨在自动从您的AI对话框输出中遮盖密码、IP 地址、API 密钥和个人身份信息等秘密和敏感信息。',
     secretRedactionEnabled: '开启',
