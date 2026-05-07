@@ -70,19 +70,15 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { Notice } from '../../Notice'
-import { FolderOpenOutlined, CommentOutlined, ExportOutlined } from '@ant-design/icons-vue'
 import i18n from '@/locales'
 import { getEditionConfig } from '@/utils/edition'
 
 const { t } = i18n.global
 const editionConfig = getEditionConfig()
-const logger = createRendererLogger('settings.about')
 
 const appInfo = {
   ...__APP_INFO__
 }
-const api = window.api as any
 
 // const onOpenLogDir = async () => {
 //   try {
@@ -102,9 +98,6 @@ const api = window.api as any
 const newVersion = ref()
 const isUpdate = ref(false)
 const progress = ref(0)
-const btnText = ref(t('about.checkUpdate'))
-const btnDisabled = ref(false)
-const updateStatus = ref(0)
 // const onCheckUpdate = async () => {
 //   btnDisabled.value = true
 //   try {

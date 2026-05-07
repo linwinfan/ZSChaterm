@@ -521,6 +521,7 @@ import { notification } from 'ant-design-vue'
 import { updateGlobalState, getGlobalState, getSecret, storeSecret, getAllExtensionState } from '@renderer/agent/storage/state'
 import eventBus from '@/utils/eventBus'
 import i18n from '@/locales'
+import { createRendererLogger } from '@/utils/logger'
 
 // Define interface for model options
 interface ModelOption {
@@ -541,6 +542,7 @@ interface ModelOption {
 // }
 
 const { t } = i18n.global
+const logger = createRendererLogger('settings.model')
 const modelOptions = ref<ModelOption[]>([])
 
 const awsRegionOptions = ref([

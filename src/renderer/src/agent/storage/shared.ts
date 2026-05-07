@@ -82,6 +82,10 @@ export interface ApiHandlerOptions {
   openAiBaseUrl?: string
   openAiApiKey?: string
   openAiModelId?: string
+  openAiModelInfo?: Record<string, unknown>
+  anthropicApiKey?: string
+  anthropicBaseUrl?: string
+  anthropicModelId?: string
   ollamaModelId?: string
   ollamaBaseUrl?: string
   ollamaApiOptionsCtxNum?: string

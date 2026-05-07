@@ -48,6 +48,7 @@
       :suggestions="suggestions"
       :active-suggestion="activeSuggestion"
       :selection-mode="suggestionSelectionMode"
+      :ai-loading="false"
     />
     <v-contextmenu ref="contextmenu">
       <Context

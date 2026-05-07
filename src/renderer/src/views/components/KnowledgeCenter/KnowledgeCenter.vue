@@ -247,7 +247,6 @@ import { message, Modal } from 'ant-design-vue'
 import eventBus from '@/utils/eventBus'
 import { getUser } from '@/api/user/user'
 import {
-  CloudOutlined,
   CloudUploadOutlined,
   FileAddOutlined,
   FolderAddOutlined,
@@ -272,6 +271,7 @@ const { t } = useI18n()
 const api = window.api
 
 const isDeletingCount = ref(0)
+const subscription = ref<string | undefined>(undefined)
 
 async function loadUserSubscription(): Promise<void> {
   if (localStorage.getItem('login-skipped') === 'true') {
@@ -284,6 +284,10 @@ async function loadUserSubscription(): Promise<void> {
   } catch {
     subscription.value = undefined
   }
+}
+
+async function loadCloudStorage(): Promise<void> {
+  // Cloud storage sync - to be implemented
 }
 
 function importErrorMessage(err: unknown, forFolder: boolean): string {
@@ -1059,8 +1063,6 @@ const importJobList = computed(() => {
     percent: j.total ? Math.floor((j.transferred / j.total) * 100) : 0
   }))
 })
-
-const isSyncing = computed(() => Object.keys(importJobs).length > 0 || isDeletingCount.value > 0)
 
 const unsubscribeProgress = ref<(() => void) | null>(null)
 

@@ -752,7 +752,6 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
-import { useRouter } from 'vue-router'
 import { useAutoScroll } from './composables/useAutoScroll'
 import { useChatHistory } from './composables/useChatHistory'
 import { useChatMessages } from './composables/useChatMessages'
@@ -827,8 +826,6 @@ const props = withDefaults(defineProps<Props>(), {
 })
 
 const emit = defineEmits(['state-changed'])
-
-const router = useRouter()
 
 const isSkippedLogin = ref(localStorage.getItem('login-skipped') === 'true')
 

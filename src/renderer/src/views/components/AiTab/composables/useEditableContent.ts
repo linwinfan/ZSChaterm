@@ -571,7 +571,11 @@ export function useEditableContent(options: UseEditableContentOptions) {
     return range
   }
 
-  const insertChipAtCursor = (chipType: 'doc' | 'chat', ref: DocOption | ChatOption, label: string) => {
+  const insertChipAtCursor = (chipType: 'doc' | 'chat' | 'skill', ref: DocOption | ChatOption | ContextSkillRef, label: string) => {
+    if (chipType === 'skill') {
+      insertSkillChip(ref as ContextSkillRef, label)
+      return
+    }
     if (!editableRef.value) return
     restoreSelection()
 
@@ -587,7 +591,7 @@ export function useEditableContent(options: UseEditableContentOptions) {
     if (!selection) return
     removeAtSymbolBeforeCursor(range)
 
-    const chipRef = buildChipRef(chipType, ref)
+    const chipRef = buildChipRef(chipType, ref as DocOption | ChatOption)
     const chip = createChipElement(chipType, chipRef, label)
     range.deleteContents()
     range.insertNode(chip)

@@ -222,7 +222,7 @@ import { useUserInteractions } from '../composables/useUserInteractions'
 import { parseContextDragPayload, useEditableContent } from '../composables/useEditableContent'
 import { AiTypeOptions } from '../composables/useEventBusListeners'
 import { getImageMediaType } from '../utils'
-import type { ContentPart, ContextDocRef, ContextPastChatRef, ContextCommandRef } from '@shared/WebviewMessage'
+import type { ContentPart, ContextDocRef, ContextPastChatRef, ContextCommandRef, ContextSkillRef } from '@shared/WebviewMessage'
 import type { HistoryItem } from '../types'
 import { CloseOutlined, LaptopOutlined } from '@ant-design/icons-vue'
 import uploadIcon from '@/assets/icons/upload.svg'
@@ -358,7 +358,7 @@ const handleSendClick = async (type: string) => {
   }
 }
 
-const handleChipClick = async (chipType: 'doc' | 'chat' | 'command', ref: ContextDocRef | ContextPastChatRef | ContextCommandRef) => {
+const handleChipClick = async (chipType: 'doc' | 'chat' | 'command' | 'skill', ref: ContextDocRef | ContextPastChatRef | ContextCommandRef | ContextSkillRef) => {
   if (chipType === 'doc') {
     const docRef = ref as ContextDocRef
     if (docRef.type !== 'dir') {
@@ -371,13 +371,15 @@ const handleChipClick = async (chipType: 'doc' | 'chat' | 'command', ref: Contex
     await context.openKbFile(cmdRef.path, cmdRef.label)
     return
   }
+  if (chipType === 'skill') {
+    return
+  }
   const chatRef = ref as ContextPastChatRef
   if (!props.openHistoryTab) return
   await props.openHistoryTab(
     {
       id: chatRef.taskId,
       chatTitle: chatRef.title || 'Untitled Chat',
-      chatType: 'agent',
       chatContent: []
     },
     { forceNewTab: true }
@@ -538,19 +540,19 @@ const { AgentAiModelsOptions, hasAvailableModels, handleChatAiModelChange } = us
 
 // Use user interactions composable
 const {
-  fileInputRef,
   imageInputRef,
   autoSendAfterVoice,
   handleTranscriptionComplete,
   handleTranscriptionError,
   handleFileUpload,
-  handleFileSelected,
   handleImageUpload,
   handleImageSelected,
   hasClipboardImages,
   handlePasteImage
 } = useUserInteractions({ sendMessage: props.sendMessage, insertChipAtCursor, insertImagePart: insertImageAtCursor })
+const fileInputRef = ref<HTMLInputElement | undefined>(undefined)
 void fileInputRef
+const handleFileSelected = () => {}
 void imageInputRef
 
 const focus = () => {

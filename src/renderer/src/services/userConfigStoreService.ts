@@ -532,7 +532,7 @@ export function dispatchSideEffects(changedFields: Partial<SyncableUserConfig>):
   // language -> localStorage + i18n locale
   if ('language' in changedFields && changedFields.language) {
     localStorage.setItem('lang', changedFields.language)
-    i18n.global.locale.value = changedFields.language
+    i18n.global.locale.value = changedFields.language as 'zh-CN' | 'en-US'
   }
 
   // theme -> document class + main process
@@ -631,6 +631,6 @@ export async function applyRemoteConfig(
     dispatchSideEffects(changedFields)
 
     // 8. Notify setting pages to reload and wait for handlers to complete
-    await eventBus.emitAsync('userConfigSyncApplied')
+    await eventBus.emit('userConfigSyncApplied')
   })
 }

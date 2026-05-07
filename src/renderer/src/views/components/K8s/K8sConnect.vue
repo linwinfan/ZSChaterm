@@ -246,16 +246,12 @@ const handleCommandOutput = (data: string) => {
 
       const outputLines = lines.slice(startIdx, endIdx)
       const finalOutput = outputLines.join('\n').trim()
-      const toolResult = {
-        output: finalOutput || 'Command executed successfully, no output returned',
-        toolName: 'execute_command'
-      }
 
       if (finalOutput) {
         const formattedOutput = `Terminal output:\n\`\`\`\n${finalOutput}\n\`\`\``
-        eventBus.emit('sendMessageToAi', { content: formattedOutput, tabId, toolResult })
+        eventBus.emit('sendMessageToAi', { content: formattedOutput, tabId })
       } else {
-        eventBus.emit('sendMessageToAi', { content: 'Command executed successfully, no output returned', tabId, toolResult })
+        eventBus.emit('sendMessageToAi', { content: 'Command executed successfully, no output returned', tabId })
       }
     }, 150)
   }

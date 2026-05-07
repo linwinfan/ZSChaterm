@@ -189,11 +189,11 @@ const cancelEditing = () => {
   isMessageEditing.value = false
 }
 
-const handleConfirmEdit = (contentParts: ContentPart[], hosts: Host[]) => {
+const handleConfirmEdit = (contentParts: ContentPart[]) => {
   emit('truncate-and-send', {
     message: props.message,
     contentParts,
-    hosts
+    hosts: props.message.hosts
   })
 
   isEditing.value = false
