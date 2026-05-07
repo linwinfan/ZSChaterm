@@ -73,18 +73,7 @@
           <template v-if="!hasAvailableModels">
             <div class="ai-login-prompt">
               <p>{{ $t('user.noAvailableModelMessage') }}</p>
-              <p class="ai-prompt-description">
-                {{ isSkippedLogin ? $t('user.noAvailableModelDescription') : $t('user.noAvailableModelDescriptionLoggedIn') }}
-              </p>
               <div class="ai-prompt-buttons">
-                <a-button
-                  v-if="isSkippedLogin"
-                  type="primary"
-                  class="login-button"
-                  @click="goToLogin"
-                >
-                  {{ $t('common.login') }}
-                </a-button>
                 <a-button
                   type="primary"
                   class="configure-model-button"
@@ -1053,10 +1042,6 @@ useEventBusListeners({
   updateHosts,
   isAgentMode: props.isAgentMode
 })
-
-const goToLogin = () => {
-  router.push('/login')
-}
 
 const goToModelSettings = () => {
   eventBus.emit('openUserTab', 'userConfig')
