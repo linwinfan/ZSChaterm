@@ -72,7 +72,6 @@ import { capabilityRegistry } from './ssh/capabilityRegistry'
 import { getActualTheme, loadUserTheme } from './themeManager'
 import { getLoginBaseUrl, getEdition, getProtocolPrefix, getProtocolName } from './config/edition'
 
-import { TelemetrySetting } from '@shared/TelemetrySetting'
 import { registerKnowledgeBaseHandlers, initKbSearchManager, closeKbSearchManager } from './services/knowledgebase'
 import { registerStageChatAttachmentHandlers } from './services/agent/stageChatAttachment'
 import { startKbSync, stopKbSync } from './services/knowledgebase/sync'
@@ -1439,7 +1438,7 @@ app.whenReady().then(async () => {
     }
   })
 
-  setTimeout(initializeTelemetrySetting, 1000)
+  setTimeout(initializeTelemetry, 1000)
 
   mark('chaterm/main/ready')
 
@@ -1765,56 +1764,6 @@ ipcMain.handle('skills:import-zip', async (_event, zipPath: string, overwrite?: 
     throw new Error('Skills manager not initialized')
   } catch (error) {
     logger.error('Failed to import skill from ZIP', { error: error })
-    throw error
-  }
-})
-
-ipcMain.handle('skills:export-zip', async (event, skillName: string) => {
-  try {
-    if (controller && controller.skillsManager) {
-      const zipBuffer = await controller.skillsManager.exportSkillAsZip(skillName)
-
-      const { dialog } = require('electron')
-      const win = BrowserWindow.fromWebContents(event.sender)
-      const result = await dialog.showSaveDialog(win!, {
-        defaultPath: `${skillName}.zip`,
-        filters: [{ name: 'ZIP Files', extensions: ['zip'] }]
-      })
-
-      if (result.canceled || !result.filePath) {
-        return { success: false, error: 'cancelled' }
-      }
-
-      await fs.writeFile(result.filePath, zipBuffer)
-      return { success: true, filePath: result.filePath }
-    }
-    throw new Error('Skills manager not initialized')
-  } catch (error) {
-    logger.error('Failed to export skill as ZIP', { error: error })
-    throw error
-  }
-})
-
-ipcMain.handle('skills:read-content', async (_event, skillName: string) => {
-  try {
-    if (controller && controller.skillsManager) {
-      return await controller.skillsManager.readSkillContent(skillName)
-    }
-    throw new Error('Skills manager not initialized')
-  } catch (error) {
-    logger.error('Failed to read skill content', { error: error })
-    throw error
-  }
-})
-
-ipcMain.handle('skills:update', async (_event, skillName: string, metadata: any, content: string) => {
-  try {
-    if (controller && controller.skillsManager) {
-      return await controller.skillsManager.updateUserSkill(skillName, metadata, content)
-    }
-    throw new Error('Skills manager not initialized')
-  } catch (error) {
-    logger.error('Failed to update skill', { error: error })
     throw error
   }
 })

@@ -2659,7 +2659,7 @@ const getSystemInfo = async (id: string): Promise<CommandGenerationContext> => {
       }
     })
 
-    result.platform = inferPlatformFromOsVersion(result.osVersion || '')
+    result.platform = inferPlatformFromOsVersion(result.osVersion || '', result.shell)
     if (!result.shell) {
       result.shell = 'bash'
     }

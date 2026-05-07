@@ -159,7 +159,7 @@ const attemptMingyuConnection = async (
     })
 
     try {
-      await recordSecondaryAttempt(event, connectionInfo, ident)
+      await recordSecondaryAttempt(event, connectionInfo)
       recordMingyuSecondaryNoise(connectionInfo, 'secondary_connect_complete')
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
