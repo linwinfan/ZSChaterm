@@ -911,6 +911,90 @@ interface ApiType {
    * Open the log directory in the system file manager
    */
   openLogDir: () => Promise<void>
+
+  // ============================================================================
+  // Batch Task Types
+  // ============================================================================
+
+  /**
+   * Batch task configuration for creating/updating tasks
+   */
+  batchListTasks: () => Promise<BatchTask[]>
+  batchGetTask: (id: string) => Promise<BatchTask | null>
+  batchCreateTask: (config: BatchTaskConfig) => Promise<BatchTask>
+  batchUpdateTask: (id: string, config: Partial<BatchTaskConfig>) => Promise<void>
+  batchDeleteTask: (id: string) => Promise<void>
+  batchExecuteTask: (taskId: string) => Promise<BatchTaskRun>
+  batchCancelRun: (runId: string) => Promise<void>
+  batchGetRun: (runId: string) => Promise<BatchTaskRun | null>
+  batchGetRunResults: (runId: string) => Promise<BatchTerminalResult[]>
+  batchExportReport: (runId: string, format: 'json' | 'html') => Promise<string>
+}
+
+// ============================================================================
+// Batch Task Type Definitions
+// ============================================================================
+
+export interface BatchTaskConfig {
+  name: string
+  description?: string
+  triggerType?: 'manual' | 'scheduled'
+  cronExpression?: string
+  cronDisplay?: string
+  executionMode?: 'serial' | 'parallel' | 'limited'
+  maxConcurrency?: number
+  terminals?: { selectorType: string; selector: string }[]
+  operations?: { operationType: string; operationConfig: string; executionOrder: number }[]
+}
+
+export interface BatchTask {
+  id: string
+  name: string
+  description?: string
+  triggerType: 'manual' | 'scheduled'
+  cronExpression?: string
+  cronDisplay?: string
+  executionMode: 'serial' | 'parallel' | 'limited'
+  maxConcurrency: number
+  createdAt: number
+  updatedAt: number
+  terminals?: any[]
+  operations?: any[]
+}
+
+export interface BatchTaskRun {
+  id: string
+  taskId: string
+  startedAt: number
+  finishedAt?: number
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  totalTerminals: number
+  completedTerminals: number
+  failedTerminals: number
+  executionMode: 'serial' | 'parallel' | 'limited'
+  reportPath?: string
+}
+
+export interface BatchTerminalResult {
+  id: string
+  runId: string
+  terminalId: string
+  terminalName: string
+  status: 'pending' | 'running' | 'success' | 'failed'
+  startedAt?: number
+  finishedAt?: number
+  output?: string
+  error?: string
+}
+
+export interface BatchProgressEvent {
+  type: 'terminal_started' | 'terminal_output' | 'terminal_completed' | 'run_progress' | 'run_completed' | 'error'
+  runId: string
+  terminalId?: string
+  status?: 'pending' | 'running' | 'success' | 'failed'
+  output?: string
+  progress?: { total: number; completed: number; failed: number }
+  error?: string
 }
 
 declare global {
