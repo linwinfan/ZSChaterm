@@ -11,9 +11,11 @@ import { upgradeMessageIndexSupport } from './migrations/add-message-index-suppo
 import { upgradeBastionCommentSupport } from './migrations/add-bastion-comment-support'
 import { upgradeRdpExtraArgsSupport } from './migrations/add-rdp-extra-args-support'
 import { upgradeTaskTitleSupport } from './migrations/add-task-title-support'
+import { upgradeBatchTaskSupport } from './migrations/add-batch-task-support'
 import { IndexDBMigrator } from './indexdb-migrator'
 import { getUserDataPath } from '../../config/edition'
 
+/* eslint-disable no-console */
 const INIT_DB_PATH = getInitDbPath()
 const INIT_CDB_PATH = getInitChatermDbPath()
 
@@ -319,6 +321,7 @@ async function applyAllMigrations(db: Database.Database): Promise<void> {
   await upgradeBastionCommentSupport(db)
   upgradeRdpExtraArgsSupport(db)
   await upgradeTaskTitleSupport(db)
+  upgradeBatchTaskSupport(db)
 }
 
 export async function initDatabase(userId?: number): Promise<Database.Database> {
