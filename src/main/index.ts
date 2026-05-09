@@ -58,6 +58,7 @@ import { versionPromptService } from './version/versionPromptService'
 import * as fsSync from 'fs'
 import { pathToFileURL } from 'url'
 import { loadAllPlugins } from './plugin/pluginLoader'
+import { batchTaskManager, scheduler, webSocketNotifier, ReportGenerator } from './batch'
 import {
   getAllPluginVersions,
   installPlugin,
@@ -1103,7 +1104,6 @@ async function getAppLockStatus(): Promise<{ hasPassword: boolean; isUnlocked: b
   }
 }
 
-
 async function createWindow(): Promise<void> {
   const result: WindowCreationResult = await createMainWindow(
     (url: string) => {
@@ -1157,9 +1157,77 @@ export async function getUserConfigFromRenderer(): Promise<any> {
 
     logger.info('Main process sending userConfig:get to renderer process')
     wc.send('userConfig:get')
-
   })
 }
+
+// ==================== Batch Task System ====================
+
+function initBatchTaskSystem(): void {
+  // Set main window reference for WebSocket pushes
+  if (mainWindow) {
+    webSocketNotifier.setMainWindow(mainWindow)
+  }
+
+  // Start the scheduler
+  scheduler.start()
+  logger.info('[BatchTask] System initialized')
+}
+
+// IPC Handlers
+ipcMain.handle('batch:list-tasks', async () => {
+  return batchTaskManager.listTasks()
+})
+
+ipcMain.handle('batch:get-task', async (_event, id: string) => {
+  return batchTaskManager.getTask(id)
+})
+
+ipcMain.handle('batch:create-task', async (_event, config) => {
+  return batchTaskManager.createTask(config)
+})
+
+ipcMain.handle('batch:update-task', async (_event, id: string, config) => {
+  batchTaskManager.updateTask(id, config)
+})
+
+ipcMain.handle('batch:delete-task', async (_event, id: string) => {
+  batchTaskManager.deleteTask(id)
+})
+
+ipcMain.handle('batch:execute-task', async (_event, taskId: string) => {
+  const task = batchTaskManager.getTask(taskId)
+  if (!task) throw new Error('Task not found')
+
+  const terminals = task.terminals || []
+  const run = batchTaskManager.createRun(taskId, terminals.length, task.executionMode)
+
+  // Execute asynchronously
+  const { executionEngine } = require('./batch')
+  executionEngine.execute(run.id, task).catch((error: unknown) => {
+    logger.error('[batch:execute-task] Execution failed', { runId: run.id, error: error instanceof Error ? error.message : String(error) })
+  })
+
+  return run
+})
+
+ipcMain.handle('batch:cancel-run', async (_event, runId: string) => {
+  batchTaskManager.cancelRun(runId)
+})
+
+ipcMain.handle('batch:get-run', async (_event, runId: string) => {
+  return batchTaskManager.getRun(runId)
+})
+
+ipcMain.handle('batch:get-run-results', async (_event, runId: string) => {
+  return batchTaskManager.getRunResults(runId)
+})
+
+ipcMain.handle('batch:export-report', async (_event, runId: string, format: 'json' | 'html') => {
+  const results = batchTaskManager.getRunResults(runId)
+  const reportGenerator = new ReportGenerator()
+  const { jsonPath, htmlPath } = await reportGenerator.generate(runId, results)
+  return format === 'json' ? jsonPath : htmlPath
+})
 
 app.whenReady().then(async () => {
   // [Security] Verify ffmpeg.dll integrity asynchronously (Windows Only)
@@ -1306,6 +1374,9 @@ app.whenReady().then(async () => {
 
   // Register interactive command IPC handlers
   setupInteractionIpcHandlers()
+
+  // Initialize batch task system
+  initBatchTaskSystem()
 
   // Run plugin loading and security config in parallel
   mark('chaterm/main/willLoadPlugins')
@@ -1497,6 +1568,13 @@ app.on('before-quit', async () => {
     } catch (error) {
       logger.error('Error during chat sync scheduler disposal', { error: error })
     }
+  }
+  // Stop batch task scheduler
+  try {
+    scheduler.stop()
+    logger.info('[BatchTask] Scheduler stopped')
+  } catch (error) {
+    logger.error('[BatchTask] Error stopping scheduler', { error: error })
   }
 })
 
@@ -1747,7 +1825,9 @@ ipcMain.handle('skills:open-folder', async () => {
 
     // shell.openPath returns Promise on Linux, need to await it
     const result = await shell.openPath(skillsPath)
+    /* eslint-disable no-console */
     console.log('[skills:open-folder] Result:', JSON.stringify(result))
+    /* eslint-enable no-console */
 
     return { success: true, path: skillsPath }
   } catch (error) {
@@ -3581,7 +3661,9 @@ ipcMain.handle('refresh-organization-assets', async (event, data) => {
       keyboardInteractiveHandler,
       authResultCallback
     )
+    /* eslint-disable no-console */
     console.log('Main process refreshOrganizationAssets debug log path:', result?.data?.debugLogPath ?? 'not available')
+    /* eslint-enable no-console */
     return result
   } catch (error) {
     logger.error('Failed to refresh organization assets', { error: error })
