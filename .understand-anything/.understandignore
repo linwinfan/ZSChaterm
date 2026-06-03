@@ -1,0 +1,58 @@
+# .understandignore — patterns for files/dirs to exclude from analysis
+# Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+# Lines below are suggestions — uncomment to activate.
+# Use ! prefix to force-include something excluded by defaults.
+#
+# Built-in defaults (always excluded unless negated):
+#   node_modules/, .git/, dist/, build/, obj/, *.lock, *.min.js, etc.
+#
+# --- From .gitignore (uncomment to exclude) ---
+
+# .DS_Store
+# .vscode/settings.json
+# .cursor/
+# .spec-workflow
+# /dist
+# /docs
+# /node_modules
+# /out
+# /out/*
+# /*.local
+# /*.local.*
+# /components.d.ts
+# npm-debug.log*
+# .pnpm-debug.log*
+# .pnpm-error.log*
+# yarn-error.log
+# debug.log
+# src/renderer/src/assets/backgroup/custom/custom_bg.jpg
+# temp-storage/
+# .chaterm-encryption/
+# *.enc
+# kms_*
+# session_*
+# tests/screenshots
+# **/__screenshots__/
+# tests/videos
+# tests/playwright-report
+# tests/test-results
+# tests/data/
+# test_data/
+# .Trae/
+# .worktrees/
+# nul
+# scripts/testssh.js
+# scripts/testssh2.js
+# .claude/
+
+# --- Detected directories (uncomment to exclude) ---
+
+# tests/
+# docs/
+# scripts/
+
+# --- Test file patterns (uncomment to exclude) ---
+
+# *.test.*
+# *.spec.*
+# *.snap
