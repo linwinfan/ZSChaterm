@@ -203,7 +203,7 @@
             </template>
           </a-directory-tree>
         </div>
-              </div>
+      </div>
       <template #overlay>
         <a-menu @click="({ key }) => onBlankContextAction(String(key))">
           <a-menu-item key="newFile">{{ $t('knowledgeCenter.newFile') }}</a-menu-item>
@@ -246,14 +246,7 @@ import { useI18n } from 'vue-i18n'
 import { message, Modal } from 'ant-design-vue'
 import eventBus from '@/utils/eventBus'
 import { getUser } from '@/api/user/user'
-import {
-  CloudUploadOutlined,
-  FileAddOutlined,
-  FolderAddOutlined,
-  PlusOutlined,
-  RedoOutlined,
-  SearchOutlined
-} from '@ant-design/icons-vue'
+import { CloudUploadOutlined, FileAddOutlined, FolderAddOutlined, PlusOutlined, RedoOutlined, SearchOutlined } from '@ant-design/icons-vue'
 import { getModifierSymbol, hasPreviewTextSelection, isShortcutEvent } from './utils/kbShortcuts'
 import { getImageMediaType, isImageFile } from '../AiTab/utils'
 

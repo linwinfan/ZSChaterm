@@ -1508,7 +1508,23 @@ const api = {
   /**
    * Open the log directory in the system file manager
    */
-  openLogDir: () => ipcRenderer.invoke('logging:openDir')
+  openLogDir: () => ipcRenderer.invoke('logging:openDir'),
+
+  // ==================== Batch Task API ====================
+  batchListTasks: () => ipcRenderer.invoke('batch:list-tasks'),
+  batchGetTask: (id: string) => ipcRenderer.invoke('batch:get-task', id),
+  batchCreateTask: (config: any) => ipcRenderer.invoke('batch:create-task', config),
+  batchUpdateTask: (id: string, config: any) => ipcRenderer.invoke('batch:update-task', id, config),
+  batchDeleteTask: (id: string) => ipcRenderer.invoke('batch:delete-task', id),
+  batchExecuteTask: (taskId: string, overrideTerminals?: { selectorType: string; selector: string }[]) =>
+    ipcRenderer.invoke('batch:execute-task', taskId, overrideTerminals),
+  batchCancelRun: (runId: string) => ipcRenderer.invoke('batch:cancel-run', runId),
+  batchGetRun: (runId: string) => ipcRenderer.invoke('batch:get-run', runId),
+  batchGetRunResults: (runId: string) => ipcRenderer.invoke('batch:get-run-results', runId),
+  batchListRuns: () => ipcRenderer.invoke('batch:list-runs'),
+  batchDeleteRun: (runId: string) => ipcRenderer.invoke('batch:delete-run', runId),
+  batchExportReport: (runId: string, format: 'json' | 'html') => ipcRenderer.invoke('batch:export-report', runId, format),
+  openPath: (filePath: string) => ipcRenderer.invoke('open-path', filePath)
 }
 // Custom API for browser control
 

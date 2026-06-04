@@ -56,7 +56,7 @@ export function upgradeBatchTaskSupport(db: Database.Database): void {
           failed_terminals INTEGER DEFAULT 0,
           execution_mode TEXT NOT NULL,
           report_path TEXT,
-          FOREIGN KEY (task_id) REFERENCES batch_tasks(id)
+          FOREIGN KEY (task_id) REFERENCES batch_tasks(id) ON DELETE CASCADE
         )
       `)
 

@@ -12,6 +12,8 @@ import { upgradeBastionCommentSupport } from './migrations/add-bastion-comment-s
 import { upgradeRdpExtraArgsSupport } from './migrations/add-rdp-extra-args-support'
 import { upgradeTaskTitleSupport } from './migrations/add-task-title-support'
 import { upgradeBatchTaskSupport } from './migrations/add-batch-task-support'
+import { fixBatchTaskRunsForeignKey } from './migrations/fix-batch-task-runs-fk'
+import { addBatchTerminalResultOperationColumns } from './migrations/add-batch-terminal-result-operation'
 import { IndexDBMigrator } from './indexdb-migrator'
 import { getUserDataPath } from '../../config/edition'
 
@@ -322,6 +324,8 @@ async function applyAllMigrations(db: Database.Database): Promise<void> {
   upgradeRdpExtraArgsSupport(db)
   await upgradeTaskTitleSupport(db)
   upgradeBatchTaskSupport(db)
+  fixBatchTaskRunsForeignKey(db)
+  addBatchTerminalResultOperationColumns(db)
 }
 
 export async function initDatabase(userId?: number): Promise<Database.Database> {

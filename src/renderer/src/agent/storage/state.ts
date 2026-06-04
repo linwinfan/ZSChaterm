@@ -177,7 +177,8 @@ export async function getAllExtensionState() {
     defaultBaseUrl,
     defaultModelId,
     defaultApiKey,
-    defaultModelInfoMap
+    defaultModelInfoMap,
+    language
   ] = await Promise.all([
     getGlobalState('apiProvider') as Promise<ApiProvider | undefined>,
     getGlobalState('apiModelId') as Promise<string | undefined>,
@@ -265,7 +266,8 @@ export async function getAllExtensionState() {
     getGlobalState('defaultBaseUrl') as Promise<string | undefined>,
     getGlobalState('defaultModelId') as Promise<string | undefined>,
     getSecret('defaultApiKey') as Promise<string | undefined>,
-    getGlobalState('defaultModelInfoMap') as Promise<Record<string, { contextWindow?: number; maxTokens?: number }> | undefined>
+    getGlobalState('defaultModelInfoMap') as Promise<Record<string, { contextWindow?: number; maxTokens?: number }> | undefined>,
+    getGlobalState('language') as Promise<string | undefined>
   ])
 
   let apiProvider: ApiProvider
@@ -387,6 +389,7 @@ export async function getAllExtensionState() {
     autoApprovalSettings: autoApprovalSettings || DEFAULT_AUTO_APPROVAL_SETTINGS, // default value can be 0 or empty string
     //browserSettings: { ...DEFAULT_BROWSER_SETTINGS, ...browserSettings }, // this will ensure that older versions of browserSettings (e.g. before remoteBrowserEnabled was added) are merged with the default values (false for remoteBrowserEnabled)
     chatSettings: chatSettings || DEFAULT_CHAT_SETTINGS,
+    language: language || 'zh-CN',
     userInfo,
     previousModeApiProvider,
     previousModeModelId,

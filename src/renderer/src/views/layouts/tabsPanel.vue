@@ -92,6 +92,29 @@
             :plugin-info="(localTab as any)"
             @uninstall-plugin="uninstallPlugin"
           />
+          <TaskListView
+            v-if="localTab.content === 'BatchTaskList'"
+            @select="handleBatchTaskSelect"
+            @run="handleBatchTaskRun"
+            @delete="handleBatchTaskDelete"
+          />
+          <RunHistoryView v-if="localTab.content === 'BatchRunHistory'" />
+          <RunDetailView
+            v-if="localTab.content === 'BatchRunDetail' && localTab.props"
+            :run-id="localTab.props.runId || ''"
+          />
+          <TaskFormView
+            v-if="localTab.content === 'BatchTaskForm'"
+            :task-id="localTab.props?.taskId"
+            @saved="handleTaskFormSaved"
+            @cancel="handleTaskFormCancel"
+          />
+          <ExecuteConfirmView
+            v-if="localTab.content === 'BatchExecuteConfirm' && localTab.props?.taskId"
+            :task-id="localTab.props.taskId"
+            @cancel="closeTab('batch-execute-confirm-' + localTab.props.taskId)"
+            @executed="closeTab('batch-execute-confirm-' + localTab.props.taskId)"
+          />
         </template>
       </div>
     </template>
@@ -99,7 +122,9 @@
 </template>
 <script setup lang="ts">
 import { computed, ref, ComponentPublicInstance, onMounted, watch, nextTick } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { userConfigStore } from '@/store/userConfigStore'
+import eventBus from '@/utils/eventBus'
 import 'splitpanes/dist/splitpanes.css'
 import UserInfo from '@views/components/LeftTab/config/userInfo.vue'
 import UserConfig from '@views/components/LeftTab/config/userConfig.vue'
@@ -118,7 +143,12 @@ import CommonConfigEditor from '@views/components/Editors/CommonConfigEditor.vue
 import SecurityConfigEditor from '@views/components/Editors/SecurityConfigEditor.vue'
 import KeywordHighlightEditor from '@views/components/Editors/KeywordHighlightEditor.vue'
 import PluginDetail from '@views/components/Extensions/pluginDetail.vue'
-import AssetManagement from '@views/components/LeftTab/config/assetManagement.vue'
+import AssetManagement from '@/views/components/LeftTab/config/assetManagement.vue'
+import TaskListView from '@views/components/BatchTask/TaskListView.vue'
+import RunHistoryView from '@views/components/BatchTask/RunHistoryView.vue'
+import RunDetailView from '@views/components/BatchTask/RunDetailView.vue'
+import TaskFormView from '@views/components/BatchTask/TaskFormView.vue'
+import ExecuteConfirmView from '@views/components/BatchTask/ExecuteConfirmView.vue'
 import type { IDockviewPanelProps } from 'dockview-vue'
 
 interface TabItem {
@@ -139,6 +169,9 @@ interface TabItem {
     endLine?: number
     jumpToken?: number | string
     organizationUuid?: string
+    initialView?: 'tasks' | 'history'
+    runId?: string
+    taskId?: string | null
   }
   mode?: 'editor' | 'preview'
   closeCurrentPanel?: (panelId?: string) => void
@@ -157,6 +190,7 @@ const emit = defineEmits<{
 const localTab = computed(() => props.params.params as TabItem)
 const configStore = userConfigStore()
 const isTransparent = computed(() => !!configStore.getUserConfig.background.image)
+const { t: $t } = useI18n()
 
 const closeTab = (value) => {
   if (localTab.value?.closeCurrentPanel) {
@@ -167,6 +201,48 @@ const closeTab = (value) => {
 const uninstallPlugin = (value) => {
   if (localTab.value?.closeCurrentPanel) {
     localTab.value.closeCurrentPanel('panel_' + value)
+  }
+}
+
+// Batch task event handlers
+const handleBatchTaskSelect = (taskId: string) => {
+  // Open task form tab in TerminalLayout via eventBus
+  eventBus.emit('batchTaskSelect', taskId)
+}
+
+const handleBatchTaskRun = (taskId: string) => {
+  // TaskListView's "Run Now" button no longer executes directly. It opens
+  // the ExecuteConfirmView so the user can review/edit the terminal
+  // selection before kicking off the run.
+  eventBus.emit('openUserTab', {
+    id: `batch-execute-confirm-${taskId}`,
+    title: $t('batchTask.runTask'),
+    content: 'BatchExecuteConfirm',
+    type: 'batch',
+    props: { taskId }
+  })
+}
+
+const handleBatchTaskDelete = async (taskId: string) => {
+  try {
+    await window.api.batchDeleteTask(taskId)
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to delete task:', error)
+  }
+}
+
+const handleTaskFormSaved = () => {
+  // Close the task form tab when saved
+  if (localTab.value?.closeCurrentPanel) {
+    localTab.value.closeCurrentPanel()
+  }
+}
+
+const handleTaskFormCancel = () => {
+  // Close the task form tab when cancelled
+  if (localTab.value?.closeCurrentPanel) {
+    localTab.value.closeCurrentPanel()
   }
 }
 

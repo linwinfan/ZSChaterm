@@ -12,6 +12,10 @@ export interface TerminalSelector {
   type: SelectorType
   ids?: string[]
   expr?: string
+  // Display metadata for active terminals. Optional for backward compatibility
+  // with selectors persisted before this field existed; when missing, the main
+  // process falls back to using the raw connectionId as the displayed name.
+  terminals?: Array<{ id: string; title: string; ip?: string }>
 }
 
 export interface OperationConfig {
@@ -73,6 +77,12 @@ export interface BatchTerminalResult {
   finishedAt?: number
   output?: string
   error?: string
+  // Per-operation metadata. The execution engine creates one
+  // BatchTerminalResult row per (terminal, operation) pair; legacy rows
+  // (one per terminal) carry `operation_type = 'legacy'`.
+  operationId?: string
+  operationType?: 'script' | 'skill' | 'kb_script' | 'legacy'
+  operationTarget?: string
 }
 
 export interface BatchProgressEvent {

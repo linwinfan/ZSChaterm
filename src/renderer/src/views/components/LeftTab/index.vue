@@ -64,6 +64,17 @@
           />
         </p>
         <p
+          v-else-if="i.key === 'batchtask'"
+          class="term_menu"
+          :class="{ active: activeKey === i.key }"
+          @click="batchtask"
+        >
+          <img
+            :src="i.icon"
+            alt=""
+          />
+        </p>
+        <p
           v-else
           class="term_menu"
           :class="{ active: activeKey === i.key }"
@@ -252,6 +263,10 @@ const files = () => {
 const kubernetes = () => {
   // K8s feature is under development, no action on click
 }
+const batchtask = () => {
+  emit('open-user-tab', 'batchtask')
+  showUserMenu.value = false
+}
 const api = (window as any).api
 
 const refreshPluginViews = async () => {
@@ -268,6 +283,7 @@ onMounted(async () => {
     const views = await api.getPluginViews()
     pluginViews.value = views
   } catch (e) {
+    // eslint-disable-next-line no-console
     console.error('Get View Error', e)
   }
   api.onPluginMetadataChanged(async () => {

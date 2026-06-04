@@ -924,16 +924,24 @@ interface ApiType {
   batchCreateTask: (config: BatchTaskConfig) => Promise<BatchTask>
   batchUpdateTask: (id: string, config: Partial<BatchTaskConfig>) => Promise<void>
   batchDeleteTask: (id: string) => Promise<void>
-  batchExecuteTask: (taskId: string) => Promise<BatchTaskRun>
+  batchExecuteTask: (taskId: string, overrideTerminals?: BatchTaskTerminalOverride[]) => Promise<BatchTaskRun>
   batchCancelRun: (runId: string) => Promise<void>
   batchGetRun: (runId: string) => Promise<BatchTaskRun | null>
   batchGetRunResults: (runId: string) => Promise<BatchTerminalResult[]>
+  batchListRuns: () => Promise<BatchTaskRunWithTaskName[]>
+  batchDeleteRun: (runId: string) => Promise<void>
   batchExportReport: (runId: string, format: 'json' | 'html') => Promise<string>
+  openPath: (filePath: string) => Promise<{ success: boolean; error?: string | null }>
 }
 
 // ============================================================================
 // Batch Task Type Definitions
 // ============================================================================
+
+export interface BatchTaskTerminalOverride {
+  selectorType: string
+  selector: string
+}
 
 export interface BatchTaskConfig {
   name: string
@@ -973,6 +981,10 @@ export interface BatchTaskRun {
   failedTerminals: number
   executionMode: 'serial' | 'parallel' | 'limited'
   reportPath?: string
+}
+
+export interface BatchTaskRunWithTaskName extends BatchTaskRun {
+  taskName?: string
 }
 
 export interface BatchTerminalResult {

@@ -3,6 +3,7 @@
 
 import { randomUUID } from 'crypto'
 import { ChatermDatabaseService } from '../storage/db/chaterm.service'
+import { getCurrentUserId } from '../storage/db/connection'
 import type { BatchTask, BatchTaskRun, BatchTerminalResult, ExecutionMode } from './types'
 import { createLogger } from '@logging'
 
@@ -176,9 +177,11 @@ export class BatchTaskManager {
   }
 
   createRun(taskId: string, totalTerminals: number, executionMode: ExecutionMode): BatchTaskRun {
+    const currentUserId = getCurrentUserId()
     const db = ChatermDatabaseService.getDatabaseSync()
     const id = randomUUID()
     const now = Date.now()
+    logger.info('[BatchTaskManager] createRun', { taskId, totalTerminals, executionMode, currentUserId, runId: id })
 
     db.prepare(
       `
@@ -231,8 +234,12 @@ export class BatchTaskManager {
   }
 
   getRun(runId: string): BatchTaskRun | null {
+    const currentUserId = getCurrentUserId()
+    logger.info('[BatchTaskManager] getRun: start', { runId, currentUserId })
     const db = ChatermDatabaseService.getDatabaseSync()
+    logger.info('[BatchTaskManager] getRun: db acquired', { runId })
     const row = db.prepare('SELECT * FROM batch_task_runs WHERE id = ?').get(runId) as Record<string, unknown> | undefined
+    logger.info('[BatchTaskManager] getRun: query result', { runId, found: !!row, rowKeys: row ? Object.keys(row) : [] })
     if (!row) return null
     return {
       id: row.id as string,
@@ -248,24 +255,54 @@ export class BatchTaskManager {
     }
   }
 
-  createTerminalResult(runId: string, terminalId: string, terminalName: string): BatchTerminalResult {
+  createTerminalResult(
+    runId: string,
+    terminalId: string,
+    terminalName: string,
+    operationId?: string,
+    operationType?: 'script' | 'skill' | 'kb_script' | 'legacy',
+    operationTarget?: string
+  ): BatchTerminalResult {
     const db = ChatermDatabaseService.getDatabaseSync()
     const id = randomUUID()
     const now = Date.now()
+    logger.info('[BatchTaskManager] createTerminalResult', {
+      runId,
+      terminalId,
+      terminalName,
+      operationId,
+      operationType,
+      operationTarget,
+      id
+    })
 
     db.prepare(
       `
-      INSERT INTO batch_terminal_results (id, run_id, terminal_id, terminal_name, status, started_at)
-      VALUES (?, ?, ?, ?, 'running', ?)
+      INSERT INTO batch_terminal_results (
+        id, run_id, terminal_id, terminal_name, status, started_at,
+        operation_id, operation_type, operation_target
+      )
+      VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)
     `
-    ).run(id, runId, terminalId, terminalName, now)
+    ).run(id, runId, terminalId, terminalName, now, operationId ?? 'legacy', operationType ?? 'legacy', operationTarget ?? null)
 
-    return { id, runId, terminalId, terminalName, status: 'running', startedAt: now }
+    return {
+      id,
+      runId,
+      terminalId,
+      terminalName,
+      status: 'running',
+      startedAt: now,
+      operationId,
+      operationType,
+      operationTarget
+    }
   }
 
   updateTerminalResult(id: string, status: string, output?: string, error?: string): void {
     const db = ChatermDatabaseService.getDatabaseSync()
     const finishedAt = Date.now()
+    logger.info('[BatchTaskManager] updateTerminalResult', { id, status, outputLength: output?.length || 0 })
     db.prepare(
       `
       UPDATE batch_terminal_results SET status = ?, output = ?, error = ?, finished_at = ?
@@ -275,8 +312,11 @@ export class BatchTaskManager {
   }
 
   getRunResults(runId: string): BatchTerminalResult[] {
+    const currentUserId = getCurrentUserId()
+    logger.info('[BatchTaskManager] getRunResults: start', { runId, currentUserId })
     const db = ChatermDatabaseService.getDatabaseSync()
     const rows = db.prepare('SELECT * FROM batch_terminal_results WHERE run_id = ?').all(runId) as Record<string, unknown>[]
+    logger.info('[BatchTaskManager] getRunResults: query result', { runId, rowCount: rows.length })
     return rows.map((r) => ({
       id: r.id as string,
       runId: r.run_id as string,
@@ -286,7 +326,10 @@ export class BatchTaskManager {
       startedAt: r.started_at as number | undefined,
       finishedAt: r.finished_at as number | undefined,
       output: r.output as string | undefined,
-      error: r.error as string | undefined
+      error: r.error as string | undefined,
+      operationId: r.operation_id as string | undefined,
+      operationType: r.operation_type as BatchTerminalResult['operationType'],
+      operationTarget: r.operation_target as string | undefined
     }))
   }
 
@@ -294,6 +337,34 @@ export class BatchTaskManager {
     const db = ChatermDatabaseService.getDatabaseSync()
     const rows = db.prepare("SELECT id FROM batch_tasks WHERE trigger_type = 'scheduled'").all() as { id: string }[]
     return rows.map((r) => this.getTask(r.id)!).filter((t): t is BatchTask => t !== null)
+  }
+
+  deleteRun(runId: string): void {
+    const db = ChatermDatabaseService.getDatabaseSync()
+    db.prepare('DELETE FROM batch_terminal_results WHERE run_id = ?').run(runId)
+    db.prepare('DELETE FROM batch_task_runs WHERE id = ?').run(runId)
+    logger.info('[BatchTaskManager] Deleted run', { runId })
+  }
+
+  listRuns(): (BatchTaskRun & { taskName?: string })[] {
+    const db = ChatermDatabaseService.getDatabaseSync()
+    const rows = db.prepare('SELECT * FROM batch_task_runs ORDER BY started_at DESC LIMIT 100').all() as Record<string, unknown>[]
+    return rows.map((r) => {
+      const task = this.getTask(r.task_id as string)
+      return {
+        id: r.id as string,
+        taskId: r.task_id as string,
+        taskName: task?.name,
+        startedAt: r.started_at as number,
+        finishedAt: r.finished_at as number | undefined,
+        status: r.status as BatchTaskRun['status'],
+        totalTerminals: r.total_terminals as number,
+        completedTerminals: r.completed_terminals as number,
+        failedTerminals: r.failed_terminals as number,
+        executionMode: r.execution_mode as ExecutionMode,
+        reportPath: r.report_path as string | undefined
+      }
+    })
   }
 }
 

@@ -88,6 +88,7 @@
 </template>
 
 <script lang="ts" setup>
+/* eslint-disable no-console */
 const copyText = ref('')
 import SearchComp from './components/searchComp.vue'
 import ZmodemProgress from './utils/zmodemProgress.vue'
@@ -95,6 +96,7 @@ import Context from './components/contextComp.vue'
 import SuggComp from './components/suggestion.vue'
 import eventBus from '@/utils/eventBus'
 import { getActualTheme } from '@/utils/themeUtils'
+import { registerSshConnection, unregisterSshConnection } from '@renderer/views/components/Ssh/utils/sshConnectionRegistry'
 import { markRaw, onBeforeUnmount, onMounted, PropType, nextTick, reactive, ref, watch, computed } from 'vue'
 import { shortcutService } from '@/services/shortcutService'
 import { useI18n } from 'vue-i18n'
@@ -760,6 +762,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
   window.removeEventListener('wheel', handleWheel)
   inputManager.unregisterInstances(connectionId.value)
+  unregisterSshConnection(props.activeTabId)
   if (resizeObserver) {
     resizeObserver.disconnect()
     resizeObserver = null
@@ -1125,6 +1128,7 @@ const connectSSH = async () => {
     const jumpserverUuid = assetInfo?.organization_uuid || props.connectData.uuid
 
     connectionId.value = `${connUsername}@${props.connectData.ip}:${connOrgType}:${hostnameBase64}:${sessionId}`
+    registerSshConnection(props.activeTabId, connectionId.value)
 
     // Setup status listener for bastion host connections
     // All plugin bastions reuse the jumpserver:status-update channel
@@ -1340,6 +1344,7 @@ const connectLocalSSH = async () => {
   }
 
   connectionId.value = `localhost@127.0.0.1:local:${props.currentConnectionId}`
+  registerSshConnection(props.activeTabId, connectionId.value)
 
   try {
     const email = userInfoStore().userInfo.email
