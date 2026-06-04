@@ -113,6 +113,22 @@ export class ChatermDatabaseService {
     this.userId = userId
   }
 
+  public getDatabase(): Database.Database {
+    return this.db
+  }
+
+  public static getDatabaseSync(userId?: number): Database.Database {
+    const targetUserId = userId || getCurrentUserId()
+    if (!targetUserId) {
+      throw new Error('User ID is required')
+    }
+    const instance = ChatermDatabaseService.instances.get(targetUserId)
+    if (!instance) {
+      throw new Error('ChatermDatabaseService not initialized for user ' + targetUserId)
+    }
+    return instance.db
+  }
+
   public static async getInstance(userId?: number): Promise<ChatermDatabaseService> {
     const targetUserId = userId || getCurrentUserId()
     if (!targetUserId) {

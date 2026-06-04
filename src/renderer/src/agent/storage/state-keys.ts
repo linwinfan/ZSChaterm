@@ -25,6 +25,7 @@ export type SecretKey =
 
 export type GlobalStateKey =
   | 'apiProvider'
+  | 'language'
   | 'apiModelId'
   | 'awsRegion'
   | 'awsUseCrossRegionInference'

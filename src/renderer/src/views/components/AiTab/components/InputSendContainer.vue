@@ -358,7 +358,10 @@ const handleSendClick = async (type: string) => {
   }
 }
 
-const handleChipClick = async (chipType: 'doc' | 'chat' | 'command' | 'skill', ref: ContextDocRef | ContextPastChatRef | ContextCommandRef | ContextSkillRef) => {
+const handleChipClick = async (
+  chipType: 'doc' | 'chat' | 'command' | 'skill',
+  ref: ContextDocRef | ContextPastChatRef | ContextCommandRef | ContextSkillRef
+) => {
   if (chipType === 'doc') {
     const docRef = ref as ContextDocRef
     if (docRef.type !== 'dir') {
@@ -446,6 +449,7 @@ const handleEditableDrop = async (e: DragEvent) => {
         data: res.content
       })
     } catch (err) {
+      // eslint-disable-next-line no-console
       console.error('Failed to read image file:', err)
     }
     return
@@ -551,7 +555,7 @@ const {
   handlePasteImage
 } = useUserInteractions({ sendMessage: props.sendMessage, insertChipAtCursor, insertImagePart: insertImageAtCursor })
 const fileInputRef = ref<HTMLInputElement | undefined>(undefined)
-void fileInputRef
+void fileInputRef.value
 const handleFileSelected = () => {}
 void imageInputRef
 

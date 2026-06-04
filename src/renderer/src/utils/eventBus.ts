@@ -26,6 +26,9 @@ export interface AppEvents {
   keyChainUpdated: void // Keychain update event, used to sync key options in host configuration
   aliasStatusChanged: number // Alias status change event, 1 means enabled, 2 means disabled
   openUserTab: any // Open Tab
+  batchTaskSelect: string // Edit batch task by ID
+  batchTaskRun: string // Run batch task by ID
+  batchTaskDelete: string // Delete batch task by ID
   kbActiveFileChanged: { relPath: string } // KnowledgeCenter active file changed
   kbEntriesRemoved: { entries: Array<{ relPath: string; isDir: boolean }> } // KnowledgeCenter delete/cut remove tabs
   openAiRight: void // Open AI right sidebar

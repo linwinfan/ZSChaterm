@@ -1464,13 +1464,12 @@ export const cleanSftpConnection = (id) => {
 export const registerSSHHandlers = () => {
   // Handle connection
   ipcMain.handle('ssh:connect', async (_event, connectionInfo) => {
-
     const { sshType, asset_type } = connectionInfo
-    console.log('[ssh:connect] Received connection request:', { sshType, asset_type, host: connectionInfo.host })
+    logger.info('[ssh:connect] Received connection request', { sshType, asset_type, hasHost: !!connectionInfo.host })
 
     // Handle RDP remote desktop connection
     if (sshType === 'rdp' || asset_type === 'person-rdp') {
-      console.log('[ssh:connect] Routing to RDP handler')
+      logger.info('[ssh:connect] Routing to RDP handler')
       const rdpResult = await connectRdp({
         host: connectionInfo.host,
         port: connectionInfo.port,
@@ -1478,7 +1477,7 @@ export const registerSSHHandlers = () => {
         password: connectionInfo.password,
         extraArgs: connectionInfo.extraArgs
       })
-      console.log('[ssh:connect] RDP handler returned:', rdpResult)
+      logger.info('[ssh:connect] RDP handler returned', { hasResult: !!rdpResult })
       return { status: 'connected', ...rdpResult }
     }
     //const { sshType } = connectionInfo

@@ -134,7 +134,28 @@ export async function getAllExtensionState(): Promise<any> {
     })()
   `
 
-  return await mainWindow.webContents.executeJavaScript(script)
+  const state = await mainWindow.webContents.executeJavaScript(script)
+
+  // Merge language from userConfig (which is the definitive source for language setting)
+  try {
+    const userConfigScript = `
+      (async () => {
+        if (window.storageAPI && window.storageAPI.getUserConfig) {
+          return await window.storageAPI.getUserConfig();
+        } else {
+          return null;
+        }
+      })()
+    `
+    const userConfig = await mainWindow.webContents.executeJavaScript(userConfigScript)
+    if (userConfig && userConfig.language) {
+      state.language = userConfig.language
+    }
+  } catch (e) {
+    // If we can't get userConfig, just proceed without language
+  }
+
+  return state
 }
 
 export async function updateApiConfiguration(config: ApiConfiguration): Promise<void> {

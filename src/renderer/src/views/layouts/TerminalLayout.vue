@@ -182,6 +182,7 @@
                 <Snippets v-else-if="currentMenu == 'snippets'" />
                 <KnowledgeCenter v-else-if="currentMenu == 'knowledgecenter'" />
                 <K8sTerminal v-else-if="currentMenu == 'k8s-explorer' || currentMenu == 'kubernetes'" />
+                <BatchTab v-else-if="currentMenu == 'batchtask'" />
 
                 <ExtensionViewHost
                   v-else
@@ -329,6 +330,7 @@ import Snippets from '@views/components/LeftTab/config/snippets.vue'
 import KnowledgeCenter from '@views/components/KnowledgeCenter/KnowledgeCenter.vue'
 import K8sTerminal from '@views/k8s/terminal/index.vue'
 import AgentsSidebar from '@views/components/AgentsSidebar/index.vue'
+import BatchTab from '@views/components/BatchTask/BatchTab.vue'
 import TabsPanel from './tabsPanel.vue'
 import ExtensionViewHost from './ExtensionViewHost.vue'
 import EditorActions from './components/EditorActions.vue'
@@ -339,6 +341,8 @@ import eventBus from '@/utils/eventBus'
 import { getActualTheme, initializeThemeFromDatabase } from '@/utils/themeUtils'
 import { componentInstances, inputManager, isGlobalInput, isShowCommandBar } from '@renderer/views/components/Ssh/utils/termInputManager'
 import { getSshConnectionId } from '@renderer/views/components/Ssh/utils/sshConnectionRegistry'
+import { connectedTerminals as sharedConnectedTerminals } from '@utils/terminalState'
+import type { ConnectedTerminal } from '@utils/terminalState'
 import { shortcutService } from '@/services/shortcutService'
 import { captureExtensionUsage, ExtensionNames, ExtensionStatus } from '@/utils/telemetry'
 import Dashboard from '@renderer/views/components/Ssh/components/dashboard.vue'
@@ -987,6 +991,7 @@ onMounted(async () => {
   eventBus.on('kbFileRenamed', handleKbFileRenamed)
   eventBus.on('openKbPreview', handleOpenKbPreview)
   eventBus.on('searchHost', handleSearchHost)
+  eventBus.on('batchTaskSelect', handleBatchTaskSelect)
   eventBus.on('save-state-before-switch', () => {
     // Save AI state before layout switch (unified since same aiTabRef)
     if (aiTabRef.value) {
@@ -1375,6 +1380,27 @@ const toggleSideBar = (value: string) => {
   }
 }
 
+// Handle batch task select (edit task)
+const handleBatchTaskSelect = (taskId: string) => {
+  if (!dockApi) return
+
+  // Check if task form is already open
+  const existingPanel = dockApi.panels.find((panel) => panel.params?.content === 'BatchTaskForm')
+  if (existingPanel) {
+    existingPanel.api.setActive()
+    return
+  }
+
+  // Open new task form tab
+  addDockPanel({
+    id: `batch-task-form-${taskId || 'new'}`,
+    title: taskId ? t('batchTask.editTask') : t('batchTask.newTask'),
+    content: 'BatchTaskForm',
+    type: 'batch',
+    props: { taskId: taskId || null }
+  })
+}
+
 // Handle host search shortcut
 const handleSearchHost = () => {
   const needsMenuSwitch = currentMenu.value !== 'workspace'
@@ -1675,9 +1701,11 @@ const currentClickServer = async (item) => {
           asset_type: 'person-rdp',
           extraArgs: assetInfo.extraArgs || []
         })
+        // eslint-disable-next-line no-console
         console.log('[RDP] Connection result:', rdpResult)
       }
     } catch (error) {
+      // eslint-disable-next-line no-console
       console.error('[RDP] Connection failed:', error)
     }
     return
@@ -1956,6 +1984,7 @@ onUnmounted(() => {
   eventBus.off('kbFileRenamed', handleKbFileRenamed)
   eventBus.off('openKbPreview', handleOpenKbPreview)
   eventBus.off('searchHost', handleSearchHost)
+  eventBus.off('batchTaskSelect', handleBatchTaskSelect)
 })
 
 interface OpenUserTabObject {
@@ -2096,6 +2125,12 @@ const openUserTab = async function (arg: OpenUserTabArg) {
     return
   }
 
+  // Handle inline components (rendered directly in the content area, not as dock panels)
+  if (value === 'batchtask') {
+    currentMenu.value = 'batchtask'
+    return
+  }
+
   if (
     value === 'assetConfig' ||
     value === 'keyManagement' ||
@@ -2108,11 +2143,25 @@ const openUserTab = async function (arg: OpenUserTabArg) {
     value === 'aliasConfig' ||
     value === 'k8sClusterConfig' ||
     value === 'files' ||
+    value === 'BatchTaskList' ||
+    value === 'BatchRunHistory' ||
+    value === 'BatchRunDetail' ||
+    value === 'BatchTaskForm' ||
+    value === 'BatchExecuteConfirm' ||
     value.startsWith('plugins:')
   ) {
     if (!dockApi) return
 
-    const existingPanel = dockApi.panels.find((panel) => panel.params?.content === value || panel.params?.type === value)
+    // BatchRunDetail / BatchTaskForm / BatchExecuteConfirm: per-instance panel keyed by id, so each run/task gets its own panel
+    const isPerInstance = value === 'BatchRunDetail' || value === 'BatchTaskForm' || value === 'BatchExecuteConfirm'
+    const targetPanelId = isPerInstance && !isStringArg && typeof arg === 'object' && arg.id ? `panel_${arg.id}` : null
+
+    const existingPanel = dockApi.panels.find((panel) => {
+      if (targetPanelId) {
+        return panel.id === targetPanelId
+      }
+      return panel.params?.content === value || panel.params?.type === value
+    })
     if (existingPanel) {
       existingPanel.api.setActive()
       return
@@ -2122,7 +2171,8 @@ const openUserTab = async function (arg: OpenUserTabArg) {
     title: value,
     key: value,
     type: value,
-    props: {}
+    content: value,
+    props: {} as Record<string, any>
   }
   switch (value) {
     case 'aliasConfig':
@@ -2132,6 +2182,49 @@ const openUserTab = async function (arg: OpenUserTabArg) {
     case 'jumpserverSupport':
       p.title = 'jumpserverSupportPlugin'
       p.type = 'extensions'
+      break
+    case 'BatchTaskList':
+      p.title = t('batchTask.taskList')
+      p.key = 'BatchTaskList'
+      p.type = 'batch'
+      p.content = 'BatchTaskList'
+      break
+    case 'BatchRunHistory':
+      p.title = t('batchTask.runHistory')
+      p.key = 'BatchRunHistory'
+      p.type = 'batch'
+      p.content = 'BatchRunHistory'
+      break
+    case 'BatchRunDetail':
+      // Use the title passed from the caller (which includes task name) instead of generic i18n text
+      p.title = !isStringArg && typeof arg === 'object' && arg.title ? arg.title : t('batchTask.viewReport')
+      p.key = 'BatchRunDetail'
+      p.type = 'batch'
+      p.content = 'BatchRunDetail'
+      // Pass through the props (which includes runId) from the event arg
+      if (!isStringArg && typeof arg === 'object' && arg.props) {
+        p.props = arg.props
+      }
+      break
+    case 'BatchTaskForm':
+      p.title = !isStringArg && typeof arg === 'object' && arg.title ? arg.title : t('batchTask.editTask')
+      p.key = 'BatchTaskForm'
+      p.type = 'batch'
+      p.content = 'BatchTaskForm'
+      // Pass through props (which includes taskId) from the event arg
+      if (!isStringArg && typeof arg === 'object' && arg.props) {
+        p.props = arg.props
+      }
+      break
+    case 'BatchExecuteConfirm':
+      p.title = !isStringArg && typeof arg === 'object' && arg.title ? arg.title : t('batchTask.runTask')
+      p.key = 'BatchExecuteConfirm'
+      p.type = 'batch'
+      p.content = 'BatchExecuteConfirm'
+      // Pass through props (which includes taskId) from the event arg
+      if (!isStringArg && typeof arg === 'object' && arg.props) {
+        p.props = arg.props
+      }
       break
     case 'k8sClusterConfig':
       p.title = t('k8s.terminal.k8sClusterConfig')
@@ -2463,6 +2556,36 @@ let dockApi: DockviewApi | null = null
 const dockApiInstance = ref<DockviewApi | null>(null)
 const isPreviewActionsVisible = ref(false)
 
+const computeConnectedTerminals = (): void => {
+  if (!dockApi) {
+    sharedConnectedTerminals.value = []
+    return
+  }
+  const list: ConnectedTerminal[] = []
+  for (const panel of dockApi.panels) {
+    const params = panel.params as { content?: string; organizationId?: string; title?: string; ip?: string; id?: string } | undefined
+    if (!params) continue
+    // An "opened connected terminal" is a dock panel whose organizationId is a non-empty
+    // string. The terminal panel mounts the SSH connection on creation, so the panel
+    // existing in the dockview is sufficient evidence that a connection is live.
+    if (params.organizationId && params.organizationId !== '') {
+      // Resolve the actual SSH connectionId (e.g. "user@ip:org:base64host:sessionId")
+      // because that's the key under which the main process stores the live connection
+      // in the `sshConnections` map. Falling back to the panel id keeps the option
+      // visible while the connection is still being established.
+      const tabId = params.id || panel.id
+      const sshId = getSshConnectionId(tabId) || tabId
+      list.push({
+        id: sshId,
+        title: params.title || panel.id,
+        ip: params.ip || '',
+        organizationId: params.organizationId
+      })
+    }
+  }
+  sharedConnectedTerminals.value = list
+}
+
 const computePreviewActionsVisible = (): boolean => {
   const panel = dockApi?.activePanel
   if (!panel) return false
@@ -2618,10 +2741,12 @@ const onDockReady = (event: DockviewReadyEvent) => {
 
   dockApi.onDidAddPanel(() => {
     panelCount.value = dockApi?.panels.length ?? 0
+    computeConnectedTerminals()
   })
 
   dockApi.onDidRemovePanel((panel) => {
     panelCount.value = dockApi?.panels.length ?? 0
+    computeConnectedTerminals()
     // Clear Assets menu selection when corresponding tab is closed
     const content = panel.params?.content
     if (content === 'assetConfig' || content === 'keyManagement') {
@@ -2635,6 +2760,7 @@ const onDockReady = (event: DockviewReadyEvent) => {
   })
 
   panelCount.value = dockApi.panels.length
+  computeConnectedTerminals()
   nextTick(() => {
     applyTheme()
     setupTabContextMenu()
@@ -2656,6 +2782,14 @@ const addDockPanel = (params) => {
     displayTitle = t('mcp.configEditor')
   } else if (params.content === 'securityConfigEditor' || params.content === 'keywordHighlightEditor') {
     // For config editors, title is already set to file name in switch statement, use it directly
+    displayTitle = params.title
+  } else if (
+    params.content === 'BatchTaskList' ||
+    params.content === 'BatchRunHistory' ||
+    params.content === 'BatchRunDetail' ||
+    params.content === 'BatchExecuteConfirm'
+  ) {
+    // Batch task content uses title directly (already set in switch case)
     displayTitle = params.title
   } else {
     displayTitle = t(`common.${params.title}`) === `common.${params.title}` ? params.title : t(`common.${params.title}`)

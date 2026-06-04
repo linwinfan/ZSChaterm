@@ -10,6 +10,11 @@ const menuTabsData = [
     icon: new URL('@/assets/menu/asset.svg', import.meta.url).href
   },
   {
+    name: 'Batch',
+    key: 'batchtask',
+    icon: new URL('@/assets/menu/laptop.svg', import.meta.url).href
+  },
+  {
     name: 'Snippets',
     key: 'snippets',
     icon: new URL('@/assets/menu/snippets.svg', import.meta.url).href
